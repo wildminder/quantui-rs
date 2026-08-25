@@ -5,10 +5,10 @@
 //! with TODO(phase-N) markers and will be uncommented as phases land.
 
 pub mod dtype;
+pub mod quant;
 // Enabled early: Phase 1 (safetensors IO) scaffolding created in Phase 0 per spec.
 pub mod st_io;
 // TODO(phase-5) pub mod manifest;
-// TODO(phase-2) pub mod quant;
 // TODO(phase-3) pub mod quant_fp8;
 // TODO(phase-3) pub mod quant_mxfp8;
 // TODO(phase-3) pub mod quant_nvfp4;

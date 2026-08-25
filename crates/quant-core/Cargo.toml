@@ -9,6 +9,9 @@ license = "MIT"
 thiserror = "2"
 memmap2 = "0.9"
 serde_json = { version = "1", features = ["preserve_order"] }
+half = "2"
+regex = "1"
+rayon = "1"
 
 [dev-dependencies]
 safetensors = "0.6"
