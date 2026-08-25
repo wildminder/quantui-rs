@@ -1,0 +1,1 @@
+{"version":1,"config_hash":"56920c6553cfa241","order":["attn_norm.weight","model.diffusion_model.double_block.0.bias","model.diffusion_model.double_block.0.weight","odd.weight"],"done":["attn_norm.weight","model.diffusion_model.double_block.0.bias","model.diffusion_model.double_block.0.weight","odd.weight"]}

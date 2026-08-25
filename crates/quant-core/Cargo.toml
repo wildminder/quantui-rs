@@ -1,0 +1,11 @@
+[package]
+name = "quant-core"
+version.workspace = true
+edition.workspace = true
+description = "Core library: safetensors IO, INT8/FP8/MXFP8/NVFP4 quantization kernels, manifests"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
