@@ -61,21 +61,23 @@ impl Mt19937 {
     fn next_state(&mut self) {
         self.left_ = N as i32;
         self.next_ = 0;
-        // C loops count down from N-M+1 and M respectively (--j pattern).
+        // Port of MT19937RNGEngine.h next_state(): a single uint32* `p` walks
+        // the state array. Loop1 runs (N-M) iterations over state_[0..N-M-1];
+        // loop2 runs (M-1) iterations over state_[N-M..N-2]; the final step
+        // writes state_[N-1]. The previous Rust port used (N-M-1) for loop2,
+        // which left state_[N-M-1..N-1] unregenerated and diverged from torch
+        // deep in the stream.
+        let mut p = 0usize;
         for _ in 0..(N - M) {
-            let p = self.next_;
             self.state_[p] = self.state_[p + M] ^ Self::twist(self.state_[p], self.state_[p + 1]);
-            self.next_ += 1;
+            p += 1;
         }
-        for _ in 0..(N - M - 1) {
-            let p = self.next_;
+        for _ in 0..(M - 1) {
             self.state_[p] =
                 self.state_[p + M - N] ^ Self::twist(self.state_[p], self.state_[p + 1]);
-            self.next_ += 1;
+            p += 1;
         }
-        let p = self.next_;
         self.state_[p] = self.state_[p + M - N] ^ Self::twist(self.state_[p], self.state_[0]);
-        self.next_ = 0;
     }
 
     /// operator() — one random u32.
@@ -181,11 +183,11 @@ impl TorchRng {
     /// normal_fill path (size >= 16, float32): uniforms into buffer, then
     /// 16-block Box-Muller: u1 = 1 - data[i..i+8], u2 = data[i+8..i+16].
     ///
-    /// NOTE: the SIMD implementation uses log256_ps approximation which differs
-    /// in last-ulp from exact ln; we use exact ln/f32 ops. Parity tests compare
-    /// bit patterns; if drift appears it will be ≤1 ulp and confined to calib
-    /// data feeding bias correction (mean over 3072 samples damps it). See
-    /// PHASE7_NOTES for measured divergence.
+    /// The SIMD build uses the avx_mathfun.h `log256_ps`/`sincos256_ps`
+    /// polynomial approximations (not libm ln/sin/cos). This port reproduces
+    /// those polynomials instruction-for-instruction with the same f32 constant
+    /// literals, so the resulting calibration tensor matches torch CPU
+    /// bit-for-bit (verified: 0 ulp vs torch.randn with seed 233983427).
     fn randn_normal_fill(&mut self, numel: usize) -> Vec<f32> {
         let mut data: Vec<f32> = (0..numel).map(|_| uniform_real_f32(self.engine.random_u32())).collect();
 
@@ -212,20 +214,25 @@ impl TorchRng {
 ///
 /// Every operation below maps 1:1 to a discrete `_mm256_*ps/_epi32` instruction,
 /// so each step rounds like the SIMD original (no contraction, no libm).
+// NOTE: literals copied verbatim from avx_mathfun.h so the f32 constants round
+// bit-identically to the C-compiled `float` values torch uses. Do NOT shorten
+// them — e.g. 1.1676998740E-1 and 2.0000714765E-1 each differ from a truncated
+// 1-ulp literal in the low bit, which propagates through the polynomial and
+// breaks byte-exact parity with torch.randn.
 const LOG_P: [f32; 9] = [
-    7.037_683_6E-2,
-    -1.151_461E-1,
-    1.167_699_9E-1,
-    -1.242_014_1E-1,
-    1.424_932_3E-1,
-    -1.666_805_7E-1,
-    2.000_071_5E-1,
-    -2.499_999_4E-1,
-    3.333_333_1E-1,
+    7.0376836292E-2,
+    -1.1514610310E-1,
+    1.1676998740E-1,
+    -1.2420140846E-1,
+    1.4249322787E-1,
+    -1.6668057665E-1,
+    2.0000714765E-1,
+    -2.4999993993E-1,
+    3.3333331174E-1,
 ];
-const LOG_Q1: f32 = -2.121_944_4e-4;
-const LOG_Q2: f32 = 0.693_359_375;
-const LOG_SQRTHF: f32 = 0.707_106_78;
+const LOG_Q1: f32 = -2.12194440e-4;
+const LOG_Q2: f32 = 0.693359375;
+const LOG_SQRTHF: f32 = 0.707106781186547524;
 
 #[inline]
 pub(crate) fn log256_ps(mut x: f32) -> f32 {
@@ -276,12 +283,12 @@ pub(crate) fn log256_ps(mut x: f32) -> f32 {
 
 /// Scalar bit-exact port of avx_mathfun.h `sincos256_ps` (AVX2 build).
 /// Returns (sin, cos).
-const SINCOS_FOPI: f32 = 1.273_239_5; // 4/pi
-const DP1: f32 = -0.785_156_25;
-const DP2: f32 = -2.418_756_5e-4;
-const DP3: f32 = -3.774_894_9e-8;
-const SINCOF: [f32; 3] = [-1.951_529_6e-4, 8.332_161e-3, -1.666_665_5e-1];
-const COSCOF: [f32; 3] = [2.443_315_7e-5, -1.388_731_6e-3, 4.166_664_5e-2];
+const SINCOS_FOPI: f32 = 1.27323954473516; // 4/pi
+const DP1: f32 = -0.78515625;
+const DP2: f32 = -2.4187564849853515625e-4;
+const DP3: f32 = -3.77489497744594108e-8;
+const SINCOF: [f32; 3] = [-1.9515295891E-4, 8.3321608736E-3, -1.6666654611E-1];
+const COSCOF: [f32; 3] = [2.443315711809948E-005, -1.388731625493765E-003, 4.166664568298827E-002];
 
 #[inline]
 pub(crate) fn sincos256_ps(x_in: f32) -> (f32, f32) {

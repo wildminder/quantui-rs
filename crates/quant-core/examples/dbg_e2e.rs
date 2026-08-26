@@ -1,7 +1,9 @@
 use quant_core::manifest::QuantConfig;
 use quant_core::stream::stream_quantize;
 fn main() {
-    let dir = std::path::PathBuf::from("../../tests/golden/linear_basic_bf16");
+    let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    dir.pop(); dir.pop();
+    dir = dir.join("tests/golden/linear_basic_bf16");
     let out = std::path::PathBuf::from("tmp_out2.safetensors");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(out.with_extension("safetensors.quant-manifest.json"));

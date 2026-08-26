@@ -122,8 +122,38 @@ impl IncrementalWriter {
         };
         let header = Header::parse_json_bytes(trimmed, &path)?;
 
-        let data_len = size.saturating_sub(8 + slot);
-        let done: Vec<String> = header.names().cloned().collect();
+        let on_disk = size.saturating_sub(8 + slot);
+
+        // Reconcile the header against the bytes actually on disk. A crashed
+        // writer may have flushed a header that lists tensors whose payloads
+        // were only partially written (or not written at all) — e.g. a golden
+        // file truncated mid-data-section. Keep only the contiguous prefix of
+        // tensors whose payloads fully fit within `on_disk`; drop the rest so
+        // they are re-appended on resume. This mirrors the real crash contract
+        // (the last flushed header lists only completed tensors) and makes
+        // resume well-defined even from a truncated file. Tensors are appended
+        // contiguously, so the kept prefix ends exactly at the re-append cursor
+        // and reproduces the original offsets byte-for-byte.
+        let mut kept: Vec<(String, TensorInfo)> = Vec::new();
+        let mut cursor = 0u64;
+        for (name, info) in header.iter() {
+            let (start, end) = info.data_offsets;
+            if start == cursor && end <= on_disk {
+                cursor = end;
+                kept.push((name.clone(), info.clone()));
+            } else {
+                break;
+            }
+        }
+        let mut reconciled = Header::default();
+        if let Some(meta) = header.metadata() {
+            reconciled.set_metadata(meta.clone());
+        }
+        for (name, info) in &kept {
+            reconciled.insert(name.clone(), info.clone());
+        }
+        let data_len = cursor;
+        let done: Vec<String> = kept.iter().map(|(n, _)| n.clone()).collect();
 
         let fh = OpenOptions::new()
             .read(true)
@@ -133,12 +163,18 @@ impl IncrementalWriter {
                 path: path.clone(),
                 source,
             })?;
+        // Discard any partially-written trailing bytes so re-appends start from
+        // a clean cursor (file length = header slot + kept data prefix).
+        fh.set_len(8 + slot + data_len).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
         let mut w = Self {
             path,
             fh: Some(fh),
             slot,
             data_len,
-            header,
+            header: reconciled,
             done,
         };
         // Mirror reference `_resume`: seek to end so appends land after existing data.
