@@ -8,7 +8,7 @@ use std::fmt;
 
 /// Header dtype strings used by the reference implementation, plus UINT16
 /// tolerance (numpy-written bf16 files use "U16" — see PHASE0_NOTES.md).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F64,
     F32,
