@@ -21,6 +21,8 @@ pub enum DType {
     U8,
     U16,
     Bool,
+    /// float8_e4m3fn (FP8 E4M3) — 1 byte per element.
+    F8E4M3,
 }
 
 impl DType {
@@ -31,7 +33,7 @@ impl DType {
             DType::F64 | DType::I64 => 8,
             DType::F32 | DType::I32 => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
-            DType::I8 | DType::U8 | DType::Bool => 1,
+            DType::I8 | DType::U8 | DType::Bool | DType::F8E4M3 => 1,
         })
     }
 
@@ -52,6 +54,8 @@ impl DType {
             // "U16" header because numpy has no native bf16.
             "U16" => DType::U16,
             "BOOL" => DType::Bool,
+            // FP8 E4M3 (float8_e4m3fn) — emitted by the FP8/MXFP8/NVFP4 paths.
+            "F8_E4M3" => DType::F8E4M3,
             _ => return None,
         })
     }
@@ -70,6 +74,7 @@ impl DType {
             DType::U8 => "U8",
             DType::U16 => "U16",
             DType::Bool => "BOOL",
+            DType::F8E4M3 => "F8_E4M3",
         }
     }
 }
