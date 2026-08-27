@@ -19,3 +19,6 @@ ctrlc = "3.5.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Phase 10 CLI tests build a tiny HF fixture + read the GGUF output back.
+half = "2"
+rlx-gguf = "=0.2.14"

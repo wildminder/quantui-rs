@@ -222,7 +222,7 @@ fn record_recent(
 
 /// UTC ISO-8601 timestamp without pulling in a chrono dependency.
 /// Uses the civil-from-days algorithm (Howard Hinnant) to convert epoch days.
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

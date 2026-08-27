@@ -13,9 +13,10 @@ pub mod quant_mxfp8;
 pub mod quant_nvfp4;
 pub mod stream;
 // Enabled early: Phase 1 (safetensors IO) scaffolding created in Phase 0 per spec.
-pub mod st_io;
-// TODO(phase-10) pub mod gguf_registry;
 pub mod bias_correction;
 pub mod discover;
+pub mod gguf_convert;
+pub mod gguf_registry;
+pub mod st_io;
 pub mod torch_rng;
 pub mod validator;

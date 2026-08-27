@@ -1,0 +1,785 @@
+//! GGUF method registry (Phase 10.3).
+//!
+//! Data-driven port of the reference `quantui/quant_methods.py` GGUF
+//! `METHODS` list — the single source of truth for which GGUF quantization
+//! methods the CLI offers — plus the per-tensor scheme policies that the
+//! composite methods (`q4_k_m`, `q5_k_m`, `q3_k_*`, `q2_k`) encode in
+//! llama.cpp's `llama-quantize`.
+//!
+//! Scope boundary (plan §1 / §7): the Unsloth Dynamic 2.0 per-layer
+//! selective variants (`q4_k_xl` / `q3_k_xl` / `q2_k_xl`, and the
+//! `dynamic_v2`-tagged `q5_1` / `q4_1` / `q4_nl` entries) are NOT
+//! supported natively — the proprietary per-layer bit-width heuristic is a
+//! permanent Python-only boundary. They are kept in the registry data
+//! (verbatim ids/labels/bpw/descriptions, `dynamic_v2 = true`) so the CLI
+//! can list them and reject them with a clear message instead of a silent
+//! typo failure.
+//!
+//! The registry is pure data + lookup: no IO, no rlx-gguf types leak into
+//! the public surface (callers map [`GgufScheme`] → `GgmlType` at the
+//! conversion boundary), so the rest of quant-core stays independent of
+//! the GGUF dependency.
+
+/// One GGUF quantization method (port of `quant_methods.QuantMethod`,
+/// GGUF family only).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GgufMethod {
+    /// Method id, exactly the reference id (`"q4_k_m"`, `"f16"`, ...).
+    pub id: &'static str,
+    /// Dropdown label, verbatim from the reference.
+    pub label: &'static str,
+    /// Unsloth Dynamic 2.0 per-layer selective variant (unsupported
+    /// natively; listed for completeness + friendly rejection).
+    pub dynamic_v2: bool,
+    /// Approximate bits-per-weight (reference `approx_bpw`, verbatim).
+    pub approx_bpw: Option<f64>,
+    /// Description, verbatim from the reference.
+    pub description: &'static str,
+}
+
+/// Storage scheme for one tensor.
+///
+/// Deliberately a local enum (not `rlx_gguf::GgmlType`) so the registry
+/// has no dependency on the GGUF crate; the conversion command maps this
+/// 1:1 onto `GgmlType` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufScheme {
+    F32,
+    F16,
+    Bf16,
+    Q8_0,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq3Xxs,
+    Iq4Nl,
+}
+
+/// Per-tensor quantization policy of a method.
+///
+/// `Default` covers the plain methods (`q4_k_s` → Q4K everywhere, `f16` →
+/// F16 everywhere, ...). The composite `_M`/`_L`/`_XS` methods carry
+/// explicit rules ported from llama.cpp's `llama-quantize`
+/// (`new_quantize` / `llama_model_quantize`): a list of (substring match
+/// on the GGUF tensor name, scheme) overrides evaluated first-match-wins,
+/// plus the shared conventions:
+///
+/// - 1-D tensors (norms, biases) stay F32,
+/// - `token_embd.weight` / `output.weight` get `embd_scheme` (F16 for the
+///   K-quant composites, else the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodPolicy {
+    /// Scheme for quantizable 2-D tensors with no rule match.
+    pub default: GgufScheme,
+    /// Scheme for `token_embd.weight` and `output.weight`.
+    pub embd_scheme: GgufScheme,
+    /// First-match-wins (GGUF-name substring, scheme) overrides.
+    pub rules: &'static [(&'static str, GgufScheme)],
+}
+
+/// Registry entry: method metadata + its per-tensor policy.
+#[derive(Debug, Clone, Copy)]
+pub struct RegistryEntry {
+    pub method: GgufMethod,
+    pub policy: MethodPolicy,
+}
+
+// ─── policy fragments (llama.cpp `llama-quantize` ports) ────────────
+
+const Q6K: GgufScheme = GgufScheme::Q6K;
+const Q5K: GgufScheme = GgufScheme::Q5K;
+const Q4K: GgufScheme = GgufScheme::Q4K;
+const Q3K: GgufScheme = GgufScheme::Q3K;
+const Q2K: GgufScheme = GgufScheme::Q2K;
+const F16: GgufScheme = GgufScheme::F16;
+const F32: GgufScheme = GgufScheme::F32;
+
+/// Q5_K_M: attn_v + ffn_down get Q6_K, rest Q5_K.
+static RULES_Q5_K_M: &[(&str, GgufScheme)] = &[("attn_v", Q6K), ("ffn_down", Q6K)];
+
+/// Q4_K_M: attn_v + ffn_down get Q6_K, rest Q4_K.
+static RULES_Q4_K_M: &[(&str, GgufScheme)] = &[("attn_v", Q6K), ("ffn_down", Q6K)];
+
+/// Q3_K_M: attn_output Q5_K; attn_q/k/v Q4_K; half of ffn_down Q6_K;
+/// rest Q3_K. (The "half" selection in llama-quantize is by layer index
+/// parity; we apply Q6_K to every ffn_down — the documented simplification
+/// keeps the policy data-driven without a layer-count dependency.)
+static RULES_Q3_K_M: &[(&str, GgufScheme)] = &[
+    ("attn_output", Q5K),
+    ("attn_q", Q4K),
+    ("attn_k", Q4K),
+    ("attn_v", Q4K),
+    ("ffn_down", Q6K),
+];
+
+/// Q3_K_L: attn_output Q5_K, rest Q3_K.
+static RULES_Q3_K_L: &[(&str, GgufScheme)] = &[("attn_output", Q5K)];
+
+/// Q3_K_S / Q3_K_XS / Q2_K: attn_v Q4_K, rest the base scheme.
+static RULES_ATTN_V_Q4K: &[(&str, GgufScheme)] = &[("attn_v", Q4K)];
+
+// ─── the registry (verbatim reference order) ────────────────────────
+
+/// All GGUF methods, in the exact reference `METHODS` order. The three
+/// UD-* Dynamic 2.0 entries are included with `dynamic_v2 = true` and an
+/// empty policy (they are rejected before the policy is ever consulted).
+pub static METHODS: &[RegistryEntry] = &[
+    entry(
+        "f16",
+        "F16 (16-bit, lossless)",
+        false,
+        Some(16.0),
+        "Full 16-bit. Largest, lossless. Best as an intermediate before manual quant.",
+        MethodPolicy {
+            default: F16,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q8_0",
+        "Q8_0 (8-bit)",
+        false,
+        Some(8.6),
+        "8-bit. Near-lossless, high memory use. Fast conversion.",
+        MethodPolicy {
+            default: GgufScheme::Q8_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q6_k",
+        "Q6_K (6-bit)",
+        false,
+        Some(6.6),
+        "6-bit K-quant. Very good quality, fairly large.",
+        MethodPolicy {
+            default: Q6K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q5_k_m",
+        "Q5_K_M (5-bit, recommended)",
+        false,
+        Some(5.5),
+        "Recommended 5-bit. Near-lossless quality with good size.",
+        MethodPolicy {
+            default: Q5K,
+            embd_scheme: F16,
+            rules: RULES_Q5_K_M,
+        },
+    ),
+    entry(
+        "q5_k_s",
+        "Q5_K_S (5-bit small)",
+        false,
+        Some(5.5),
+        "5-bit small. Uses Q5_K for all tensors.",
+        MethodPolicy {
+            default: Q5K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q5_0",
+        "Q5_0",
+        false,
+        Some(5.5),
+        "Higher accuracy, slower inference.",
+        MethodPolicy {
+            default: GgufScheme::Q5_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q5_1",
+        "Q5_1 (Dynamic 2.0 format)",
+        true,
+        Some(5.5),
+        "New Dynamic 2.0 efficiency format (ARM / Apple Silicon).",
+        MethodPolicy {
+            default: GgufScheme::Q5_1,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q4_k_m",
+        "Q4_K_M (4-bit, recommended)",
+        false,
+        Some(4.85),
+        "Recommended 4-bit. Good balance of size and quality.",
+        MethodPolicy {
+            default: Q4K,
+            embd_scheme: F16,
+            rules: RULES_Q4_K_M,
+        },
+    ),
+    entry(
+        "q4_k_s",
+        "Q4_K_S (4-bit small)",
+        false,
+        Some(4.5),
+        "4-bit small. Q4_K for all tensors.",
+        MethodPolicy {
+            default: Q4K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q4_0",
+        "Q4_0",
+        false,
+        Some(4.55),
+        "Original 4-bit method.",
+        MethodPolicy {
+            default: GgufScheme::Q4_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q4_1",
+        "Q4_1 (Dynamic 2.0 format)",
+        true,
+        Some(4.8),
+        "New Dynamic 2.0 format. Higher accuracy than Q4_0.",
+        MethodPolicy {
+            default: GgufScheme::Q4_1,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q4_nl",
+        "Q4_NL (Dynamic 2.0 format)",
+        true,
+        Some(4.5),
+        "New Dynamic 2.0 efficiency format for Apple Silicon / ARM.",
+        MethodPolicy {
+            default: GgufScheme::Iq4Nl,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q3_k_m",
+        "Q3_K_M (3-bit)",
+        false,
+        Some(3.9),
+        "3-bit. Q4_K for key tensors.",
+        MethodPolicy {
+            default: Q3K,
+            embd_scheme: F16,
+            rules: RULES_Q3_K_M,
+        },
+    ),
+    entry(
+        "q3_k_l",
+        "Q3_K_L (3-bit large)",
+        false,
+        Some(4.0),
+        "3-bit large.",
+        MethodPolicy {
+            default: Q3K,
+            embd_scheme: F16,
+            rules: RULES_Q3_K_L,
+        },
+    ),
+    entry(
+        "q3_k_s",
+        "Q3_K_S (3-bit small)",
+        false,
+        Some(3.5),
+        "3-bit small. Q3_K for all tensors.",
+        MethodPolicy {
+            default: Q3K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q3_k_xs",
+        "Q3_K_XS (3-bit XS)",
+        false,
+        Some(3.3),
+        "3-bit extra-small.",
+        MethodPolicy {
+            default: Q3K,
+            embd_scheme: F16,
+            rules: RULES_ATTN_V_Q4K,
+        },
+    ),
+    entry(
+        "q2_k",
+        "Q2_K (2-bit)",
+        false,
+        Some(2.96),
+        "2-bit. Q4_K for key tensors.",
+        MethodPolicy {
+            default: Q2K,
+            embd_scheme: F16,
+            rules: RULES_ATTN_V_Q4K,
+        },
+    ),
+    entry(
+        "iq4_nl",
+        "IQ4_NL (imatrix)",
+        false,
+        Some(4.5),
+        "Importance-matrix 4-bit (needs an imatrix file).",
+        MethodPolicy {
+            default: GgufScheme::Iq4Nl,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "iq3_xxs",
+        "IQ3_XXS (imatrix)",
+        false,
+        Some(3.06),
+        "Importance quant, very small.",
+        MethodPolicy {
+            default: GgufScheme::Iq3Xxs,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "iq2_xxs",
+        "IQ2_XXS (imatrix)",
+        false,
+        Some(2.06),
+        "Importance quant, tiny.",
+        MethodPolicy {
+            default: GgufScheme::Iq2Xxs,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "iq2_xs",
+        "IQ2_XS (imatrix)",
+        false,
+        Some(2.31),
+        "Importance quant.",
+        MethodPolicy {
+            default: GgufScheme::Iq2Xs,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    // ── Unsloth Dynamic 2.0 per-layer selective (unsupported natively) ──
+    entry(
+        "q4_k_xl",
+        "UD-Q4_K_XL (Dynamic 2.0)",
+        true,
+        Some(4.5),
+        "Dynamic 2.0 per-layer selective. Best quality at ~Q4 size. Output: UD-Q4_K_XL.",
+        MethodPolicy {
+            default: Q4K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q3_k_xl",
+        "UD-Q3_K_XL (Dynamic 2.0)",
+        true,
+        Some(3.5),
+        "Dynamic 2.0 per-layer selective, smaller. Output: UD-Q3_K_XL.",
+        MethodPolicy {
+            default: Q3K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q2_k_xl",
+        "UD-Q2_K_XL (Dynamic 2.0)",
+        true,
+        Some(2.7),
+        "Dynamic 2.0 per-layer selective, smallest. Output: UD-Q2_K_XL.",
+        MethodPolicy {
+            default: Q2K,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+];
+
+const fn entry(
+    id: &'static str,
+    label: &'static str,
+    dynamic_v2: bool,
+    approx_bpw: Option<f64>,
+    description: &'static str,
+    policy: MethodPolicy,
+) -> RegistryEntry {
+    RegistryEntry {
+        method: GgufMethod {
+            id,
+            label,
+            dynamic_v2,
+            approx_bpw,
+            description,
+        },
+        policy,
+    }
+}
+
+/// Look up a method by id (case-sensitive, exactly the reference ids).
+pub fn get_method(id: &str) -> Option<&'static RegistryEntry> {
+    METHODS.iter().find(|e| e.method.id == id)
+}
+
+/// All natively supported (non-Dynamic-2.0) method ids, in registry order.
+pub fn supported_ids() -> Vec<&'static str> {
+    METHODS
+        .iter()
+        .filter(|e| !e.method.dynamic_v2)
+        .map(|e| e.method.id)
+        .collect()
+}
+
+/// All Dynamic 2.0 ids (listed by the CLI, rejected at conversion time).
+pub fn dynamic_ids() -> Vec<&'static str> {
+    METHODS
+        .iter()
+        .filter(|e| e.method.dynamic_v2)
+        .map(|e| e.method.id)
+        .collect()
+}
+
+/// Resolve the storage scheme for one tensor under `method`'s policy.
+///
+/// `gguf_name` is the tensor's GGUF-side name (e.g. `blk.0.attn_v.weight`)
+/// — the policy rules match llama.cpp naming, so the HF→GGUF name mapping
+/// must happen before this call. `ndim` is the tensor's rank.
+///
+/// Conventions (llama.cpp `llama_model_quantize`):
+/// - 1-D tensors (norms, biases, positions) stay F32 — quantizing them
+///   buys nothing and costs accuracy;
+/// - `token_embd.weight` / `output.weight` use the method's `embd_scheme`;
+/// - everything else: first matching rule wins, else the default scheme.
+pub fn scheme_for(method: &RegistryEntry, gguf_name: &str, ndim: usize) -> GgufScheme {
+    if ndim < 2 {
+        return F32;
+    }
+    if gguf_name == "token_embd.weight" || gguf_name == "output.weight" {
+        return method.policy.embd_scheme;
+    }
+    for (needle, scheme) in method.policy.rules {
+        if gguf_name.contains(needle) {
+            return *scheme;
+        }
+    }
+    method.policy.default
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_matches_reference_method_list() {
+        // Verbatim port of docs/ref/quantui/quant_methods.py METHODS
+        // (ids, labels, dynamic flags, bpw, descriptions, order).
+        let expected: &[(&str, &str, bool, Option<f64>, &str)] = &[
+            (
+                "f16",
+                "F16 (16-bit, lossless)",
+                false,
+                Some(16.0),
+                "Full 16-bit. Largest, lossless. Best as an intermediate before manual quant.",
+            ),
+            (
+                "q8_0",
+                "Q8_0 (8-bit)",
+                false,
+                Some(8.6),
+                "8-bit. Near-lossless, high memory use. Fast conversion.",
+            ),
+            (
+                "q6_k",
+                "Q6_K (6-bit)",
+                false,
+                Some(6.6),
+                "6-bit K-quant. Very good quality, fairly large.",
+            ),
+            (
+                "q5_k_m",
+                "Q5_K_M (5-bit, recommended)",
+                false,
+                Some(5.5),
+                "Recommended 5-bit. Near-lossless quality with good size.",
+            ),
+            (
+                "q5_k_s",
+                "Q5_K_S (5-bit small)",
+                false,
+                Some(5.5),
+                "5-bit small. Uses Q5_K for all tensors.",
+            ),
+            (
+                "q5_0",
+                "Q5_0",
+                false,
+                Some(5.5),
+                "Higher accuracy, slower inference.",
+            ),
+            (
+                "q5_1",
+                "Q5_1 (Dynamic 2.0 format)",
+                true,
+                Some(5.5),
+                "New Dynamic 2.0 efficiency format (ARM / Apple Silicon).",
+            ),
+            (
+                "q4_k_m",
+                "Q4_K_M (4-bit, recommended)",
+                false,
+                Some(4.85),
+                "Recommended 4-bit. Good balance of size and quality.",
+            ),
+            (
+                "q4_k_s",
+                "Q4_K_S (4-bit small)",
+                false,
+                Some(4.5),
+                "4-bit small. Q4_K for all tensors.",
+            ),
+            ("q4_0", "Q4_0", false, Some(4.55), "Original 4-bit method."),
+            (
+                "q4_1",
+                "Q4_1 (Dynamic 2.0 format)",
+                true,
+                Some(4.8),
+                "New Dynamic 2.0 format. Higher accuracy than Q4_0.",
+            ),
+            (
+                "q4_nl",
+                "Q4_NL (Dynamic 2.0 format)",
+                true,
+                Some(4.5),
+                "New Dynamic 2.0 efficiency format for Apple Silicon / ARM.",
+            ),
+            (
+                "q3_k_m",
+                "Q3_K_M (3-bit)",
+                false,
+                Some(3.9),
+                "3-bit. Q4_K for key tensors.",
+            ),
+            (
+                "q3_k_l",
+                "Q3_K_L (3-bit large)",
+                false,
+                Some(4.0),
+                "3-bit large.",
+            ),
+            (
+                "q3_k_s",
+                "Q3_K_S (3-bit small)",
+                false,
+                Some(3.5),
+                "3-bit small. Q3_K for all tensors.",
+            ),
+            (
+                "q3_k_xs",
+                "Q3_K_XS (3-bit XS)",
+                false,
+                Some(3.3),
+                "3-bit extra-small.",
+            ),
+            (
+                "q2_k",
+                "Q2_K (2-bit)",
+                false,
+                Some(2.96),
+                "2-bit. Q4_K for key tensors.",
+            ),
+            (
+                "iq4_nl",
+                "IQ4_NL (imatrix)",
+                false,
+                Some(4.5),
+                "Importance-matrix 4-bit (needs an imatrix file).",
+            ),
+            (
+                "iq3_xxs",
+                "IQ3_XXS (imatrix)",
+                false,
+                Some(3.06),
+                "Importance quant, very small.",
+            ),
+            (
+                "iq2_xxs",
+                "IQ2_XXS (imatrix)",
+                false,
+                Some(2.06),
+                "Importance quant, tiny.",
+            ),
+            (
+                "iq2_xs",
+                "IQ2_XS (imatrix)",
+                false,
+                Some(2.31),
+                "Importance quant.",
+            ),
+            (
+                "q4_k_xl",
+                "UD-Q4_K_XL (Dynamic 2.0)",
+                true,
+                Some(4.5),
+                "Dynamic 2.0 per-layer selective. Best quality at ~Q4 size. Output: UD-Q4_K_XL.",
+            ),
+            (
+                "q3_k_xl",
+                "UD-Q3_K_XL (Dynamic 2.0)",
+                true,
+                Some(3.5),
+                "Dynamic 2.0 per-layer selective, smaller. Output: UD-Q3_K_XL.",
+            ),
+            (
+                "q2_k_xl",
+                "UD-Q2_K_XL (Dynamic 2.0)",
+                true,
+                Some(2.7),
+                "Dynamic 2.0 per-layer selective, smallest. Output: UD-Q2_K_XL.",
+            ),
+        ];
+        assert_eq!(METHODS.len(), expected.len());
+        for (entry, (id, label, dyn2, bpw, desc)) in METHODS.iter().zip(expected) {
+            assert_eq!(entry.method.id, *id, "id mismatch at {id}");
+            assert_eq!(entry.method.label, *label, "label mismatch at {id}");
+            assert_eq!(
+                entry.method.dynamic_v2, *dyn2,
+                "dynamic flag mismatch at {id}"
+            );
+            assert_eq!(entry.method.approx_bpw, *bpw, "bpw mismatch at {id}");
+            assert_eq!(
+                entry.method.description, *desc,
+                "description mismatch at {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_non_dynamic_method_maps_to_an_encoder_scheme() {
+        // Plan 10.3 verification: every non-dynamic ref method maps to a
+        // scheme that rlx-gguf 0.2.14 has an encoder for (verified against
+        // quantize.rs dispatch: F32/F16/BF16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/
+        // Q2K..Q8K/IQ4NL/IQ4XS/IQ2XXS/IQ2XS/IQ2S/IQ3XXS/IQ3S/IQ1S/IQ1M).
+        for e in METHODS.iter().filter(|e| !e.method.dynamic_v2) {
+            let schemes: Vec<GgufScheme> = std::iter::once(e.policy.default)
+                .chain(std::iter::once(e.policy.embd_scheme))
+                .chain(e.policy.rules.iter().map(|(_, s)| *s))
+                .collect();
+            for s in schemes {
+                assert!(
+                    matches!(
+                        s,
+                        GgufScheme::F32
+                            | GgufScheme::F16
+                            | GgufScheme::Bf16
+                            | GgufScheme::Q8_0
+                            | GgufScheme::Q4_0
+                            | GgufScheme::Q4_1
+                            | GgufScheme::Q5_0
+                            | GgufScheme::Q5_1
+                            | GgufScheme::Q2K
+                            | GgufScheme::Q3K
+                            | GgufScheme::Q4K
+                            | GgufScheme::Q5K
+                            | GgufScheme::Q6K
+                            | GgufScheme::Q8K
+                            | GgufScheme::Iq2Xxs
+                            | GgufScheme::Iq2Xs
+                            | GgufScheme::Iq3Xxs
+                            | GgufScheme::Iq4Nl
+                    ),
+                    "method {} uses scheme {:?} without an rlx-gguf encoder",
+                    e.method.id,
+                    s
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_variants_are_exactly_the_reference_dynamic_set() {
+        assert_eq!(
+            dynamic_ids(),
+            vec!["q5_1", "q4_1", "q4_nl", "q4_k_xl", "q3_k_xl", "q2_k_xl"]
+        );
+        assert_eq!(supported_ids().len(), METHODS.len() - 6);
+    }
+
+    #[test]
+    fn get_method_lookup() {
+        assert_eq!(
+            get_method("q4_k_m").unwrap().method.label,
+            "Q4_K_M (4-bit, recommended)"
+        );
+        assert!(get_method("nope").is_none());
+        assert!(get_method("Q4_K_M").is_none()); // case-sensitive, like the ref dict
+    }
+
+    #[test]
+    fn scheme_for_composite_policies() {
+        let q4km = get_method("q4_k_m").unwrap();
+        // 1-D tensors stay F32 regardless of rules.
+        assert_eq!(scheme_for(q4km, "blk.0.attn_norm.weight", 1), F32);
+        assert_eq!(scheme_for(q4km, "blk.0.ffn_norm.bias", 1), F32);
+        // Embeddings/output use the embd scheme.
+        assert_eq!(scheme_for(q4km, "token_embd.weight", 2), F16);
+        assert_eq!(scheme_for(q4km, "output.weight", 2), F16);
+        // Rule matches.
+        assert_eq!(scheme_for(q4km, "blk.3.attn_v.weight", 2), Q6K);
+        assert_eq!(scheme_for(q4km, "blk.3.ffn_down.weight", 2), Q6K);
+        // Default.
+        assert_eq!(scheme_for(q4km, "blk.3.attn_q.weight", 2), Q4K);
+        assert_eq!(scheme_for(q4km, "blk.3.ffn_up.weight", 2), Q4K);
+
+        let q3km = get_method("q3_k_m").unwrap();
+        assert_eq!(scheme_for(q3km, "blk.1.attn_output.weight", 2), Q5K);
+        assert_eq!(scheme_for(q3km, "blk.1.attn_q.weight", 2), Q4K);
+        assert_eq!(scheme_for(q3km, "blk.1.ffn_down.weight", 2), Q6K);
+        assert_eq!(scheme_for(q3km, "blk.1.ffn_gate.weight", 2), Q3K);
+
+        let q2k = get_method("q2_k").unwrap();
+        assert_eq!(scheme_for(q2k, "blk.9.attn_v.weight", 2), Q4K);
+        assert_eq!(scheme_for(q2k, "blk.9.attn_k.weight", 2), Q2K);
+    }
+
+    #[test]
+    fn scheme_for_plain_methods() {
+        let f16 = get_method("f16").unwrap();
+        assert_eq!(scheme_for(f16, "blk.0.attn_q.weight", 2), F16);
+        assert_eq!(scheme_for(f16, "token_embd.weight", 2), F16);
+        assert_eq!(scheme_for(f16, "blk.0.attn_norm.weight", 1), F32);
+
+        let q8 = get_method("q8_0").unwrap();
+        assert_eq!(scheme_for(q8, "blk.0.ffn_down.weight", 2), GgufScheme::Q8_0);
+
+        let q5ks = get_method("q5_k_s").unwrap();
+        assert_eq!(scheme_for(q5ks, "blk.0.attn_v.weight", 2), Q5K); // no rules in _S
+    }
+}

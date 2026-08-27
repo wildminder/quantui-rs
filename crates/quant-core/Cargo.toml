@@ -14,7 +14,13 @@ half = "2"
 regex = "1"
 rayon = "1"
 sha2 = "0.10"
+# Phase 10: GGUF v3 writer + GGML quant encoders. Pinned exactly — young crate
+# with API churn risk (plan §6 risk register); GGUF phase is isolated.
+rlx-gguf = "=0.2.14"
 
 [dev-dependencies]
 safetensors = "0.6"
 tempfile = "3"
+# Phase 10 E2E tests read the GGUF output back through the crate's own parser.
+rlx-gguf = "=0.2.14"
+half = "2"

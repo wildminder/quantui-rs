@@ -132,3 +132,40 @@ pub struct InfoArgs {
     #[arg(long)]
     pub raw: bool,
 }
+
+// --------------------------------------------------------------------------- //
+// gguf
+// --------------------------------------------------------------------------- //
+
+#[derive(Args, Debug)]
+pub struct GgufArgs {
+    /// Input: a single `.safetensors` file OR a sharded HF model folder
+    /// (containing `model.safetensors.index.json`). Optional only with
+    /// `--list-methods`.
+    pub input: Option<PathBuf>,
+
+    /// Output `.gguf` file path. If omitted, auto-named
+    /// `<base>-<method>.gguf` next to the input.
+    pub output: Option<PathBuf>,
+
+    /// GGUF quantization method id (e.g. `q4_k_m`, `q8_0`, `f16`). Use
+    /// `--list-methods` to see all options.
+    #[arg(long, short = 'm', default_value = "q4_k_m")]
+    pub method: String,
+
+    /// Override the GGUF architecture string (else detected from config.json).
+    #[arg(long)]
+    pub arch: Option<String>,
+
+    /// Override the `general.name` metadata (else derived from the input).
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// List all supported GGUF methods and exit.
+    #[arg(long)]
+    pub list_methods: bool,
+
+    /// Disable the progress bar (plain, CI-friendly output).
+    #[arg(long)]
+    pub no_progress: bool,
+}

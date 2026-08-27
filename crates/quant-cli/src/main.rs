@@ -10,7 +10,7 @@ mod progress;
 
 use clap::{Parser, Subcommand};
 
-use args::{InfoArgs, QuantizeArgs, ValidateArgs};
+use args::{GgufArgs, InfoArgs, QuantizeArgs, ValidateArgs};
 
 /// Standalone, dependency-free-at-runtime CLI for ComfyUI/GGUF model quantization.
 #[derive(Parser, Debug)]
@@ -28,6 +28,8 @@ struct Cli {
 enum Commands {
     /// Quantize a safetensors model (single file or sharded folder).
     Quantize(QuantizeArgs),
+    /// Convert a HF safetensors model to GGUF (single file or sharded folder).
+    Gguf(GgufArgs),
     /// Structural + numeric validation of a quantized output.
     Validate(ValidateArgs),
     /// Inspect a safetensors header without loading tensors.
@@ -38,6 +40,7 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Quantize(args) => commands::quantize::run(args),
+        Commands::Gguf(args) => commands::gguf::run(args),
         Commands::Validate(args) => commands::validate::run(args),
         Commands::Info(args) => commands::info::run(args),
     }
