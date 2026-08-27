@@ -64,6 +64,12 @@ pub struct ShardedStreamResult {
 /// (`stream_quant.py::SHARDED_MANIFEST_NAME`).
 pub const SHARDED_MANIFEST_NAME: &str = ".quant-manifest.json";
 
+/// Progress callback `(cur, total)` invoked after each completed tensor
+/// (single/union runs) or shard (sharded runs) — mirrors the reference
+/// `on_progress: Callable[[int, int], None]`. For a resumed run `cur` counts
+/// already-done tensors too (`len(state.done)`), so it starts above zero.
+pub type ProgressFn<'a> = dyn FnMut(usize, usize) + 'a;
+
 /// Errors from the orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -80,6 +86,11 @@ pub enum StreamError {
          enable skip_inefficient to copy such layers instead"
     )]
     NotDivisible { m: u64, n: u64, block_size: u32 },
+    /// Cooperative cancellation requested (e.g. Ctrl-C). The partial output and
+    /// manifest are already flushed to a valid, resumable state at the last
+    /// completed tensor.
+    #[error("cancelled after {done} of {total} tensors (partial output is resumable)")]
+    Cancelled { done: usize, total: usize },
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
@@ -192,8 +203,39 @@ pub fn stream_quantize(
     output_path: impl AsRef<Path>,
     config: &QuantConfig,
 ) -> Result<StreamResult> {
+    stream_quantize_with_progress(input_path, output_path, config, None)
+}
+
+/// Like [`stream_quantize`] with an optional `(cur, total)` progress callback
+/// invoked after each tensor (mirrors reference `on_progress`).
+pub fn stream_quantize_with_progress(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    config: &QuantConfig,
+    on_progress: Option<&mut ProgressFn>,
+) -> Result<StreamResult> {
     let source = SingleFileSource::open(input_path)?;
-    stream_quantize_source(&source, output_path.as_ref(), config)
+    stream_quantize_source(&source, output_path.as_ref(), config, on_progress, None)
+}
+
+/// Like [`stream_quantize_with_progress`] with a cooperative cancellation flag.
+/// When the flag is set, the run stops at the next tensor boundary and returns
+/// [`StreamError::Cancelled`], leaving a valid, resumable partial output.
+pub fn stream_quantize_cancellable(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    config: &QuantConfig,
+    on_progress: Option<&mut ProgressFn>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<StreamResult> {
+    let source = SingleFileSource::open(input_path)?;
+    stream_quantize_source(
+        &source,
+        output_path.as_ref(),
+        config,
+        on_progress,
+        Some(cancel),
+    )
 }
 
 /// Stream several shards as ONE logical tensor sequence into a single output
@@ -204,8 +246,38 @@ pub fn stream_quantize_shards(
     output_path: impl AsRef<Path>,
     config: &QuantConfig,
 ) -> Result<StreamResult> {
+    stream_quantize_shards_with_progress(shard_paths, output_path, config, None)
+}
+
+/// Like [`stream_quantize_shards`] with an optional `(cur, total)` progress
+/// callback invoked after each tensor of the union sequence.
+pub fn stream_quantize_shards_with_progress(
+    shard_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+    config: &QuantConfig,
+    on_progress: Option<&mut ProgressFn>,
+) -> Result<StreamResult> {
     let source = UnionSource::open(shard_paths)?;
-    stream_quantize_source(&source, output_path.as_ref(), config)
+    stream_quantize_source(&source, output_path.as_ref(), config, on_progress, None)
+}
+
+/// Like [`stream_quantize_shards_with_progress`] with a cooperative
+/// cancellation flag (see [`stream_quantize_cancellable`]).
+pub fn stream_quantize_shards_cancellable(
+    shard_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+    config: &QuantConfig,
+    on_progress: Option<&mut ProgressFn>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<StreamResult> {
+    let source = UnionSource::open(shard_paths)?;
+    stream_quantize_source(
+        &source,
+        output_path.as_ref(),
+        config,
+        on_progress,
+        Some(cancel),
+    )
 }
 
 /// Stream-quantize a sharded model into a sharded OUTPUT directory
@@ -220,15 +292,68 @@ pub fn stream_quantize_sharded(
     output_dir: impl AsRef<Path>,
     config: &QuantConfig,
 ) -> Result<ShardedStreamResult> {
+    stream_quantize_sharded_with_progress(model, output_dir, config, None)
+}
+
+/// Like [`stream_quantize_sharded`] with an optional `(shards_done,
+/// total_shards)` progress callback invoked after each shard (mirrors the
+/// reference, which passes `on_progress=None` to the per-shard runs and only
+/// reports shard-level progress).
+pub fn stream_quantize_sharded_with_progress(
+    model: &ShardedModel,
+    output_dir: impl AsRef<Path>,
+    config: &QuantConfig,
+    on_progress: Option<&mut ProgressFn>,
+) -> Result<ShardedStreamResult> {
+    stream_quantize_sharded_inner(model, output_dir, config, on_progress, None)
+}
+
+/// Like [`stream_quantize_sharded_with_progress`] with a cooperative
+/// cancellation flag. The flag is checked both between shards and (via the
+/// per-shard runs) between tensors, so cancellation stops at the nearest
+/// tensor boundary, leaving every started shard valid and resumable.
+pub fn stream_quantize_sharded_cancellable(
+    model: &ShardedModel,
+    output_dir: impl AsRef<Path>,
+    config: &QuantConfig,
+    on_progress: Option<&mut ProgressFn>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ShardedStreamResult> {
+    stream_quantize_sharded_inner(model, output_dir, config, on_progress, Some(cancel))
+}
+
+fn stream_quantize_sharded_inner(
+    model: &ShardedModel,
+    output_dir: impl AsRef<Path>,
+    config: &QuantConfig,
+    mut on_progress: Option<&mut ProgressFn>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<ShardedStreamResult> {
     let output_dir = output_dir.as_ref();
     std::fs::create_dir_all(output_dir)?;
 
+    let total = model.shard_files.len();
     let mut per_shard: Vec<(String, Vec<String>)> = Vec::new();
-    for shard in &model.shard_files {
+    for (i, shard) in model.shard_files.iter().enumerate() {
+        // Cooperative cancellation between shards.
+        if let Some(flag) = cancel {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(StreamError::Cancelled { done: i, total });
+            }
+        }
         let in_path = model.model_dir.join(shard);
         let out_path = output_dir.join(shard);
-        let result = stream_quantize(&in_path, &out_path, config)?;
+        // Per-shard runs get NO tensor-level callback (reference passes
+        // on_progress=None to the inner stream_quantize), but they DO honor
+        // the cancellation flag so a Ctrl-C stops at a tensor boundary.
+        let result = match cancel {
+            Some(flag) => stream_quantize_cancellable(&in_path, &out_path, config, None, flag)?,
+            None => stream_quantize(&in_path, &out_path, config)?,
+        };
         per_shard.push((shard.clone(), result.done));
+        if let Some(cb) = on_progress.as_deref_mut() {
+            cb(i + 1, total);
+        }
     }
 
     // Copy index json + sidecars unchanged (shard filenames / tensor names
@@ -298,8 +423,13 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     input: &S,
     output_path: &Path,
     config: &QuantConfig,
+    mut on_progress: Option<&mut ProgressFn>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamResult> {
     let names: Vec<String> = input.names().to_vec();
+    // Reference: `total = len(names)` — the full tensor count, independent of
+    // how many are already done from a resumed run.
+    let total = names.len();
 
     // ---- manifest / resume bookkeeping ------------------------------------ //
     let mut state = StreamState::new(output_path, config.config_hash());
@@ -386,6 +516,20 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     let mut corrected_bias: HashMap<String, Vec<u8>> = HashMap::new();
 
     for name in &remaining {
+        // Cooperative cancellation (Ctrl-C): stop at a tensor boundary. The
+        // writer has already flushed the header after every completed tensor
+        // and the manifest is saved per-tensor, so finalizing here leaves a
+        // valid, resumable partial output.
+        if let Some(flag) = cancel {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                writer.finalize()?;
+                state.save_manifest()?;
+                return Err(StreamError::Cancelled {
+                    done: state.done.len(),
+                    total,
+                });
+            }
+        }
         if corrected_bias.contains_key(name) {
             // Bias whose weight was already processed -> write corrected value.
             let info = input.info(name).expect("exists");
@@ -396,7 +540,7 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
                 &info.shape,
                 &corrected_bias[name.as_str()],
             )?;
-            finish_name(&mut state, name)?;
+            finish_name(&mut state, name, total, &mut on_progress)?;
             continue;
         }
 
@@ -470,7 +614,7 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
         } else {
             copy_tensor(name, input, &mut writer, target_dtype, &skip_cast)?;
         }
-        finish_name(&mut state, name)?;
+        finish_name(&mut state, name, total, &mut on_progress)?;
     }
 
     writer.finalize()?;
@@ -488,12 +632,23 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
 }
 
 /// Mark one tensor done and flush the manifest (mirrors per-tensor state.save).
-fn finish_name(state: &mut StreamState, name: &str) -> Result<()> {
+/// When a progress callback is present it is invoked with
+/// `(len(state.done), total)` after the manifest is saved — exactly like the
+/// reference's `on_progress(len(state.done), total)`.
+fn finish_name(
+    state: &mut StreamState,
+    name: &str,
+    total: usize,
+    on_progress: &mut Option<&mut ProgressFn>,
+) -> Result<()> {
     state.done.insert(name.to_string());
     if !state.order.iter().any(|o| o == name) {
         state.order.push(name.to_string());
     }
     state.save_manifest()?;
+    if let Some(cb) = on_progress {
+        cb(state.done.len(), total);
+    }
     Ok(())
 }
 

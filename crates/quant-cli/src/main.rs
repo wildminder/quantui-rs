@@ -1,11 +1,16 @@
 //! quantui-rs: standalone CLI for quantizing safetensors models.
 //!
-//! Subcommands implemented so far: `validate` (Phase 8.3).
-//! `quantize` and `info` land in Phase 9.
+//! Subcommands: `quantize` (Phase 9.2), `validate` (Phase 8.3), `info`
+//! (Phase 9.3). Arg definitions live in `args.rs` (Phase 9.1).
 
+mod args;
 mod commands;
+mod profiles;
+mod progress;
 
 use clap::{Parser, Subcommand};
+
+use args::{InfoArgs, QuantizeArgs, ValidateArgs};
 
 /// Standalone, dependency-free-at-runtime CLI for ComfyUI/GGUF model quantization.
 #[derive(Parser, Debug)]
@@ -22,24 +27,18 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Quantize a safetensors model (single file or sharded folder).
-    Quantize,
+    Quantize(QuantizeArgs),
     /// Structural + numeric validation of a quantized output.
-    Validate(commands::validate::ValidateArgs),
+    Validate(ValidateArgs),
     /// Inspect a safetensors header without loading tensors.
-    Info,
+    Info(InfoArgs),
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Quantize => {
-            println!("quantize: not implemented");
-            std::process::ExitCode::SUCCESS
-        }
+        Commands::Quantize(args) => commands::quantize::run(args),
         Commands::Validate(args) => commands::validate::run(args),
-        Commands::Info => {
-            println!("info: not implemented");
-            std::process::ExitCode::SUCCESS
-        }
+        Commands::Info(args) => commands::info::run(args),
     }
 }

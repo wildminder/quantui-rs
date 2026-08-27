@@ -9,21 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Args;
 use quant_core::validator::{format_report, validate_comfy_quant};
 
-#[derive(Args, Debug)]
-pub struct ValidateArgs {
-    /// One or more `.safetensors` files or directories containing them
-    /// (sharded output folders are expanded to their shard files).
-    #[arg(required = true)]
-    paths: Vec<PathBuf>,
-
-    /// Also run the numeric pass (weight bounds, scale finiteness/positivity,
-    /// input_scale == 1.0). Reads tensor payloads, not just headers.
-    #[arg(long)]
-    numeric: bool,
-}
+use crate::args::ValidateArgs;
 
 /// Collect the `.safetensors` files to validate for one CLI path argument.
 fn expand_path(path: &Path) -> Result<Vec<PathBuf>, String> {
