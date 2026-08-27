@@ -165,10 +165,11 @@ impl IncrementalWriter {
             })?;
         // Discard any partially-written trailing bytes so re-appends start from
         // a clean cursor (file length = header slot + kept data prefix).
-        fh.set_len(8 + slot + data_len).map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
+        fh.set_len(8 + slot + data_len)
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
         let mut w = Self {
             path,
             fh: Some(fh),

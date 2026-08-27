@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(f32_to_e2m1_bits(1.25), 2); // 1↔1.5 tie → 1 (code 2, even)
         assert_eq!(f32_to_e2m1_bits(0.75), 2); // 0.5↔1 tie → 1 (code 2, even)
         assert_eq!(f32_to_e2m1_bits(0.25), 0); // 0↔0.5 tie → 0 (code 0, even)
-        // Just off the ties.
+                                               // Just off the ties.
         assert_eq!(f32_to_e2m1_bits(5.1), 7);
         assert_eq!(f32_to_e2m1_bits(4.9), 6);
         assert_eq!(f32_to_e2m1_bits(0.26), 1);
@@ -299,8 +299,8 @@ mod tests {
         assert_eq!(f32_to_e2m1_bits(-100.0), 15);
         assert_eq!(f32_to_e2m1_bits(0.49), 1); // rounds to 0.5
         assert_eq!(f32_to_e2m1_bits(1e-30), 0); // deep underflow → 0
-        // Largest f32 below 1.0 still rounds up to 1.0 (code 2) via the
-        // denormal path overflowing into normal codes.
+                                                // Largest f32 below 1.0 still rounds up to 1.0 (code 2) via the
+                                                // denormal path overflowing into normal codes.
         assert_eq!(f32_to_e2m1_bits(f32::from_bits(0x3F7F_FFFF)), 2);
     }
 
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(r.scale_shape, vec![128, 4]);
         assert_eq!(r.per_tensor_scale, 1.0);
         assert_eq!(r.scale[0], 0x7E); // 448 in E4M3, flat index 0
-        // Codes: 7 1 2 3 4 5 6 7 | 9 10 11 12 13 14 15 0 (hi-first packing).
+                                      // Codes: 7 1 2 3 4 5 6 7 | 9 10 11 12 13 14 15 0 (hi-first packing).
         let expect = [0x71u8, 0x23, 0x45, 0x67, 0x9A, 0xBC, 0xDE, 0xF0];
         assert_eq!(&r.qdata[..8], &expect);
         // Padding rows (1..16) are zero blocks → all-zero bytes.

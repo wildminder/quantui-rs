@@ -34,16 +34,16 @@ impl ScalingMode {
 /// Python dict keys character-for-character.
 #[derive(Debug, Clone)]
 pub struct QuantConfig {
-    pub target_format: String,   // "int8"
-    pub int8: bool,              // true
+    pub target_format: String, // "int8"
+    pub int8: bool,            // true
     pub scaling_mode: ScalingMode,
-    pub block_size: u32,         // 128
+    pub block_size: u32,           // 128
     pub no_learned_rounding: bool, // --simple, true
-    pub convrot: bool,           // false
-    pub convrot_group_size: u32, // 256
+    pub convrot: bool,             // false
+    pub convrot_group_size: u32,   // 256
     /// Output dtype for skipped-weight casting: "bfloat16" | "float16".
     pub orig_dtype: String,
-    pub skip_inefficient: bool,  // --heur
+    pub skip_inefficient: bool, // --heur
     /// Pinned calibration seed (parity contract with the whole-file baseline).
     pub calib_seed: i64,
     /// Optional exclude-layers regex; None disables matching.
@@ -228,7 +228,10 @@ mod tests {
 
         // Simulate a partial run.
         std::fs::write(&out, b"partial").unwrap();
-        st.order = ["a.weight", "a.bias"].iter().map(|s| s.to_string()).collect();
+        st.order = ["a.weight", "a.bias"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         st.done.insert("a.weight".to_string());
         st.save_manifest().unwrap();
 
@@ -261,7 +264,11 @@ mod tests {
             s.push(".tmp");
             PathBuf::from(s)
         };
-        std::fs::write(&tmp_path, b"{\"version\":1,\"config_hash\":\"aabbccdd00112233\"}").unwrap();
+        std::fs::write(
+            &tmp_path,
+            b"{\"version\":1,\"config_hash\":\"aabbccdd00112233\"}",
+        )
+        .unwrap();
         let mut st = StreamState::new(&out, "aabbccdd00112233".into());
         assert!(!st.load_manifest(&out));
     }
@@ -273,7 +280,10 @@ mod tests {
         assert!(c.excluded("blocks.0.attn_norm.weight"));
         assert!(!c.excluded("blocks.1.ff.weight"));
         c.exclude_layers = Some("[invalid".into());
-        assert!(!c.excluded("attn_norm.weight"), "invalid regex never excludes");
+        assert!(
+            !c.excluded("attn_norm.weight"),
+            "invalid regex never excludes"
+        );
         c.exclude_layers = None;
         assert!(!c.excluded("anything"));
     }

@@ -43,9 +43,10 @@ fn e2e_parity_linear_basic_bf16() {
         "output bytes must equal golden"
     );
     // Manifest semantic equality.
-    let ours: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(out.with_extension("safetensors.quant-manifest.json")).unwrap())
-            .unwrap();
+    let ours: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.with_extension("safetensors.quant-manifest.json")).unwrap(),
+    )
+    .unwrap();
     let theirs: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dir.join("output.safetensors.quant-manifest.json")).unwrap(),
     )

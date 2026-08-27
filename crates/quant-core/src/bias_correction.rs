@@ -253,7 +253,10 @@ pub fn correct_bias(
     let sums = emulate_sum_dim0(&out_err, CALIB_SAMPLES, m);
 
     if std::env::var("BC_DEBUG").is_ok() {
-        let mut bytes: Vec<u8> = x[..CALIB_SAMPLES * n.min(128)].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut bytes: Vec<u8> = x[..CALIB_SAMPLES * n.min(128)]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         bytes.extend(out_err.iter().flat_map(|v| v.to_le_bytes()));
         bytes.extend(sums.iter().flat_map(|v| v.to_le_bytes()));
         std::fs::write("out_err_rust.bin", &bytes).unwrap();

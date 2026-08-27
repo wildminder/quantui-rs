@@ -27,7 +27,10 @@ fn load(path: &std::path::Path) -> SafetensorsReader {
 
 /// Convert raw input tensor bytes to f32 based on the header dtype string.
 fn to_f32(reader: &SafetensorsReader, name: &str) -> (Vec<f32>, Vec<u64>) {
-    let info = reader.header().get(name).unwrap_or_else(|| panic!("input tensor {name}"));
+    let info = reader
+        .header()
+        .get(name)
+        .unwrap_or_else(|| panic!("input tensor {name}"));
     let bytes = reader.tensor_bytes(name).unwrap();
     let shape = info.shape.clone();
     let vals = match info.dtype_raw.as_str() {

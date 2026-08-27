@@ -227,7 +227,7 @@ mod tests {
         // e8m0 for row 0 block 0 lands at flat index 0.
         assert_eq!(r.scale[0], 124);
         assert_eq!(r.qdata[31], 0x78); // 256.0 in E4M3
-        // 16/0.125 = 128 → 2^7 → biased exp 14, mant 0 → 0x70.
+                                       // 16/0.125 = 128 → 2^7 → biased exp 14, mant 0 → 0x70.
         assert_eq!(r.qdata[15], 0x70);
     }
 

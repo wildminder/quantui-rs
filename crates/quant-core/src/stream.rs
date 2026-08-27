@@ -20,7 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::bias_correction::{correct_bias, CalibCache};
-use crate::dtype::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, f16_bits_to_f32, DType};
+use crate::comfy_schema::{encode_comfy_quant, ComfyFormat};
+use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
 use crate::manifest::{QuantConfig, ScalingMode, StreamState};
 use crate::quant::{dequantize_int8, quantize_int8_weight, should_skip_shape};
 use crate::st_io::reader::SafetensorsReader;
@@ -140,9 +141,7 @@ pub fn stream_quantize(
         names.iter().map(|n| {
             let info = reader.header().get(n);
             match info {
-                Some(i) if is_quantizable(config, n, &i.shape) => {
-                    Some(i.shape[1] as usize)
-                }
+                Some(i) if is_quantizable(config, n, &i.shape) => Some(i.shape[1] as usize),
                 _ => None,
             }
         }),
@@ -173,8 +172,11 @@ pub fn stream_quantize(
             continue;
         }
 
-        let info_shape =
-            reader.header().get(name).map(|i| i.shape.as_slice()).unwrap_or(&[]);
+        let info_shape = reader
+            .header()
+            .get(name)
+            .map(|i| i.shape.as_slice())
+            .unwrap_or(&[]);
         if is_quantizable(config, name, info_shape) && reader.header().contains_key(name) {
             // Weight whose bias came earlier: specs were cached then; write now.
             if weight_outputs.contains_key(name) {
@@ -205,7 +207,14 @@ pub fn stream_quantize(
                     )?;
                 }
             } else {
-                compute_weight_outputs(name, &reader, config, &calib, &mut weight_outputs, &mut corrected_bias)?;
+                compute_weight_outputs(
+                    name,
+                    &reader,
+                    config,
+                    &calib,
+                    &mut weight_outputs,
+                    &mut corrected_bias,
+                )?;
                 let o = &weight_outputs[name];
                 writer.add_tensor(name, DType::I8, None, &[o.m, o.n], &o.q_bytes)?;
                 let base = base_of(name);
@@ -237,8 +246,11 @@ pub fn stream_quantize(
             // Bias reached BEFORE its weight: process (compute+cache) the
             // weight now but only write the bias here.
             let wname = format!("{}.weight", &name[..name.len() - ".bias".len()]);
-            let wshape =
-                reader.header().get(&wname).map(|i| i.shape.as_slice()).unwrap_or(&[]);
+            let wshape = reader
+                .header()
+                .get(&wname)
+                .map(|i| i.shape.as_slice())
+                .unwrap_or(&[]);
             if reader.header().contains_key(&wname) && is_quantizable(config, &wname, wshape) {
                 compute_weight_outputs(
                     &wname,
@@ -360,24 +372,23 @@ fn compute_weight_outputs(
 
     // <base>.weight_scale F32 with scalar squeeze for 1-element scales
     // (normalize_tensorwise_scales parity: [1]/[1,1] → shape []).
-    let scale_shape: Vec<u64> =
-        if r.scale.len() == 1 { vec![] } else { r.scale_shape.clone() };
+    let scale_shape: Vec<u64> = if r.scale.len() == 1 {
+        vec![]
+    } else {
+        r.scale_shape.clone()
+    };
     let scale_bytes: Vec<u8> = r.scale.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-    // <base>.comfy_quant blob: JSON with DEFAULT separators (", " / ": "),
-    // key order format, orig_dtype, group_size (block only).
-    let fmt_str = match config.scaling_mode {
-        ScalingMode::Block => "int8_blockwise",
-        _ => "int8_tensorwise",
+    // <base>.comfy_quant blob via the comfy_schema encoder (Phase 3.5):
+    // family-A key order format, orig_dtype, group_size (block only). The
+    // encoder emits group_size only for block-based formats, so passing the
+    // block size unconditionally is safe for tensor/row modes.
+    let comfy_fmt = match config.scaling_mode {
+        ScalingMode::Block => ComfyFormat::Int8Blockwise,
+        _ => ComfyFormat::Int8Tensorwise,
     };
     let orig = resolve_orig_dtype_str(&config.orig_dtype);
-    let blob = match config.scaling_mode {
-        ScalingMode::Block => format!(
-            r#"{{"format": "{fmt_str}", "orig_dtype": "{orig}", "group_size": {}}}"#,
-            config.block_size
-        ),
-        _ => format!(r#"{{"format": "{fmt_str}", "orig_dtype": "{orig}"}}"#),
-    };
+    let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
     let input_scale = matches!(config.scaling_mode, ScalingMode::Block);
 
     weight_outputs.insert(
@@ -386,7 +397,7 @@ fn compute_weight_outputs(
             q_bytes,
             scale_bytes,
             scale_shape,
-            blob: blob.into_bytes(),
+            blob,
             input_scale,
             m: m as u64,
             n: n as u64,
@@ -395,18 +406,9 @@ fn compute_weight_outputs(
 
     // ---- sibling-bias correction (Phase 7.3) -------------------------------- //
     let bias_name = format!("{base}.bias", base = base_of(name));
-    if reader.header().contains_key(&bias_name)
-        && !corrected_bias.contains_key(&bias_name)
-    {
+    if reader.header().contains_key(&bias_name) && !corrected_bias.contains_key(&bias_name) {
         if let Some(x) = calib.get(n) {
-            let w_dq = dequantize_int8(
-                &r.qdata,
-                &r.scale,
-                m,
-                n,
-                mode,
-                config.block_size as usize,
-            );
+            let w_dq = dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
             let bias_info = reader.header().get(&bias_name).expect("checked");
             let bias_raw = reader.tensor_bytes(&bias_name)?;
             assert_eq!(
@@ -518,12 +520,6 @@ fn copy_tensor(
     }
 
     // Verbatim passthrough with original dtype string.
-    writer.add_tensor(
-        name,
-        info.dtype,
-        Some(&info.dtype_raw),
-        &info.shape,
-        data,
-    )?;
+    writer.add_tensor(name, info.dtype, Some(&info.dtype_raw), &info.shape, data)?;
     Ok(())
 }

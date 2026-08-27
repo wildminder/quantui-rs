@@ -32,7 +32,10 @@ fn load(path: &std::path::Path) -> SafetensorsReader {
 
 /// Convert raw input tensor bytes to f32 based on the header dtype string.
 fn to_f32(reader: &SafetensorsReader, name: &str) -> (Vec<f32>, Vec<u64>) {
-    let info = reader.header().get(name).unwrap_or_else(|| panic!("input tensor {name}"));
+    let info = reader
+        .header()
+        .get(name)
+        .unwrap_or_else(|| panic!("input tensor {name}"));
     let bytes = reader.tensor_bytes(name).unwrap();
     let shape = info.shape.clone();
     let vals = match info.dtype_raw.as_str() {
@@ -133,8 +136,13 @@ fn check_case(case: &str) {
         let s2_golden = output
             .tensor_bytes(&scale2_name)
             .unwrap_or_else(|_| panic!("{case}/nvfp4: missing {scale2_name}"));
-        assert_eq!(s2_golden.len(), 4, "{case}/nvfp4/{name}: weight_scale_2 not scalar");
-        let golden_pts = f32::from_le_bytes([s2_golden[0], s2_golden[1], s2_golden[2], s2_golden[3]]);
+        assert_eq!(
+            s2_golden.len(),
+            4,
+            "{case}/nvfp4/{name}: weight_scale_2 not scalar"
+        );
+        let golden_pts =
+            f32::from_le_bytes([s2_golden[0], s2_golden[1], s2_golden[2], s2_golden[3]]);
         assert_eq!(
             r.per_tensor_scale.to_bits(),
             golden_pts.to_bits(),

@@ -189,7 +189,9 @@ impl TorchRng {
     /// literals, so the resulting calibration tensor matches torch CPU
     /// bit-for-bit (verified: 0 ulp vs torch.randn with seed 233983427).
     fn randn_normal_fill(&mut self, numel: usize) -> Vec<f32> {
-        let mut data: Vec<f32> = (0..numel).map(|_| uniform_real_f32(self.engine.random_u32())).collect();
+        let mut data: Vec<f32> = (0..numel)
+            .map(|_| uniform_real_f32(self.engine.random_u32()))
+            .collect();
 
         let mut i = 0usize;
         while i + 16 <= numel {
@@ -237,7 +239,7 @@ const LOG_SQRTHF: f32 = 0.707106781186547524;
 #[inline]
 pub(crate) fn log256_ps(mut x: f32) -> f32 {
     let invalid = x <= 0.0; // _mm256_cmp_ps(x, 0, _CMP_LE_OS)
-    // cut off denormals: x = max(x, min_norm_pos)
+                            // cut off denormals: x = max(x, min_norm_pos)
     const MIN_NORM_POS: f32 = f32::from_bits(0x0080_0000);
     if !(x >= MIN_NORM_POS) {
         x = MIN_NORM_POS;
@@ -288,7 +290,11 @@ const DP1: f32 = -0.78515625;
 const DP2: f32 = -2.4187564849853515625e-4;
 const DP3: f32 = -3.77489497744594108e-8;
 const SINCOF: [f32; 3] = [-1.9515295891E-4, 8.3321608736E-3, -1.6666654611E-1];
-const COSCOF: [f32; 3] = [2.443315711809948E-005, -1.388731625493765E-003, 4.166664568298827E-002];
+const COSCOF: [f32; 3] = [
+    2.443315711809948E-005,
+    -1.388731625493765E-003,
+    4.166664568298827E-002,
+];
 
 #[inline]
 pub(crate) fn sincos256_ps(x_in: f32) -> (f32, f32) {
@@ -373,8 +379,14 @@ mod tests {
         // numel < 16 → scalar cached-pair path.
         // torch randn(8, seed=233983427) bit-exact:
         let bits = [
-            0x3efb_ea0au32, 0xbe9b_5326, 0x3f02_d4fd, 0xbf9a_5216, 0xbd71_6485, 0x3d65_2e68,
-            0xbf96_cc45, 0x3f09_4365,
+            0x3efb_ea0au32,
+            0xbe9b_5326,
+            0x3f02_d4fd,
+            0xbf9a_5216,
+            0xbd71_6485,
+            0x3d65_2e68,
+            0xbf96_cc45,
+            0x3f09_4365,
         ];
         let expected: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
         let got = TorchRng::manual_seed(233983427).randn_f32(8);
@@ -414,16 +426,45 @@ mod tests {
         // Bit-exact expected: our scalar port of log256_ps/sincos256_ps
         // reproduces the AVX2 polynomial math instruction-for-instruction.
         let bits = [
-            0xbe8e_e95eu32, 0x3f22_4dde, 0x3f5b_a5c6, 0x3fa3_34c4, 0xbf69_abe2, 0x3fdd_f2d6,
-            0xbec2_8396, 0x3e6e_01af, 0x3f68_d65b, 0xbf06_dbe3, 0xbf5a_835b, 0x3f95_7fe8,
-            0x4025_81fe, 0x3f94_34a3, 0x3f4b_a448, 0xbee5_0f39, 0x3e93_9816, 0x3f08_7395,
-            0xbf76_1eda, 0x3f68_6b4b, 0xbfc1_2dda, 0x3f1e_9dfb, 0xbf75_5245, 0xbf3f_6f47,
-            0xbdfa_994d, 0x3f2b_922e, 0xbeee_5ef1, 0xbed6_eb38, 0xbf86_807c, 0xc046_0027,
-            0x3e0f_084f, 0xbef5_bb76,
+            0xbe8e_e95eu32,
+            0x3f22_4dde,
+            0x3f5b_a5c6,
+            0x3fa3_34c4,
+            0xbf69_abe2,
+            0x3fdd_f2d6,
+            0xbec2_8396,
+            0x3e6e_01af,
+            0x3f68_d65b,
+            0xbf06_dbe3,
+            0xbf5a_835b,
+            0x3f95_7fe8,
+            0x4025_81fe,
+            0x3f94_34a3,
+            0x3f4b_a448,
+            0xbee5_0f39,
+            0x3e93_9816,
+            0x3f08_7395,
+            0xbf76_1eda,
+            0x3f68_6b4b,
+            0xbfc1_2dda,
+            0x3f1e_9dfb,
+            0xbf75_5245,
+            0xbf3f_6f47,
+            0xbdfa_994d,
+            0x3f2b_922e,
+            0xbeee_5ef1,
+            0xbed6_eb38,
+            0xbf86_807c,
+            0xc046_0027,
+            0x3e0f_084f,
+            0xbef5_bb76,
         ];
         let expected: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
         let got = TorchRng::manual_seed(233983427).randn_f32(32);
-        assert_eq!(got, expected, "normal_fill randn must be bit-exact vs torch");
+        assert_eq!(
+            got, expected,
+            "normal_fill randn must be bit-exact vs torch"
+        );
     }
 
     #[test]
@@ -436,7 +477,10 @@ mod tests {
             let approx = log256_ps(x);
             let exact = x.ln();
             let d = approx.to_bits().abs_diff(exact.to_bits());
-            assert!(d <= 2 || (approx - exact).abs() / exact.abs() < 1e-6, "log({x})");
+            assert!(
+                d <= 2 || (approx - exact).abs() / exact.abs() < 1e-6,
+                "log({x})"
+            );
         }
     }
 

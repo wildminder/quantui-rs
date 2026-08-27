@@ -187,7 +187,11 @@ pub fn fp8_e4m3_bits_to_f32(input: u8) -> f32 {
     } else {
         nonsign.leading_zeros()
     };
-    let renorm_shift = if renorm_shift > 4 { renorm_shift - 4 } else { 0 };
+    let renorm_shift = if renorm_shift > 4 {
+        renorm_shift - 4
+    } else {
+        0
+    };
 
     // All-ones exponent+mantissa (NaN pattern) → exponent becomes 0xFF.
     let inf_nan_mask = (((nonsign as i32).wrapping_add(0x0100_0000) >> 8) as u32) & 0x7F80_0000;

@@ -4,6 +4,7 @@
 //! Only modules needed for the current phase are enabled; the rest are stubbed out
 //! with TODO(phase-N) markers and will be uncommented as phases land.
 
+pub mod comfy_schema;
 pub mod dtype;
 pub mod manifest;
 pub mod quant;
@@ -14,7 +15,7 @@ pub mod stream;
 // Enabled early: Phase 1 (safetensors IO) scaffolding created in Phase 0 per spec.
 pub mod st_io;
 // TODO(phase-10) pub mod gguf_registry;
-pub mod torch_rng;
 pub mod bias_correction;
+pub mod torch_rng;
 // TODO(phase-8) pub mod validator;
 // TODO(phase-6) pub mod discover;
