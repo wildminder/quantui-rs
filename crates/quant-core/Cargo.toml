@@ -5,6 +5,9 @@ edition.workspace = true
 description = "Core library: safetensors IO, INT8/FP8/MXFP8/NVFP4 quantization kernels, manifests"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 thiserror = "2"
 memmap2 = "0.9"
@@ -24,3 +27,9 @@ tempfile = "3"
 # Phase 10 E2E tests read the GGUF output back through the crate's own parser.
 rlx-gguf = "=0.2.14"
 half = "2"
+# Phase 11.1: throughput benchmark (GB/s) of the streaming quantizer.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "stream_throughput"
+harness = false

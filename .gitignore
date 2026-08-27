@@ -3,3 +3,7 @@
 __pycache__/
 .workbuddy-ai/
 _backup
+# Phase 11.1: large generated benchmark fixture + criterion HTML reports.
+/tests/bench/*.safetensors
+/crates/quant-core/target/
+target/criterion/

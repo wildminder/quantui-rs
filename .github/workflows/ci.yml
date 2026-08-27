@@ -5,9 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# Phase 11.3: full regression + golden byte-parity on both Windows and Linux.
+# The golden fixtures (tests/golden/**) are committed and marked binary in
+# .gitattributes so byte-compare parity tests are valid on every OS.
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
@@ -16,7 +20,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo build --release
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (incl. golden byte-parity)
+        run: cargo test --workspace
+      - name: Release build
+        run: cargo build --release
+      - name: Report release binary size
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            ls -la target/release/quantui-rs.exe
+          else
+            ls -la target/release/quantui-rs
+          fi

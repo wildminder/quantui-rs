@@ -1,1 +1,10 @@
 * text=auto
+
+# Phase 11.3: byte-exact golden fixtures must survive git checkout unchanged on
+# every OS. `text=auto` would otherwise risk CRLF/EOL mangling of binary parity
+# files on Windows<->Linux CI checkouts, silently breaking byte-compare tests.
+*.safetensors binary
+*.gguf binary
+*.bin binary
+*.pt binary
+*.npz binary

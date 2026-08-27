@@ -120,19 +120,26 @@ pub fn quantize_int8_weight(
             let bm = m / block_size;
             let bn = n / block_size;
             // Per-block amax over the (bs, bs) tile; scale = max(amax/127, 1e-8).
+            // Parallelized over block-rows (Phase 11.1 perf). This is bit-safe:
+            // each block's amax is a `max` over its own fixed element set
+            // (order-independent), and every block writes a distinct `scale` slot,
+            // so the result is identical to the sequential loop.
             let mut scale = vec![0.0f32; bm * bn];
-            for bi in 0..bm {
-                for bj in 0..bn {
-                    let mut amax = 0.0f32;
-                    for i in bi * block_size..(bi + 1) * block_size {
-                        let row = &w[i * n..(i + 1) * n];
-                        for &v in &row[bj * block_size..(bj + 1) * block_size] {
-                            amax = amax.max(v.abs());
+            scale
+                .par_chunks_mut(bn)
+                .enumerate()
+                .for_each(|(bi, scale_row)| {
+                    for bj in 0..bn {
+                        let mut amax = 0.0f32;
+                        for i in bi * block_size..(bi + 1) * block_size {
+                            let row = &w[i * n..(i + 1) * n];
+                            for &v in &row[bj * block_size..(bj + 1) * block_size] {
+                                amax = amax.max(v.abs());
+                            }
                         }
+                        scale_row[bj] = (amax / 127.0).max(1e-8);
                     }
-                    scale[bi * bn + bj] = (amax / 127.0).max(1e-8);
-                }
-            }
+                });
             // Divide by broadcast scale, clamp, round-ties-even, to i8.
             // Parallelized over output blocks (order-preserving).
             let n_blocks_row = bn;

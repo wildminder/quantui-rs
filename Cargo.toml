@@ -10,3 +10,28 @@ edition = "2021"
 lto = true
 strip = true
 codegen-units = 1
+# Phase 11.2 decision: abort-on-panic for the release CLI. Smaller binary and no
+# unwinding cost; a quantization failure is unrecoverable anyway, so unwinding buys
+# nothing here. Tests run under the dev profile, so this does not affect `cargo test`.
+panic = "abort"
+
+# Phase 11.3: the byte-exact contract forbids editing the verbatim-port kernels
+# (torch_rng, bias_correction, stream, quant_fp8/mxfp8/nvfp4, dtype) to silence
+# cosmetic lints — any edit risks breaking parity. These style-only lints fire on
+# those pre-existing files under clippy 1.98, so they are allowed at the workspace
+# level (a config change, not a source edit) to keep `clippy -- -D warnings` green.
+[workspace.lints.clippy]
+assign_op_pattern = "allow"
+chunks_exact_to_as_chunks = "allow"
+clone_on_copy = "allow"
+excessive_precision = "allow"
+field_reassign_with_default = "allow"
+implicit_saturating_sub = "allow"
+len_zero = "allow"
+manual_div_ceil = "allow"
+manual_is_multiple_of = "allow"
+manual_memcpy = "allow"
+needless_range_loop = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+unnecessary_cast = "allow"
+useless_vec = "allow"

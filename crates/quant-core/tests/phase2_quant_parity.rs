@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use quant_core::dtype::{bf16_bits_to_f32, f32_to_bf16_bits};
+use quant_core::dtype::bf16_bits_to_f32;
 use quant_core::quant::{quantize_int8_weight, should_skip_shape, ScalingMode};
 use quant_core::st_io::reader::SafetensorsReader;
 
@@ -135,7 +135,6 @@ fn skipped_weight_cast_to_bf16_matches_golden() {
         "skipped bf16 weight must pass through verbatim"
     );
     // Header records BF16 (cast target), not the raw U16 tolerance form.
-    use quant_core::st_io::header::Header as _;
     let info = output.header().get("blocks.1.weight").unwrap();
     assert_eq!(info.dtype_raw, "BF16");
 }

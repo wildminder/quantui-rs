@@ -5,6 +5,9 @@ edition.workspace = true
 description = "quantui-rs: standalone CLI for safetensors -> ComfyUI/GGUF quantization"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "quantui-rs"
 path = "src/main.rs"
