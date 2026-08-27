@@ -260,9 +260,12 @@ fn run_single(
     let mut sink: Box<dyn ProgressSink> = make_sink(args, "quantizing");
     let result = {
         let mut cb = |cur: usize, total: usize| sink.update(cur, total);
-        stream_quantize_cancellable(&args.input, &output, config, Some(&mut cb), cancel)?
+        stream_quantize_cancellable(&args.input, &output, config, Some(&mut cb), cancel)
     };
+    // Always clear the progress bar before reporting — including on
+    // cancellation/error — so the stop message is never garbled by the bar.
     sink.finish();
+    let result = result?;
 
     Ok(RunOutcome {
         summary: format!(
@@ -308,9 +311,10 @@ fn run_sharded(
                     config,
                     Some(&mut cb),
                     cancel,
-                )?
+                )
             };
             sink.finish();
+            let result = result?;
             Ok(RunOutcome {
                 summary: format!(
                     "wrote {} ({} tensors, config_hash {})",
@@ -332,9 +336,10 @@ fn run_sharded(
                     config,
                     Some(&mut cb),
                     cancel,
-                )?
+                )
             };
             sink.finish();
+            let result = result?;
             Ok(RunOutcome {
                 summary: format!(
                     "wrote {} ({} shard(s), config_hash {})",

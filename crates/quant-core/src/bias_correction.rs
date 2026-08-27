@@ -32,6 +32,8 @@
 //! - mean = cascade sum then f32 division by S; bias update b - corr in f32.
 
 use crate::torch_rng::TorchRng;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const CALIB_SAMPLES: usize = 3072;
 
@@ -158,38 +160,29 @@ fn ilp_col_sum(col: &[f32]) -> f32 {
 ///   C%4 columns use scalar `row_sum` (same ilp structure).
 ///
 /// Thread parallelization splits columns only; per-column order is unchanged.
+///
+/// Bit-safe parallelization: each output column depends only on its own input
+/// column (a self-contained cascade), and every column writes a distinct `out`
+/// slot. The per-column algorithm (plain cascade vs ilp) is a pure function of
+/// the column index `j` and `cols`, so scheduling columns across threads in any
+/// order reproduces the sequential result bit-for-bit.
 fn emulate_sum_dim0(mat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     assert_eq!(mat.len(), rows * cols);
     let mut out = vec![0.0f32; cols];
-    let at = |j: usize, i: usize| mat[i * cols + j];
-    let mut j = 0usize;
-    if cols >= 8 {
-        while j + 32 <= cols {
-            for jj in j..j + 32 {
-                let c: Vec<f32> = (0..rows).map(|i| at(jj, i)).collect();
-                out[jj] = plain_col_sum(&c);
-            }
-            j += 32;
-        }
-        while j < cols {
-            let c: Vec<f32> = (0..rows).map(|i| at(j, i)).collect();
-            out[j] = ilp_col_sum(&c);
-            j += 1;
-        }
-    } else {
-        while j + 4 <= cols {
-            for jj in j..j + 4 {
-                let c: Vec<f32> = (0..rows).map(|i| at(jj, i)).collect();
-                out[jj] = plain_col_sum(&c);
-            }
-            j += 4;
-        }
-        while j < cols {
-            let c: Vec<f32> = (0..rows).map(|i| at(j, i)).collect();
-            out[j] = ilp_col_sum(&c);
-            j += 1;
-        }
-    }
+    // Sequential dispatch groups: cols >= 8 -> 32-groups of plain cascade then
+    // ilp tail; cols < 8 -> 4-groups of plain cascade then ilp tail. In both
+    // cases the first `plain_count` columns use the plain per-column cascade
+    // and the remainder use the ilp strided partials.
+    let group = if cols >= 8 { 32 } else { 4 };
+    let plain_count = (cols / group) * group;
+    out.par_iter_mut().enumerate().for_each(|(j, slot)| {
+        let c: Vec<f32> = (0..rows).map(|i| mat[i * cols + j]).collect();
+        *slot = if j < plain_count {
+            plain_col_sum(&c)
+        } else {
+            ilp_col_sum(&c)
+        };
+    });
     out
 }
 
@@ -197,6 +190,9 @@ fn emulate_sum_dim0(mat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 ///
 /// - `x`: calib data `(S, N)` row-major; `w_orig`, `w_dq`: `(M, N)` row-major;
 ///   `bias`: `(M,)`; all f32. Returns the corrected bias `(M,)` as **f32 values**.
+/// - `cancel`: optional cooperative-cancellation flag (Ctrl-C). When set, the
+///   GEMM stops scheduling new work promptly and this returns `None`. The
+///   caller treats `None` as "abort the run at a tensor boundary".
 ///
 /// The caller is responsible for casting the result back to the bias's original
 /// dtype (mirroring the reference's `(b_orig - corr).to(dtype=bias.dtype)`):
@@ -209,7 +205,8 @@ pub fn correct_bias(
     bias: &[f32],
     m: usize,
     n: usize,
-) -> Vec<f32> {
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<f32>> {
     debug_assert_eq!(x.len(), CALIB_SAMPLES * n);
     debug_assert_eq!(w_orig.len(), m * n);
     debug_assert_eq!(w_dq.len(), m * n);
@@ -223,39 +220,74 @@ pub fn correct_bias(
     // added to the previous rounded f32 partial, rounded once back to f32).
     // For K <= 128 this degenerates to a single chain. Validated bit-exact
     // vs torch 2.13.0+cpu at S=3072 for K in {64, 128, 256}
-    // (target/probe_gemm_final.py). Materializing (S, M) costs ~3MB.
+    // (target/probe_gemm_final.py).
+    //
+    // Parallelization (bit-safe): each output element out_err[s, i] owns its
+    // own K-accumulation chain, independent of every other element, so we may
+    // schedule the (s, i) work across threads in any order without changing a
+    // single accumulated bit. We parallelize over `s` (rows of the output /
+    // calibration rows), keeping the reference's inner loop order (i, then j)
+    // intact inside each task — this preserves the original cache behavior
+    // (the calibration row `xs` is loaded once and reused across all `i`).
+    // Same order-independence argument as the block-amax pass (Phase 11.1).
+    //
+    // The `err` matrix (w_orig - w_dq, "the err tensor itself is an f32 torch
+    // op") is materialized ONCE up front and shared read-only across tasks.
+    // f32 subtraction is deterministic, so this is bit-identical to computing
+    // `ro[j] - rd[j]` inline, and it removes (S-1)·m·n redundant subtractions.
+    //
+    // Cancellation: `try_for_each` short-circuits — once any task sees the
+    // flag set it returns Err and rayon stops scheduling further tasks, so a
+    // Ctrl-C takes effect within one task's worth of work (a few ms), not
+    // after the whole (S, M) GEMM.
     const GEMM_K_CHUNK: usize = 128;
-    let mut out_err = vec![0.0f32; CALIB_SAMPLES * m];
-    for s in 0..CALIB_SAMPLES {
-        let xs = &x[s * n..(s + 1) * n];
-        for i in 0..m {
-            let ro = &w_orig[i * n..(i + 1) * n];
-            let rd = &w_dq[i * n..(i + 1) * n];
-            let mut acc = 0.0f32;
-            let mut j0 = 0usize;
-            let mut first = true;
-            while j0 < n {
-                let j1 = (j0 + GEMM_K_CHUNK).min(n);
-                let mut part = 0.0f32;
-                for j in j0..j1 {
-                    let e = ro[j] - rd[j]; // err tensor itself is an f32 torch op
-                    part = ((xs[j] as f64) * (e as f64) + (part as f64)) as f32;
+    let s_count = CALIB_SAMPLES;
+    let err: Vec<f32> = (0..w_orig.len())
+        .into_par_iter()
+        .map(|k| w_orig[k] - w_dq[k])
+        .collect();
+    let mut out_err = vec![0.0f32; s_count * m];
+    let gemm_cancelled = out_err
+        .par_chunks_mut(m)
+        .enumerate()
+        .try_for_each(|(s, row)| {
+            if let Some(flag) = cancel {
+                if flag.load(Ordering::Relaxed) {
+                    return Err(());
                 }
-                acc = if first {
-                    part
-                } else {
-                    ((acc as f64) + (part as f64)) as f32
-                };
-                first = false;
-                j0 = j1;
             }
-            out_err[s * m + i] = acc;
-        }
+            let xs = &x[s * n..(s + 1) * n];
+            for i in 0..m {
+                let er = &err[i * n..(i + 1) * n];
+                let mut acc = 0.0f32;
+                let mut j0 = 0usize;
+                let mut first = true;
+                while j0 < n {
+                    let j1 = (j0 + GEMM_K_CHUNK).min(n);
+                    let mut part = 0.0f32;
+                    for j in j0..j1 {
+                        part = ((xs[j] as f64) * (er[j] as f64) + (part as f64)) as f32;
+                    }
+                    acc = if first {
+                        part
+                    } else {
+                        ((acc as f64) + (part as f64)) as f32
+                    };
+                    first = false;
+                    j0 = j1;
+                }
+                row[i] = acc;
+            }
+            Ok(())
+        })
+        .is_err();
+    if gemm_cancelled {
+        return None;
     }
 
     // Reduction stage: sum(dim=0) via the cascade algorithm, then mean =
     // elementwise f32 division by S; bias update b - corr in plain f32.
-    let sums = emulate_sum_dim0(&out_err, CALIB_SAMPLES, m);
+    let sums = emulate_sum_dim0(&out_err, s_count, m);
 
     if std::env::var("BC_DEBUG").is_ok() {
         let mut bytes: Vec<u8> = x[..CALIB_SAMPLES * n.min(128)]
@@ -272,5 +304,108 @@ pub fn correct_bias(
         let corr = s / CALIB_SAMPLES as f32;
         out.push(b - corr);
     }
-    out
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Deterministic pseudo-random f32 in [-1, 1) from a 64-bit state (SplitMix64).
+    fn next_f32(state: &mut u64) -> f32 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Map to [-1, 1).
+        ((z >> 40) as f32 / (1u64 << 24) as f32) - 1.0
+    }
+
+    /// Naive SEQUENTIAL reference of the GEMM + reduction + bias update,
+    /// mirroring the original (pre-parallelization) loop order exactly:
+    /// s outer, i middle, j inner with 128-element K chunks. Used to prove the
+    /// parallelized `correct_bias` is bit-identical.
+    fn sequential_correct_bias(x: &[f32], w_orig: &[f32], w_dq: &[f32], bias: &[f32], m: usize, n: usize) -> Vec<f32> {
+        const K_CHUNK: usize = 128;
+        let mut out_err = vec![0.0f32; CALIB_SAMPLES * m];
+        for s in 0..CALIB_SAMPLES {
+            let xs = &x[s * n..(s + 1) * n];
+            for i in 0..m {
+                let ro = &w_orig[i * n..(i + 1) * n];
+                let rd = &w_dq[i * n..(i + 1) * n];
+                let mut acc = 0.0f32;
+                let mut j0 = 0usize;
+                let mut first = true;
+                while j0 < n {
+                    let j1 = (j0 + K_CHUNK).min(n);
+                    let mut part = 0.0f32;
+                    for j in j0..j1 {
+                        let e = ro[j] - rd[j];
+                        part = ((xs[j] as f64) * (e as f64) + (part as f64)) as f32;
+                    }
+                    acc = if first {
+                        part
+                    } else {
+                        ((acc as f64) + (part as f64)) as f32
+                    };
+                    first = false;
+                    j0 = j1;
+                }
+                out_err[s * m + i] = acc;
+            }
+        }
+        let sums = emulate_sum_dim0(&out_err, CALIB_SAMPLES, m);
+        let mut out = Vec::with_capacity(m);
+        for (b, s) in bias.iter().zip(sums.iter()) {
+            let corr = s / CALIB_SAMPLES as f32;
+            out.push(b - corr);
+        }
+        out
+    }
+
+    #[test]
+    fn parallel_correct_bias_is_bit_identical_to_sequential() {
+        // Small but non-trivial dims; n not a multiple of 128 to exercise the
+        // K-chunk tail, m spanning both the 32-group and ilp-tail reduction paths.
+        let (m, n) = (40usize, 300usize);
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let x: Vec<f32> = (0..CALIB_SAMPLES * n).map(|_| next_f32(&mut state)).collect();
+        let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+        let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+        let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();
+
+        let par = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, None).expect("no cancel");
+        let seq = sequential_correct_bias(&x, &w_orig, &w_dq, &bias, m, n);
+
+        assert_eq!(par.len(), seq.len());
+        for (i, (a, b)) in par.iter().zip(seq.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "bias[{i}] differs: parallel={a} sequential={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn correct_bias_returns_none_when_cancelled() {
+        let (m, n) = (8usize, 64usize);
+        let mut state = 42u64;
+        let x: Vec<f32> = (0..CALIB_SAMPLES * n).map(|_| next_f32(&mut state)).collect();
+        let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+        let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+        let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();
+
+        // Flag already set before the call → must abort and return None.
+        let cancel = AtomicBool::new(true);
+        let res = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, Some(&cancel));
+        assert!(res.is_none(), "pre-set cancel flag must abort the GEMM");
+
+        // Flag not set → completes normally.
+        let cancel = AtomicBool::new(false);
+        let res = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, Some(&cancel));
+        assert!(res.is_some(), "unset flag must complete");
+    }
 }

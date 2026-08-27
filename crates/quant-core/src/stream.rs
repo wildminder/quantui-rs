@@ -551,14 +551,24 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
         if is_quantizable(config, name, info_shape) && input.info(name).is_some() {
             // Weight whose bias came earlier: specs were cached then; write now.
             if !weight_outputs.contains_key(name) {
-                compute_weight_outputs(
+                let completed = compute_weight_outputs(
                     name,
                     input,
                     config,
                     &calib,
                     &mut weight_outputs,
                     &mut corrected_bias,
+                    cancel,
                 )?;
+                if !completed {
+                    // Ctrl-C during bias correction: stop at a tensor boundary.
+                    writer.finalize()?;
+                    state.save_manifest()?;
+                    return Err(StreamError::Cancelled {
+                        done: state.done.len(),
+                        total,
+                    });
+                }
             }
             let o = &weight_outputs[name];
             writer.add_tensor(name, DType::I8, None, &[o.m, o.n], &o.q_bytes)?;
@@ -595,14 +605,24 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
                 .map(|i| i.shape.as_slice())
                 .unwrap_or(&[]);
             if input.info(&wname).is_some() && is_quantizable(config, &wname, wshape) {
-                compute_weight_outputs(
+                let completed = compute_weight_outputs(
                     &wname,
                     input,
                     config,
                     &calib,
                     &mut weight_outputs,
                     &mut corrected_bias,
+                    cancel,
                 )?;
+                if !completed {
+                    // Ctrl-C during bias correction: stop at a tensor boundary.
+                    writer.finalize()?;
+                    state.save_manifest()?;
+                    return Err(StreamError::Cancelled {
+                        done: state.done.len(),
+                        total,
+                    });
+                }
                 let info = input.info(name).expect("bias exists");
                 writer.add_tensor(
                     name,
@@ -690,6 +710,13 @@ fn resolve_output_dtype(s: &str) -> Option<DType> {
 /// the weight's own file position), and if a sibling `.bias` exists compute +
 /// cache its corrected bytes (mirrors process_weight in reference
 /// stream_quant.py — which writes nothing itself).
+///
+/// Returns `Ok(true)` when the weight (and any sibling bias) was fully
+/// computed, or `Ok(false)` when cooperative cancellation was requested during
+/// the (long-running) bias-correction GEMM — the caller must then finalize the
+/// writer, save the manifest, and report `StreamError::Cancelled`. Nothing is
+/// written to disk mid-tensor, so a `false` return leaves the last completed
+/// tensor as the valid resume point.
 #[allow(clippy::type_complexity)]
 fn compute_weight_outputs<S: TensorSource + ?Sized>(
     name: &str,
@@ -698,7 +725,8 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
     calib: &CalibCache,
     weight_outputs: &mut HashMap<String, WeightOutputs>,
     corrected_bias: &mut HashMap<String, Vec<u8>>,
-) -> Result<()> {
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<bool> {
     let info = input.info(name).expect("checked caller");
     let (m, n) = (info.shape[0] as usize, info.shape[1] as usize);
     if !config.skip_inefficient
@@ -792,7 +820,11 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     })
                 }
             };
-            let corrected = correct_bias(x, &w_f32, &w_dq, &bias, m, n);
+            let corrected = match correct_bias(x, &w_f32, &w_dq, &bias, m, n, cancel) {
+                Some(c) => c,
+                // Ctrl-C during the bias-correction GEMM: abort promptly.
+                None => return Ok(false),
+            };
             // Cast back to the bias's original dtype (reference parity).
             let bytes: Vec<u8> = match bias_info.dtype {
                 DType::F32 => corrected.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -811,7 +843,7 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
         // Missing calibration entry → torch reference warns and keeps the
         // original bias; our copy path handles that naturally.
     }
-    Ok(())
+    Ok(true)
 }
 
 fn base_of(weight_name: &str) -> &str {
