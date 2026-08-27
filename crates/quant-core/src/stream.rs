@@ -91,6 +91,9 @@ pub enum StreamError {
     /// completed tensor.
     #[error("cancelled after {done} of {total} tensors (partial output is resumable)")]
     Cancelled { done: usize, total: usize },
+    /// Bias correction needs a float bias (f32/f16/bf16); got something else.
+    #[error("bias `{name}` has unsupported dtype {dtype} for bias correction (need f32/f16/bf16)")]
+    UnsupportedBiasDtype { name: String, dtype: DType },
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
@@ -762,16 +765,47 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
             let w_dq = dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
             let bias_info = input.info(&bias_name).expect("checked");
             let bias_raw = input.tensor_bytes(&bias_name)?;
-            assert_eq!(
-                bias_info.dtype,
-                DType::F32,
-                "fixtures use F32 biases; extend decode for others when needed"
-            );
-            let bias: Vec<f32> = bias_raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let bytes = correct_bias(x, &w_f32, &w_dq, &bias, m, n);
+            // The reference correct biases of ANY dtype: it upcasts to f32 for
+            // the math, then casts the result back to the bias's original dtype
+            // (`(b_orig - corr).to(dtype=bias.dtype)`, stream_quant.py:145).
+            // Real models (e.g. VibeVoice) ship BF16 biases, so decode f32/f16/
+            // bf16 here and re-encode into the original dtype below. For F32 the
+            // round trip is the identity, so byte-parity with the F32 goldens is
+            // preserved exactly.
+            let bias: Vec<f32> = match bias_info.dtype {
+                DType::F32 => bias_raw
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                DType::F16 => bias_raw
+                    .chunks_exact(2)
+                    .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+                DType::Bf16 => bias_raw
+                    .chunks_exact(2)
+                    .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+                dt => {
+                    return Err(StreamError::UnsupportedBiasDtype {
+                        name: bias_name.clone(),
+                        dtype: dt,
+                    })
+                }
+            };
+            let corrected = correct_bias(x, &w_f32, &w_dq, &bias, m, n);
+            // Cast back to the bias's original dtype (reference parity).
+            let bytes: Vec<u8> = match bias_info.dtype {
+                DType::F32 => corrected.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                DType::F16 => corrected
+                    .iter()
+                    .flat_map(|v| f32_to_f16_bits(*v).to_le_bytes())
+                    .collect(),
+                DType::Bf16 => corrected
+                    .iter()
+                    .flat_map(|v| f32_to_bf16_bits(*v).to_le_bytes())
+                    .collect(),
+                _ => unreachable!("non-float bias dtypes rejected above"),
+            };
             corrected_bias.insert(bias_name, bytes);
         }
         // Missing calibration entry → torch reference warns and keeps the

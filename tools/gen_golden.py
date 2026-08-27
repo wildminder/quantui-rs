@@ -186,6 +186,25 @@ def case_conv_net_tensors() -> dict[str, object]:
     }
 
 
+def case_nonf32_bias_tensors() -> dict[str, object]:
+    """(d) Bias correction with NON-F32 biases (regression for the VibeVoice
+    BF16-bias panic). Two quantizable 2D weights whose sibling biases are
+    bfloat16 and float16 respectively. The reference upcasts each bias to f32
+    for the correction math, then casts the corrected value back to the bias's
+    original dtype (stream_quant.py:145) — the golden output therefore carries
+    BF16 / F16 corrected biases, exercising the Rust decode->correct->re-encode
+    round trip for non-F32 bias dtypes."""
+    rng = np.random.default_rng(4004)
+    return {
+        # bf16 weight + bf16 bias (the exact VibeVoice shape of the bug).
+        "blk.0.weight": ("bf16", _bf16_from_f32(rng.standard_normal((256, 128)).astype(np.float32) * 0.05)),
+        "blk.0.bias": ("bf16", _bf16_from_f32(rng.standard_normal(256).astype(np.float32) * 0.01)),
+        # f16 weight + f16 bias (covers the other 2-byte float path).
+        "blk.1.weight": ("f16", _f16_from_f32(rng.standard_normal((128, 128)).astype(np.float32) * 0.05)),
+        "blk.1.bias": ("f16", _f16_from_f32(rng.standard_normal(128).astype(np.float32) * 0.01)),
+    }
+
+
 CASES: list[dict] = [
     {
         "name": "linear_basic_bf16",
@@ -203,6 +222,12 @@ CASES: list[dict] = [
         "name": "conv_net",
         "seed_note": "rng seed 3003",
         "build": case_conv_net_tensors,
+        "exclude_layers": None,
+    },
+    {
+        "name": "nonf32_bias",
+        "seed_note": "rng seed 4004",
+        "build": case_nonf32_bias_tensors,
         "exclude_layers": None,
     },
 ]

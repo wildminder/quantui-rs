@@ -196,7 +196,12 @@ fn emulate_sum_dim0(mat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// Mirror `_correct_bias_torch`: b_new = b_orig - mean(X @ (W_orig - W_dq).T, dim=0).
 ///
 /// - `x`: calib data `(S, N)` row-major; `w_orig`, `w_dq`: `(M, N)` row-major;
-///   `bias`: `(M,)`; all f32. Returns corrected bias `(M,)` as raw LE bytes.
+///   `bias`: `(M,)`; all f32. Returns the corrected bias `(M,)` as **f32 values**.
+///
+/// The caller is responsible for casting the result back to the bias's original
+/// dtype (mirroring the reference's `(b_orig - corr).to(dtype=bias.dtype)`):
+/// for an F32 bias the cast is the identity (byte-exact), for a BF16/F16 bias
+/// the f32 result is rounded to that dtype before serialization.
 pub fn correct_bias(
     x: &[f32],
     w_orig: &[f32],
@@ -204,7 +209,7 @@ pub fn correct_bias(
     bias: &[f32],
     m: usize,
     n: usize,
-) -> Vec<u8> {
+) -> Vec<f32> {
     debug_assert_eq!(x.len(), CALIB_SAMPLES * n);
     debug_assert_eq!(w_orig.len(), m * n);
     debug_assert_eq!(w_dq.len(), m * n);
@@ -262,10 +267,10 @@ pub fn correct_bias(
         std::fs::write("out_err_rust.bin", &bytes).unwrap();
     }
 
-    let mut out_bytes = Vec::with_capacity(m * 4);
+    let mut out = Vec::with_capacity(m);
     for (b, s) in bias.iter().zip(sums.iter()) {
         let corr = s / CALIB_SAMPLES as f32;
-        out_bytes.extend_from_slice((b - corr).to_le_bytes().as_slice());
+        out.push(b - corr);
     }
-    out_bytes
+    out
 }

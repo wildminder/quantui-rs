@@ -91,6 +91,25 @@ fn e2e_parity_conv_net_f16() {
 }
 
 #[test]
+fn e2e_parity_nonf32_bias_correction() {
+    // Regression for the VibeVoice BF16-bias panic: bias correction must handle
+    // non-F32 biases. The reference upcasts the bias to f32 for the correction
+    // math, then casts the corrected value back to the bias's original dtype
+    // (stream_quant.py:145). This golden has a BF16 bias (blk.0) and an F16
+    // bias (blk.1); the whole output file must match byte-for-byte.
+    let dir = golden("nonf32_bias");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out.safetensors");
+
+    stream_quantize(dir.join("input.safetensors"), &out, &ref_config(None)).unwrap();
+
+    assert!(
+        files_equal(&out, &dir.join("output.safetensors")),
+        "BF16/F16 bias correction output must match golden byte-for-byte"
+    );
+}
+
+#[test]
 fn kill_simulation_resume_mid_run_equals_golden() {
     // Simulate a crash after N tensors: run once, capture manifest+file state,
     // then delete the last few tensors from done by truncating our own progress:
