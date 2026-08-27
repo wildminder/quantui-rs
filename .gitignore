@@ -2,3 +2,4 @@
 *.gguf
 __pycache__/
 .workbuddy-ai/
+_backup

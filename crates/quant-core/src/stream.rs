@@ -1,8 +1,16 @@
 //! Resumable streaming quantization orchestrator (plan Phase 5, step 4.3;
-//! Phase 7.3 adds torch-parity bias correction).
+//! Phase 7.3 bias correction; Phase 6.2 sharded input/output).
 //!
-//! Port of reference `stream_quant.py::stream_quantize` (single-file variant):
-//! - iterate tensors in file order
+//! Port of reference `stream_quant.py`:
+//! - `stream_quantize` — single file → single file
+//! - union streaming — several shards → ONE output file
+//!   (`_resolve_union_header` + single `stream_quantize` body)
+//! - `stream_quantize_sharded` — sharded model → sharded OUTPUT directory
+//!   (one output shard per input shard, index json + sidecars copied verbatim,
+//!   global `.quant-manifest.json`)
+//!
+//! Semantics (all mirrored from the reference):
+//! - iterate tensors in file order (union: first-appearance order across shards)
 //! - 2D `.weight` tensors that are quantizable (not excluded, dims divisible by
 //!   block size when heur is on) are INT8-quantized into
 //!   `<name>` + `<base>.weight_scale` + `<base>.comfy_quant` + `<base>.input_scale`
@@ -12,18 +20,25 @@
 //!   when they're a castable float dtype and differ from it
 //! - everything else passes through verbatim
 //! - biases reached BEFORE their weight defer the weight processing so the
-//!   corrected value is available at the bias's file position
+//!   corrected value is available at the bias's file position (works across
+//!   shards in union mode)
 //! - manifest saved after EVERY tensor; resume skips names in `done`
 //! - config-hash mismatch → clean restart from zero
+//! - the output NEVER carries `__metadata__`: the reference rebuilds the header
+//!   via `_resolve_union_header`, which drops `__metadata__`, and then passes
+//!   `header.get("__metadata__")` (always None) to the writer — confirmed by
+//!   probe even for single-file inputs that have metadata.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bias_correction::{correct_bias, CalibCache};
 use crate::comfy_schema::{encode_comfy_quant, ComfyFormat};
+use crate::discover::{ShardedModel, INDEX_NAME};
 use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
-use crate::manifest::{QuantConfig, ScalingMode, StreamState};
+use crate::manifest::{QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
 use crate::quant::{dequantize_int8, quantize_int8_weight, should_skip_shape};
+use crate::st_io::header::TensorInfo;
 use crate::st_io::reader::SafetensorsReader;
 use crate::st_io::writer::IncrementalWriter;
 
@@ -35,11 +50,27 @@ pub struct StreamResult {
     pub done: Vec<String>,
 }
 
+/// Output result of a sharded streaming run (mirrors the reference global
+/// manifest dict).
+#[derive(Debug)]
+pub struct ShardedStreamResult {
+    pub config_hash: String,
+    pub output_dir: PathBuf,
+    /// shard filename → sorted done list, in shard order.
+    pub shards: Vec<(String, Vec<String>)>,
+}
+
+/// Global manifest filename inside a sharded output directory
+/// (`stream_quant.py::SHARDED_MANIFEST_NAME`).
+pub const SHARDED_MANIFEST_NAME: &str = ".quant-manifest.json";
+
 /// Errors from the orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
     #[error("input not found: {0}")]
     InputNotFound(std::path::PathBuf),
+    #[error("no input shards given")]
+    NoInputShards,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -52,6 +83,203 @@ pub enum StreamError {
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
+
+// --------------------------------------------------------------------------- //
+// Tensor source: one file OR several shards as one logical tensor sequence.
+// --------------------------------------------------------------------------- //
+
+/// One or more safetensors files presented as a single logical tensor sequence.
+pub trait TensorSource {
+    /// Ordered tensor names: file order for a single file; first-appearance
+    /// union order across shards (each shard in its header order).
+    fn names(&self) -> &[String];
+    fn info(&self, name: &str) -> Option<&TensorInfo>;
+    fn tensor_bytes(&self, name: &str) -> Result<&[u8]>;
+}
+
+/// Single-file source.
+pub struct SingleFileSource {
+    reader: SafetensorsReader,
+    names: Vec<String>,
+}
+
+impl SingleFileSource {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(StreamError::InputNotFound(path.to_path_buf()));
+        }
+        let reader = SafetensorsReader::open(path)?;
+        let names = reader.header().names().cloned().collect();
+        Ok(Self { reader, names })
+    }
+}
+
+impl TensorSource for SingleFileSource {
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+    fn info(&self, name: &str) -> Option<&TensorInfo> {
+        self.reader.header().get(name)
+    }
+    fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
+        Ok(self.reader.tensor_bytes(name)?)
+    }
+}
+
+/// Union of several shards (mirrors `_resolve_union_header` + per-shard
+/// `safe_open` handles): first occurrence wins for duplicate names.
+pub struct UnionSource {
+    readers: Vec<SafetensorsReader>,
+    entries: Vec<(String, TensorInfo)>,
+    names: Vec<String>,
+    name_to_shard: HashMap<String, usize>,
+}
+
+impl UnionSource {
+    pub fn open(shard_paths: &[PathBuf]) -> Result<Self> {
+        if shard_paths.is_empty() {
+            return Err(StreamError::NoInputShards);
+        }
+        let mut readers = Vec::with_capacity(shard_paths.len());
+        for sp in shard_paths {
+            if !sp.exists() {
+                return Err(StreamError::InputNotFound(sp.clone()));
+            }
+            readers.push(SafetensorsReader::open(sp)?);
+        }
+        let mut entries: Vec<(String, TensorInfo)> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut name_to_shard: HashMap<String, usize> = HashMap::new();
+        for (idx, reader) in readers.iter().enumerate() {
+            for (name, info) in reader.header().iter() {
+                if !name_to_shard.contains_key(name) {
+                    name_to_shard.insert(name.clone(), idx);
+                    names.push(name.clone());
+                    entries.push((name.clone(), info.clone()));
+                }
+            }
+        }
+        Ok(Self {
+            readers,
+            entries,
+            names,
+            name_to_shard,
+        })
+    }
+}
+
+impl TensorSource for UnionSource {
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+    fn info(&self, name: &str) -> Option<&TensorInfo> {
+        self.entries.iter().find(|(n, _)| n == name).map(|(_, i)| i)
+    }
+    fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
+        let idx = self.name_to_shard[name];
+        Ok(self.readers[idx].tensor_bytes(name)?)
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Public entry points.
+// --------------------------------------------------------------------------- //
+
+/// Run streaming quantization of one `input_path` → `output_path`, resumable.
+pub fn stream_quantize(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    config: &QuantConfig,
+) -> Result<StreamResult> {
+    let source = SingleFileSource::open(input_path)?;
+    stream_quantize_source(&source, output_path.as_ref(), config)
+}
+
+/// Stream several shards as ONE logical tensor sequence into a single output
+/// file (reference `--output-mode single` for sharded inputs; replaces the
+/// reference's temp-merge).
+pub fn stream_quantize_shards(
+    shard_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+    config: &QuantConfig,
+) -> Result<StreamResult> {
+    let source = UnionSource::open(shard_paths)?;
+    stream_quantize_source(&source, output_path.as_ref(), config)
+}
+
+/// Stream-quantize a sharded model into a sharded OUTPUT directory
+/// (port of `stream_quant.py::stream_quantize_sharded`).
+///
+/// Each input shard is quantized into its own output shard (never merged),
+/// each individually resumable via its own `<shard>.quant-manifest.json`.
+/// Afterwards `model.safetensors.index.json` and the non-weight sidecars are
+/// copied verbatim, and a global `.quant-manifest.json` is written.
+pub fn stream_quantize_sharded(
+    model: &ShardedModel,
+    output_dir: impl AsRef<Path>,
+    config: &QuantConfig,
+) -> Result<ShardedStreamResult> {
+    let output_dir = output_dir.as_ref();
+    std::fs::create_dir_all(output_dir)?;
+
+    let mut per_shard: Vec<(String, Vec<String>)> = Vec::new();
+    for shard in &model.shard_files {
+        let in_path = model.model_dir.join(shard);
+        let out_path = output_dir.join(shard);
+        let result = stream_quantize(&in_path, &out_path, config)?;
+        per_shard.push((shard.clone(), result.done));
+    }
+
+    // Copy index json + sidecars unchanged (shard filenames / tensor names
+    // stay valid).
+    std::fs::copy(&model.index_path, output_dir.join(INDEX_NAME))?;
+    for fname in &model.non_weight_files {
+        let src = model.model_dir.join(fname);
+        if src.is_file() {
+            std::fs::copy(&src, output_dir.join(fname))?;
+        }
+    }
+
+    // Global manifest (compact JSON, key order version/config_hash/output_dir/
+    // shards; shards in shard order — mirrors json.dump of the reference dict).
+    let config_hash = config.config_hash();
+    let mut obj = serde_json::Map::new();
+    obj.insert("version".into(), serde_json::Value::from(MANIFEST_VERSION));
+    obj.insert(
+        "config_hash".into(),
+        serde_json::Value::from(config_hash.clone()),
+    );
+    obj.insert(
+        "output_dir".into(),
+        serde_json::Value::from(output_dir.to_string_lossy().into_owned()),
+    );
+    let mut shards_obj = serde_json::Map::new();
+    for (shard, done) in &per_shard {
+        shards_obj.insert(
+            shard.clone(),
+            serde_json::Value::Array(
+                done.iter()
+                    .map(|d| serde_json::Value::from(d.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    obj.insert("shards".into(), serde_json::Value::Object(shards_obj));
+    let json = serde_json::to_vec(&serde_json::Value::Object(obj))
+        .expect("global manifest serialization cannot fail");
+    std::fs::write(output_dir.join(SHARDED_MANIFEST_NAME), json)?;
+
+    Ok(ShardedStreamResult {
+        config_hash,
+        output_dir: output_dir.to_path_buf(),
+        shards: per_shard,
+    })
+}
+
+// --------------------------------------------------------------------------- //
+// Core streaming body (shared by single-file and union sources).
+// --------------------------------------------------------------------------- //
 
 /// Cached output specs per processed weight (mirrors quantized_specs_cache in
 /// reference stream_quant.py): computed once when the weight (or its earlier
@@ -66,21 +294,12 @@ struct WeightOutputs {
     n: u64,
 }
 
-/// Run streaming quantization of `input_path` → `output_path`, resumable.
-pub fn stream_quantize(
-    input_path: impl AsRef<Path>,
-    output_path: impl AsRef<Path>,
+fn stream_quantize_source<S: TensorSource + ?Sized>(
+    input: &S,
+    output_path: &Path,
     config: &QuantConfig,
 ) -> Result<StreamResult> {
-    let input_path = input_path.as_ref();
-    let output_path = output_path.as_ref();
-
-    if !input_path.exists() {
-        return Err(StreamError::InputNotFound(input_path.to_path_buf()));
-    }
-
-    let reader = SafetensorsReader::open(input_path)?;
-    let names: Vec<String> = reader.header().names().cloned().collect();
+    let names: Vec<String> = input.names().to_vec();
 
     // ---- manifest / resume bookkeeping ------------------------------------ //
     let mut state = StreamState::new(output_path, config.config_hash());
@@ -98,11 +317,14 @@ pub fn stream_quantize(
     }
 
     // ---- open writer (resume appends; fresh truncates) --------------------- //
+    // The reference NEVER carries __metadata__ into the streaming output (the
+    // union header drops it and `header.get("__metadata__")` is always None),
+    // so a fresh file always starts without metadata — even for single-file
+    // inputs that have metadata (probe-verified).
     let mut writer = if resumed {
         IncrementalWriter::open_resume(output_path)?
     } else {
-        let meta = reader.header().metadata().cloned();
-        IncrementalWriter::open_new_with(output_path, 1 << 16, meta)?
+        IncrementalWriter::open_new_with(output_path, 1 << 16, None)?
     };
 
     // ---- classify tensors --------------------------------------------------- //
@@ -116,7 +338,7 @@ pub fn stream_quantize(
         if !name.ends_with(".weight") {
             continue;
         }
-        let Some(info) = reader.header().get(name) else {
+        let Some(info) = input.info(name) else {
             continue;
         };
         if info.shape.len() != 2 || info.shape.contains(&0) {
@@ -135,13 +357,21 @@ pub fn stream_quantize(
         .collect();
 
     // ---- bias-correction calibration cache (Phase 7.3) --------------------- //
-    // Unique in_features among quantizable 2D weights, in file order, from one
-    // shared generator seeded once (mirrors _build_torch_calibration_cache).
+    // Unique in_features among ALL 2D `.weight` tensors (quantizable or not),
+    // in file order, from one shared generator seeded once. This mirrors
+    // `_build_torch_calibration_cache` exactly: it iterates every name ending
+    // in `.weight` with a 2D shape and draws `randn(3072, in_features)` per
+    // unique in_features — it does NOT filter by quantizability/exclusion.
+    // (Skipping the draw for skipped weights would shift the RNG stream and
+    // corrupt bias correction whenever a skipped weight sorts before a
+    // quantized one — confirmed by probe.)
     let calib = CalibCache::build(
         names.iter().map(|n| {
-            let info = reader.header().get(n);
+            let info = input.info(n);
             match info {
-                Some(i) if is_quantizable(config, n, &i.shape) => Some(i.shape[1] as usize),
+                Some(i) if n.ends_with(".weight") && i.shape.len() == 2 => {
+                    Some(i.shape[1] as usize)
+                }
                 _ => None,
             }
         }),
@@ -156,11 +386,9 @@ pub fn stream_quantize(
     let mut corrected_bias: HashMap<String, Vec<u8>> = HashMap::new();
 
     for name in &remaining {
-        if corrected_bias.contains_key(name.as_str()) || {
-            // bias whose weight was already processed -> write corrected value
-            name.ends_with(".bias") && corrected_bias.contains_key(name)
-        } {
-            let info = reader.header().get(name).expect("exists");
+        if corrected_bias.contains_key(name) {
+            // Bias whose weight was already processed -> write corrected value.
+            let info = input.info(name).expect("exists");
             writer.add_tensor(
                 name,
                 info.dtype,
@@ -172,95 +400,63 @@ pub fn stream_quantize(
             continue;
         }
 
-        let info_shape = reader
-            .header()
-            .get(name)
-            .map(|i| i.shape.as_slice())
-            .unwrap_or(&[]);
-        if is_quantizable(config, name, info_shape) && reader.header().contains_key(name) {
+        let info_shape = input.info(name).map(|i| i.shape.as_slice()).unwrap_or(&[]);
+        if is_quantizable(config, name, info_shape) && input.info(name).is_some() {
             // Weight whose bias came earlier: specs were cached then; write now.
-            if weight_outputs.contains_key(name) {
-                let o = &weight_outputs[name];
-                writer.add_tensor(name, DType::I8, None, &[o.m, o.n], &o.q_bytes)?;
-                let base = base_of(name);
-                writer.add_tensor(
-                    &format!("{base}.weight_scale"),
-                    DType::F32,
-                    None,
-                    &o.scale_shape,
-                    &o.scale_bytes,
-                )?;
-                writer.add_tensor(
-                    &format!("{base}.comfy_quant"),
-                    DType::U8,
-                    None,
-                    &[o.blob.len() as u64],
-                    &o.blob,
-                )?;
-                if o.input_scale {
-                    writer.add_tensor(
-                        &format!("{base}.input_scale"),
-                        DType::F32,
-                        None,
-                        &[],
-                        &1.0f32.to_le_bytes(),
-                    )?;
-                }
-            } else {
+            if !weight_outputs.contains_key(name) {
                 compute_weight_outputs(
                     name,
-                    &reader,
+                    input,
                     config,
                     &calib,
                     &mut weight_outputs,
                     &mut corrected_bias,
                 )?;
-                let o = &weight_outputs[name];
-                writer.add_tensor(name, DType::I8, None, &[o.m, o.n], &o.q_bytes)?;
-                let base = base_of(name);
+            }
+            let o = &weight_outputs[name];
+            writer.add_tensor(name, DType::I8, None, &[o.m, o.n], &o.q_bytes)?;
+            let base = base_of(name);
+            writer.add_tensor(
+                &format!("{base}.weight_scale"),
+                DType::F32,
+                None,
+                &o.scale_shape,
+                &o.scale_bytes,
+            )?;
+            writer.add_tensor(
+                &format!("{base}.comfy_quant"),
+                DType::U8,
+                None,
+                &[o.blob.len() as u64],
+                &o.blob,
+            )?;
+            if o.input_scale {
                 writer.add_tensor(
-                    &format!("{base}.weight_scale"),
+                    &format!("{base}.input_scale"),
                     DType::F32,
                     None,
-                    &o.scale_shape,
-                    &o.scale_bytes,
+                    &[],
+                    &1.0f32.to_le_bytes(),
                 )?;
-                writer.add_tensor(
-                    &format!("{base}.comfy_quant"),
-                    DType::U8,
-                    None,
-                    &[o.blob.len() as u64],
-                    &o.blob,
-                )?;
-                if o.input_scale {
-                    writer.add_tensor(
-                        &format!("{base}.input_scale"),
-                        DType::F32,
-                        None,
-                        &[],
-                        &1.0f32.to_le_bytes(),
-                    )?;
-                }
             }
         } else if name.ends_with(".bias") {
             // Bias reached BEFORE its weight: process (compute+cache) the
             // weight now but only write the bias here.
             let wname = format!("{}.weight", &name[..name.len() - ".bias".len()]);
-            let wshape = reader
-                .header()
-                .get(&wname)
+            let wshape = input
+                .info(&wname)
                 .map(|i| i.shape.as_slice())
                 .unwrap_or(&[]);
-            if reader.header().contains_key(&wname) && is_quantizable(config, &wname, wshape) {
+            if input.info(&wname).is_some() && is_quantizable(config, &wname, wshape) {
                 compute_weight_outputs(
                     &wname,
-                    &reader,
+                    input,
                     config,
                     &calib,
                     &mut weight_outputs,
                     &mut corrected_bias,
                 )?;
-                let info = reader.header().get(name).expect("bias exists");
+                let info = input.info(name).expect("bias exists");
                 writer.add_tensor(
                     name,
                     info.dtype,
@@ -269,10 +465,10 @@ pub fn stream_quantize(
                     &corrected_bias[name.as_str()],
                 )?;
             } else {
-                copy_tensor(name, &reader, &mut writer, target_dtype, &skip_cast)?;
+                copy_tensor(name, input, &mut writer, target_dtype, &skip_cast)?;
             }
         } else {
-            copy_tensor(name, &reader, &mut writer, target_dtype, &skip_cast)?;
+            copy_tensor(name, input, &mut writer, target_dtype, &skip_cast)?;
         }
         finish_name(&mut state, name)?;
     }
@@ -337,15 +533,15 @@ fn resolve_output_dtype(s: &str) -> Option<DType> {
 /// cache its corrected bytes (mirrors process_weight in reference
 /// stream_quant.py — which writes nothing itself).
 #[allow(clippy::type_complexity)]
-fn compute_weight_outputs(
+fn compute_weight_outputs<S: TensorSource + ?Sized>(
     name: &str,
-    reader: &SafetensorsReader,
+    input: &S,
     config: &QuantConfig,
     calib: &CalibCache,
     weight_outputs: &mut HashMap<String, WeightOutputs>,
     corrected_bias: &mut HashMap<String, Vec<u8>>,
 ) -> Result<()> {
-    let info = reader.header().get(name).expect("checked caller");
+    let info = input.info(name).expect("checked caller");
     let (m, n) = (info.shape[0] as usize, info.shape[1] as usize);
     if !config.skip_inefficient
         && (m % config.block_size as usize != 0 || n % config.block_size as usize != 0)
@@ -357,7 +553,7 @@ fn compute_weight_outputs(
         });
     }
 
-    let raw = reader.tensor_bytes(name)?;
+    let raw = input.tensor_bytes(name)?;
     let w_f32: Vec<f32> = decode_to_f32(info.dtype, raw);
 
     let mode = match config.scaling_mode {
@@ -406,11 +602,11 @@ fn compute_weight_outputs(
 
     // ---- sibling-bias correction (Phase 7.3) -------------------------------- //
     let bias_name = format!("{base}.bias", base = base_of(name));
-    if reader.header().contains_key(&bias_name) && !corrected_bias.contains_key(&bias_name) {
+    if input.info(&bias_name).is_some() && !corrected_bias.contains_key(&bias_name) {
         if let Some(x) = calib.get(n) {
             let w_dq = dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
-            let bias_info = reader.header().get(&bias_name).expect("checked");
-            let bias_raw = reader.tensor_bytes(&bias_name)?;
+            let bias_info = input.info(&bias_name).expect("checked");
+            let bias_raw = input.tensor_bytes(&bias_name)?;
             assert_eq!(
                 bias_info.dtype,
                 DType::F32,
@@ -465,15 +661,15 @@ fn decode_to_f32(dtype: DType, raw: &[u8]) -> Vec<f32> {
     }
 }
 
-fn copy_tensor(
+fn copy_tensor<S: TensorSource + ?Sized>(
     name: &str,
-    reader: &SafetensorsReader,
+    input: &S,
     writer: &mut IncrementalWriter,
     target_dtype: Option<DType>,
     skip_cast: &HashSet<&str>,
 ) -> Result<()> {
-    let info = reader.header().get(name).expect("exists");
-    let data = reader.tensor_bytes(name)?;
+    let info = input.info(name).expect("exists");
+    let data = input.tensor_bytes(name)?;
 
     // Skipped 2D .weight cast to output dtype (ctq cast_unquantized_weights):
     // only for castable float source dtypes differing from target.

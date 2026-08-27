@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "total_size": 123456
+  },
+  "weight_map": {
+    "aaa_skipped.weight": "model-00001-of-00003.safetensors",
+    "blocks.0.weight": "model-00001-of-00003.safetensors",
+    "blocks.0.bias": "model-00001-of-00003.safetensors",
+    "norm.weight": "model-00001-of-00003.safetensors",
+    "blocks.1.bias": "model-00002-of-00003.safetensors",
+    "small.weight": "model-00002-of-00003.safetensors",
+    "blocks.1.weight": "model-00003-of-00003.safetensors",
+    "head.weight": "model-00003-of-00003.safetensors",
+    "head.bias": "model-00003-of-00003.safetensors"
+  }
+}

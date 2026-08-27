@@ -16,6 +16,6 @@ pub mod stream;
 pub mod st_io;
 // TODO(phase-10) pub mod gguf_registry;
 pub mod bias_correction;
+pub mod discover;
 pub mod torch_rng;
 // TODO(phase-8) pub mod validator;
-// TODO(phase-6) pub mod discover;
