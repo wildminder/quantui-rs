@@ -234,6 +234,9 @@ const LOG_P: [f32; 9] = [
 ];
 const LOG_Q1: f32 = -2.12194440e-4;
 const LOG_Q2: f32 = 0.693359375;
+// Verbatim literal from the Cephes/SLEEF reference port — do not rewrite to
+// f32::consts::FRAC_1_SQRT_2; byte-exact parity depends on the source literal.
+#[allow(clippy::approx_constant)]
 const LOG_SQRTHF: f32 = 0.707106781186547524;
 
 #[inline]

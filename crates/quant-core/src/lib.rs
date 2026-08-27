@@ -18,4 +18,4 @@ pub mod st_io;
 pub mod bias_correction;
 pub mod discover;
 pub mod torch_rng;
-// TODO(phase-8) pub mod validator;
+pub mod validator;

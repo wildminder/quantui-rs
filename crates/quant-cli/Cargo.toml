@@ -12,3 +12,7 @@ path = "src/main.rs"
 [dependencies]
 quant-core = { path = "../quant-core" }
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"

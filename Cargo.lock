@@ -336,6 +336,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "quant-core",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
