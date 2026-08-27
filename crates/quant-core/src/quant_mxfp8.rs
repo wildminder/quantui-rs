@@ -110,7 +110,9 @@ fn block_scale(block_max: f32) -> (u8, f32) {
 /// for input cell `(r, c)` with `rb = r/128`, `rrem = r%128`, `cb = c/4`,
 /// `crem = c%4`, `b = rb*ncb + cb`, `r0 = rrem/32`, `r1 = rrem%32`:
 /// `flat = b*512 + r1*16 + r0*4 + crem` (index into the flattened output).
-fn to_blocked_u8(src: &[u8], rows: usize, cols: usize) -> (Vec<u8>, Vec<u64>) {
+///
+/// Shared by MXFP8 (E8M0 scales) and NVFP4 (E4M3 block scales).
+pub fn to_blocked_u8(src: &[u8], rows: usize, cols: usize) -> (Vec<u8>, Vec<u64>) {
     let nrb = roundup(rows, 128) / 128;
     let ncb = roundup(cols, 4) / 4;
     let padded_rows = nrb * 128;

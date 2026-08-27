@@ -21,10 +21,30 @@ Determinism:
     * ``manual_seed`` pinned to 233983427 (same calibration seed contract)
     * ``device='cpu'`` forced for reproducibility (CUDA would be nondeterministic)
     * ``simple=True`` (no learned rounding), ``heur=True`` (skip-inefficient)
-    * double-run verified byte-identical for all three formats (2026-08-27)
+    * double-run verified byte-identical for all formats (2026-08-27)
 
-Run with the ctq venv interpreter:
+Provenance note (2026-08-27): the format modules hardcode
+``device = "cuda" if torch.cuda.is_available() else "cpu"`` (fp8_conversion.py:118,
+mxfp8_conversion.py:106, nvfp4_conversion.py:108), silently overriding the
+``device="cpu"`` passed here. The first golden batch was therefore generated on
+CUDA. Per-tensor diffing showed the FP8/MXFP8 CUDA kernels are numerically
+identical to eager for the quantized payloads (only bias-correction matmuls
+differed), but the NVFP4 CUDA kernel uses reciprocal-multiply data division and
+its quantized payloads differ from eager at E2M1 tie points. All 20 goldens
+were regenerated with CUDA hidden (``CUDA_VISIBLE_DEVICES=-1``) so the eager
+backend runs — matching this script's documented CPU intent and the plan's
+parity target ("All bit-exact portable" against the eager/PyTorch algorithm).
+
+Run with the ctq venv interpreter, CUDA hidden so the format modules'
+``device = "cuda" if torch.cuda.is_available() else "cpu"`` fallback lands on
+CPU/eager (the modules ignore the ``device="cpu"`` we pass; see
+nvfp4_conversion.py:108):
+
+    CUDA_VISIBLE_DEVICES=-1 \\
     <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/gen_golden_formats.py
+
+Optional ``--only <fmt> [fmt ...]`` restricts generation to a subset of
+FORMATS (e.g. ``--only nvfp4``).
 """
 
 from __future__ import annotations
@@ -125,9 +145,26 @@ def _publish(src: str, dst: str) -> bool:
 
 
 def main() -> int:
+    import argparse
     import tempfile
 
     from convert_to_quant import quantize
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--only", nargs="+", default=None, metavar="FMT",
+        help="restrict generation to these format keys (default: all)",
+    )
+    args = parser.parse_args()
+
+    formats = FORMATS
+    if args.only:
+        unknown = [f for f in args.only if f not in FORMATS]
+        if unknown:
+            print(f"unknown format(s): {unknown}; valid: {sorted(FORMATS)}")
+            return 2
+        formats = {k: v for k, v in FORMATS.items() if k in args.only}
+        print(f"restricted to formats: {sorted(formats)}")
 
     work_root = tempfile.mkdtemp(prefix="gen_golden_fmt_")
     print(f"work dir: {work_root}")
@@ -145,7 +182,7 @@ def main() -> int:
             skipped.append((case, "input.safetensors missing (run gen_golden.py first)"))
             continue
 
-        for fmt, kwargs in FORMATS.items():
+        for fmt, kwargs in formats.items():
             tag = f"{case}/{fmt}"
             out_name = f"output_{fmt}.safetensors"
             dst = os.path.join(GOLDEN_DIR, case, out_name)
