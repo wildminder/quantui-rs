@@ -38,6 +38,9 @@ use crate::discover::{ShardedModel, INDEX_NAME};
 use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
 use crate::manifest::{Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
 use crate::quant::{dequantize_int8, quantize_int8_weight, should_skip_shape};
+use crate::quant_fp8::{dequantize_fp8, quantize_fp8_weight, Fp8ScalingMode};
+use crate::quant_mxfp8::{dequantize_mxfp8, quantize_mxfp8_weight};
+use crate::quant_nvfp4::{dequantize_nvfp4, quantize_nvfp4_weight};
 use crate::st_io::header::TensorInfo;
 use crate::st_io::reader::SafetensorsReader;
 use crate::st_io::writer::IncrementalWriter;
@@ -94,11 +97,6 @@ pub enum StreamError {
     /// Bias correction needs a float bias (f32/f16/bf16); got something else.
     #[error("bias `{name}` has unsupported dtype {dtype} for bias correction (need f32/f16/bf16)")]
     UnsupportedBiasDtype { name: String, dtype: DType },
-    /// TEMPORARY (plan Phase A.4 → removed by Phase C.2): the orchestrator
-    /// only implements INT8 kernel routing so far. FP8/MXFP8/NVFP4 configs
-    /// must fail loudly rather than silently emit INT8 output.
-    #[error("format `{0}` is not yet implemented by the streaming orchestrator (only int8 is wired; see plan Phase C)")]
-    FormatNotYetWired(String),
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
@@ -455,15 +453,6 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     mut on_progress: Option<&mut ProgressFn>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamResult> {
-    // TEMPORARY (plan Phase A.4 → removed by Phase C.2): kernel routing is
-    // INT8-only so far. Non-INT8 configs must fail loudly here — never
-    // silently emit INT8 output for a different requested format.
-    if config.format != Format::Int8 {
-        return Err(StreamError::FormatNotYetWired(
-            config.format.as_str().into(),
-        ));
-    }
-
     let names: Vec<String> = input.names().to_vec();
     // Reference: `total = len(names)` — the full tensor count, independent of
     // how many are already done from a resumed run.
@@ -724,6 +713,68 @@ fn finish_name(
     Ok(())
 }
 
+/// ctq `constants.py::AVOID_KEY_NAMES` (verbatim). The MXFP8/NVFP4 dedicated
+/// modules hardcode `exclude_patterns = list(AVOID_KEY_NAMES)` and skip any key
+/// containing one of these substrings (`mxfp8_conversion.py:219`,
+/// `nvfp4_conversion.py:221`). The FP8 unified path does NOT apply this list —
+/// it only applies `--exclude-layers` (plan §3.6 / OQ-1).
+const AVOID_KEY_NAMES: &[&str] = &[
+    "norm",
+    "bias",
+    "embed_tokens",
+    "lm_head",
+    "shared",
+    "patch_embedding",
+    "audio_model.patch_embedding",
+    "ref_conv",
+    "control_adapter",
+    "motion_encoder.enc.net_app",
+    "face_encoder.conv",
+    "pose_patch_embedding",
+    "motion_encoder.enc.fc",
+    "img_emb.proj",
+    "k_norm",
+    "q_norm",
+    "motion_encoder.dec",
+    "head.modulation",
+    "casual_audio_encoder",
+    "cond_encoder",
+    "frame_packer",
+    "norm_k",
+    "norm_q",
+    "tekken_model",
+    "multi_modal_projector",
+    "patch_conv",
+    "ln_pre",
+    "input_layernorm",
+    "attention_norm",
+    "post_attention_layernorm",
+    "mm_in_projection_weight",
+];
+
+/// Effective block size for the skip-inefficient heuristic predicate, per
+/// format AND (for FP8) per scaling mode (plan §3.6 + Phase C finding).
+///
+/// ctq `fp8_conversion.py:183-184` computes
+/// `block_size = kwargs.get("block_size") or format_block_sizes["fp8"]=64` and
+/// passes THAT to `should_skip_layer_for_performance`. The ctq CLI only
+/// defaults `block_size=128` when block scaling is active, so tensor/row FP8
+/// runs pass no block size → the heuristic uses ctq's fp8 default of **64**.
+/// Golden proof: `linear_basic_bf16` `blocks.1.weight [128,64]` is BF16-skipped
+/// in the `fp8` (block, bs=128) golden but F8_E4M3-quantized in
+/// `fp8_tensor`/`fp8_row`. MXFP8=32 / NVFP4=16 from `constants.py:351/355`.
+fn heur_block_size(config: &QuantConfig) -> usize {
+    match config.format {
+        Format::Int8 => config.block_size as usize,
+        Format::Fp8E4m3 => match config.scaling_mode {
+            ScalingMode::Block => config.block_size as usize,
+            ScalingMode::Tensor | ScalingMode::Row => 64,
+        },
+        Format::Mxfp8 => 32,
+        Format::Nvfp4 => 16,
+    }
+}
+
 fn is_quantizable(config: &QuantConfig, name: &str, shape: &[u64]) -> bool {
     if !name.ends_with(".weight") {
         return false;
@@ -731,10 +782,15 @@ fn is_quantizable(config: &QuantConfig, name: &str, shape: &[u64]) -> bool {
     if config.excluded(name) {
         return false;
     }
+    // MXFP8/NVFP4 only: substring exclusion against ctq AVOID_KEY_NAMES.
+    if config.format.carries_file_metadata() && AVOID_KEY_NAMES.iter().any(|pat| name.contains(pat))
+    {
+        return false;
+    }
     if shape.len() != 2 || shape.contains(&0) {
         return false;
     }
-    if config.skip_inefficient && should_skip_shape(shape, config.block_size as usize) {
+    if config.skip_inefficient && should_skip_shape(shape, heur_block_size(config)) {
         return false;
     }
     true
@@ -778,7 +834,12 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
 ) -> Result<bool> {
     let info = input.info(name).expect("checked caller");
     let (m, n) = (info.shape[0] as usize, info.shape[1] as usize);
-    if !config.skip_inefficient
+
+    // Divisibility policy (plan §3.6): only INT8 errors on indivisible dims
+    // when the skip heuristic is OFF. FP8 falls back to row-wise inside the
+    // kernel; MXFP8/NVFP4 pad internally — neither ever errors here.
+    if config.format == Format::Int8
+        && !config.skip_inefficient
         && (m % config.block_size as usize != 0 || n % config.block_size as usize != 0)
     {
         return Err(StreamError::NotDivisible {
@@ -791,57 +852,184 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
     let raw = input.tensor_bytes(name)?;
     let w_f32: Vec<f32> = decode_to_f32(info.dtype, raw);
 
-    let mode = match config.scaling_mode {
-        ScalingMode::Tensor => crate::quant::ScalingMode::Tensor,
-        ScalingMode::Row => crate::quant::ScalingMode::Row,
-        ScalingMode::Block => crate::quant::ScalingMode::Block,
-    };
-    let r = quantize_int8_weight(&w_f32, m, n, mode, config.block_size as usize);
-
-    // <name> int8 payload.
-    let q_bytes: Vec<u8> = r.qdata.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-    // <base>.weight_scale F32 with scalar squeeze for 1-element scales
-    // (normalize_tensorwise_scales parity: [1]/[1,1] → shape []).
-    let scale_shape: Vec<u64> = if r.scale.len() == 1 {
-        vec![]
-    } else {
-        r.scale_shape.clone()
-    };
-    let scale_bytes: Vec<u8> = r.scale.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-    // <base>.comfy_quant blob via the comfy_schema encoder (Phase 3.5):
-    // family-A key order format, orig_dtype, group_size (block only). The
-    // encoder emits group_size only for block-based formats, so passing the
-    // block size unconditionally is safe for tensor/row modes.
-    let comfy_fmt = match config.scaling_mode {
-        ScalingMode::Block => ComfyFormat::Int8Blockwise,
-        _ => ComfyFormat::Int8Tensorwise,
-    };
+    // ---- format routing (plan Phase C.2) ---------------------------------- //
+    // Each branch produces the per-format output specs (`WeightOutputs`) plus
+    // the dequantized weight `w_dq` (f32, original m×n, padding cropped) used
+    // for sibling-bias correction (plan §3.5 / Phase C.4). Emission dtypes,
+    // shapes, and blob families follow the §3.3 byte contract (golden headers).
     let orig = resolve_orig_dtype_str(&config.orig_dtype);
-    let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
-    let input_scale = matches!(config.scaling_mode, ScalingMode::Block);
+    let (outputs, w_dq): (WeightOutputs, Vec<f32>) = match config.format {
+        Format::Int8 => {
+            let mode = match config.scaling_mode {
+                ScalingMode::Tensor => crate::quant::ScalingMode::Tensor,
+                ScalingMode::Row => crate::quant::ScalingMode::Row,
+                ScalingMode::Block => crate::quant::ScalingMode::Block,
+            };
+            let r = quantize_int8_weight(&w_f32, m, n, mode, config.block_size as usize);
 
-    weight_outputs.insert(
-        name.to_string(),
-        WeightOutputs {
-            q_bytes,
-            q_dtype: DType::I8,
-            q_shape: vec![m as u64, n as u64],
-            scale_bytes,
-            scale_dtype: DType::F32,
-            scale_shape,
-            scale2: None,
-            blob,
-            input_scale,
-        },
-    );
+            // <name> int8 payload.
+            let q_bytes: Vec<u8> = r.qdata.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-    // ---- sibling-bias correction (Phase 7.3) -------------------------------- //
+            // <base>.weight_scale F32 with scalar squeeze for 1-element scales
+            // (normalize_tensorwise_scales parity: [1]/[1,1] → shape []).
+            let scale_shape: Vec<u64> = if r.scale.len() == 1 {
+                vec![]
+            } else {
+                r.scale_shape.clone()
+            };
+            let scale_bytes: Vec<u8> = r.scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+            // <base>.comfy_quant blob via the comfy_schema encoder (Phase 3.5):
+            // family-A key order format, orig_dtype, group_size (block only).
+            let comfy_fmt = match config.scaling_mode {
+                ScalingMode::Block => ComfyFormat::Int8Blockwise,
+                _ => ComfyFormat::Int8Tensorwise,
+            };
+            let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
+            let input_scale = matches!(config.scaling_mode, ScalingMode::Block);
+
+            let w_dq = dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
+            (
+                WeightOutputs {
+                    q_bytes,
+                    q_dtype: DType::I8,
+                    q_shape: vec![m as u64, n as u64],
+                    scale_bytes,
+                    scale_dtype: DType::F32,
+                    scale_shape,
+                    scale2: None,
+                    blob,
+                    input_scale,
+                },
+                w_dq,
+            )
+        }
+
+        Format::Fp8E4m3 => {
+            let fp8_mode = match config.scaling_mode {
+                ScalingMode::Tensor => Fp8ScalingMode::Tensor,
+                ScalingMode::Row => Fp8ScalingMode::Row,
+                ScalingMode::Block => Fp8ScalingMode::Block,
+            };
+            let r = quantize_fp8_weight(&w_f32, m, n, fp8_mode, config.block_size as usize);
+
+            // <name> F8_E4M3 payload (kernel already emits one byte/element).
+            let q_bytes = r.qdata.clone();
+
+            // <base>.weight_scale F32, scalar-squeezed for 1-element scales
+            // (normalize_tensorwise_scales parity, same as INT8).
+            let scale_shape: Vec<u64> = if r.scale.len() == 1 {
+                vec![]
+            } else {
+                r.scale_shape.clone()
+            };
+            let scale_bytes: Vec<u8> = r.scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+            // Family-A blob; the encoder drops group_size for tensor/row.
+            let comfy_fmt = match config.scaling_mode {
+                ScalingMode::Block => ComfyFormat::Fp8Blockwise,
+                ScalingMode::Row => ComfyFormat::Fp8Rowwise,
+                ScalingMode::Tensor => ComfyFormat::Fp8Tensor,
+            };
+            let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
+
+            // FP8 never emits input_scale in our parity contract (plan §3.3).
+            let w_dq = dequantize_fp8(&w_f32, &r, m, n, fp8_mode, config.block_size as usize);
+            (
+                WeightOutputs {
+                    q_bytes,
+                    q_dtype: DType::F8E4M3,
+                    q_shape: vec![m as u64, n as u64],
+                    scale_bytes,
+                    scale_dtype: DType::F32,
+                    scale_shape,
+                    scale2: None,
+                    blob,
+                    input_scale: false,
+                },
+                w_dq,
+            )
+        }
+
+        Format::Mxfp8 => {
+            let r = quantize_mxfp8_weight(&w_f32, m, n);
+
+            // <name> F8_E4M3 payload at the PADDED shape; <base>.weight_scale
+            // is the E8M0 tiled (to_blocked) U8 bytes as the kernel emits them.
+            let q_bytes = r.qdata.clone();
+            let q_shape = r.qdata_shape.clone();
+            let scale_bytes = r.scale.clone();
+            let scale_shape = r.scale_shape.clone();
+
+            // Family-B blob carries the PRE-padding input shape.
+            let blob =
+                encode_comfy_quant(ComfyFormat::Mxfp8, &orig, None, Some(&[m as u64, n as u64]));
+
+            let w_dq = dequantize_mxfp8(&r, m, n);
+            (
+                WeightOutputs {
+                    q_bytes,
+                    q_dtype: DType::F8E4M3,
+                    q_shape,
+                    scale_bytes,
+                    scale_dtype: DType::U8,
+                    scale_shape,
+                    scale2: None,
+                    blob,
+                    input_scale: false,
+                },
+                w_dq,
+            )
+        }
+
+        Format::Nvfp4 => {
+            let r = quantize_nvfp4_weight(&w_f32, m, n);
+
+            // <name> U8 packed payload at (m_pad, n_pad/2); <base>.weight_scale
+            // is the E4M3 tiled (to_blocked) bytes; <base>.weight_scale_2 is the
+            // per-tensor f32 scale.
+            let q_bytes = r.qdata.clone();
+            let q_shape = r.qdata_shape.clone();
+            let scale_bytes = r.scale.clone();
+            let scale_shape = r.scale_shape.clone();
+            let scale2 = Some((
+                r.per_tensor_scale.to_le_bytes().to_vec(),
+                DType::F32,
+                vec![],
+            ));
+
+            // Family-B blob carries the PRE-padding input shape.
+            let blob =
+                encode_comfy_quant(ComfyFormat::Nvfp4, &orig, None, Some(&[m as u64, n as u64]));
+
+            let w_dq = dequantize_nvfp4(&r, m, n);
+            (
+                WeightOutputs {
+                    q_bytes,
+                    q_dtype: DType::U8,
+                    q_shape,
+                    scale_bytes,
+                    scale_dtype: DType::F8E4M3,
+                    scale_shape,
+                    scale2,
+                    blob,
+                    input_scale: false,
+                },
+                w_dq,
+            )
+        }
+    };
+
+    weight_outputs.insert(name.to_string(), outputs);
+
+    // ---- sibling-bias correction (Phase 7.3; per-format dequant C.4) ------ //
+    // `w_dq` was produced by the format routing above via the format's own
+    // dequant (plan §3.5): INT8 `dequantize_int8`, FP8 `dequantize_fp8`
+    // (tensor/row = IEEE division, block = multiply), MXFP8 `dequantize_mxfp8`,
+    // NVFP4 `dequantize_nvfp4`. The correction pipeline itself is format-agnostic.
     let bias_name = format!("{base}.bias", base = base_of(name));
     if input.info(&bias_name).is_some() && !corrected_bias.contains_key(&bias_name) {
         if let Some(x) = calib.get(n) {
-            let w_dq = dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
             let bias_info = input.info(&bias_name).expect("checked");
             let bias_raw = input.tensor_bytes(&bias_name)?;
             // The reference correct biases of ANY dtype: it upcasts to f32 for
@@ -1105,6 +1293,31 @@ mod tests {
         assert!(
             !by_name.contains_key("blk.weight_scale_2"),
             "INT8 must not emit weight_scale_2"
+        );
+    }
+
+    /// INT8 with the skip heuristic OFF must ERROR on indivisible dims
+    /// (plan §3.6: only INT8 keeps the `NotDivisible` error; FP8 falls back to
+    /// row-wise and MXFP8/NVFP4 pad internally).
+    #[test]
+    fn int8_not_divisible_errors_when_heur_off() {
+        let (m, n) = (130usize, 130usize); // not divisible by 128
+        let mut src = MemSource::new();
+        let w: Vec<u8> = (0..m * n)
+            .flat_map(|i| crate::dtype::f32_to_bf16_bits((i as f32) * 0.001).to_le_bytes())
+            .collect();
+        src.add("blk.weight", DType::Bf16, vec![m as u64, n as u64], w);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.safetensors");
+        let mut config = QuantConfig::default(); // INT8, block, bs=128
+        config.skip_inefficient = false; // heur OFF → must error, not skip
+
+        let err = stream_quantize_source(&src, &out, &config, None, None)
+            .expect_err("indivisible INT8 dims with heur off must error");
+        assert!(
+            matches!(err, StreamError::NotDivisible { .. }),
+            "expected NotDivisible, got {err:?}"
         );
     }
 }

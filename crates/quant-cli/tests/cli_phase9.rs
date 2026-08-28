@@ -348,11 +348,11 @@ fn nvfp4_scaling_mode_override_is_usage_error() {
     );
 }
 
-/// TEMPORARY (plan Phase A.4 → replaced by parity tests in Phase C/E): the
-/// orchestrator is INT8-only so far, so a non-INT8 run must fail with a
-/// clean runtime error (exit 1) — never silently emit INT8 output.
+/// Phase C.2 removed the "only int8" guard: non-INT8 formats are now wired,
+/// so a `--format mxfp8` run must SUCCEED (exit 0) and produce an output file.
+/// (Full per-format CLI payload parity lives in Phase E `cli_all_formats.rs`.)
 #[test]
-fn unwired_format_fails_cleanly() {
+fn wired_format_runs_via_cli() {
     let tmp = tempfile::tempdir().unwrap();
     let out_path = tmp.path().join("o.safetensors");
     let out = bin()
@@ -370,16 +370,12 @@ fn unwired_format_fails_cleanly() {
         .unwrap();
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "unwired format must be a runtime failure"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not yet implemented"),
-        "stderr must explain the format is not wired yet:\n{stderr}"
+        Some(0),
+        "mxfp8 is wired and must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !out_path.exists(),
-        "no output file may be created for an unwired format"
+        out_path.exists(),
+        "a wired format must produce an output file"
     );
 }
