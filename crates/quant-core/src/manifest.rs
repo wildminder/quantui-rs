@@ -149,22 +149,42 @@ impl QuantConfig {
     /// Python `json.dumps` default separators are `", "` / `": "`; booleans are
     /// lowercase; ints plain decimal. We hand-build that exact string to avoid
     /// serde_json formatting drift.
+    ///
+    /// Per-format payload values (plan §3.2): the same 9 keys for every
+    /// format; `target_format`/`int8`/`scaling_mode`/`block_size` vary. The
+    /// INT8 branch reads the raw fields exactly as before — the captured
+    /// Python vector `56920c6553cfa241` must never move. Non-INT8 payloads
+    /// have no external reference vector (the reference only ever ran INT8);
+    /// they only need to be deterministic, distinct per effective config, and
+    /// collision-free vs INT8 (guaranteed by distinct `target_format`).
     pub fn config_hash(&self) -> String {
+        let (target_format, int8, scaling_mode, block_size): (&str, bool, &str, u32) =
+            match self.format {
+                Format::Int8 => (
+                    &self.target_format,
+                    self.int8,
+                    self.scaling_mode.as_str(),
+                    self.block_size,
+                ),
+                Format::Fp8E4m3 => ("fp8", false, self.scaling_mode.as_str(), self.block_size),
+                Format::Mxfp8 => ("mxfp8", false, "block", 32),
+                Format::Nvfp4 => ("nvfp4", false, "block", 16),
+            };
         let payload = format!(
             concat!(
                 r#"{{"block_size": {}, "calib_seed": {}, "convrot": {}, "#,
                 r#""convrot_group_size": {}, "int8": {}, "no_learned_rounding": {}, "#,
                 r#""scaling_mode": "{}", "skip_inefficient": {}, "target_format": "{}"}}"#
             ),
-            self.block_size,
+            block_size,
             self.calib_seed,
             self.convrot,
             self.convrot_group_size,
-            self.int8,
+            int8,
             self.no_learned_rounding,
-            self.scaling_mode.as_str(),
+            scaling_mode,
             self.skip_inefficient,
-            self.target_format,
+            target_format,
         );
         let digest = Sha256::digest(payload.as_bytes());
         hex(&digest)[..16].to_string()
@@ -331,6 +351,65 @@ mod tests {
         c.block_size = 128;
         c.scaling_mode = ScalingMode::Row;
         assert_ne!(c.config_hash(), base);
+    }
+
+    /// Captured deterministic vectors for the non-INT8 formats (plan A.2).
+    /// The payload strings are hand-built `json.dumps(sort_keys=True)`
+    /// mirrors; these vectors pin them against accidental drift. The INT8
+    /// vector above is the only externally-referenced one (Python ref);
+    /// these are internal stability pins.
+    #[test]
+    fn config_hash_fp8_vector() {
+        let mut c = QuantConfig::default();
+        c.format = Format::Fp8E4m3;
+        c.target_format = "fp8".into();
+        c.int8 = false;
+        assert_eq!(c.config_hash(), "5f14780b1bcf30f2");
+        // Scaling mode is hash-relevant for FP8 (tensor/row/block).
+        c.scaling_mode = ScalingMode::Row;
+        assert_ne!(c.config_hash(), "5f14780b1bcf30f2");
+    }
+
+    #[test]
+    fn config_hash_mxfp8_vector() {
+        let mut c = QuantConfig::default();
+        c.format = Format::Mxfp8;
+        c.target_format = "mxfp8".into();
+        c.int8 = false;
+        // Fixed block_size=32 / scaling_mode=block regardless of config fields.
+        assert_eq!(c.config_hash(), "cff3b89365c9544d");
+        c.block_size = 64; // ignored for the hash payload
+        c.scaling_mode = ScalingMode::Row; // ignored for the hash payload
+        assert_eq!(c.config_hash(), "cff3b89365c9544d");
+    }
+
+    #[test]
+    fn config_hash_nvfp4_vector() {
+        let mut c = QuantConfig::default();
+        c.format = Format::Nvfp4;
+        c.target_format = "nvfp4".into();
+        c.int8 = false;
+        assert_eq!(c.config_hash(), "95ede677cf402b53");
+        c.block_size = 64; // ignored for the hash payload
+        assert_eq!(c.config_hash(), "95ede677cf402b53");
+    }
+
+    #[test]
+    fn config_hash_pairwise_distinct_across_formats() {
+        let mut c = QuantConfig::default();
+        let int8 = c.config_hash();
+        c.format = Format::Fp8E4m3;
+        let fp8 = c.config_hash();
+        c.format = Format::Mxfp8;
+        let mxfp8 = c.config_hash();
+        c.format = Format::Nvfp4;
+        let nvfp4 = c.config_hash();
+        let all = [int8, fp8, mxfp8, nvfp4];
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                assert_ne!(all[i], all[j], "formats {i} and {j} collide");
+            }
+        }
     }
 
     #[test]
