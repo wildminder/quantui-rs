@@ -14,7 +14,7 @@ use std::sync::Arc;
 use quant_core::discover::{
     classify_input, ctq_quant_tags, discover_shards, suggest_comfy_output, InputKind,
 };
-use quant_core::manifest::{QuantConfig, ScalingMode};
+use quant_core::manifest::{Format, QuantConfig, ScalingMode};
 use quant_core::stream::{
     stream_quantize_cancellable, stream_quantize_sharded_cancellable,
     stream_quantize_shards_cancellable, StreamError,
@@ -32,13 +32,20 @@ fn scaling_mode(m: ScalingModeArg) -> ScalingMode {
     }
 }
 
-/// Format id used for auto-naming tags (mirrors reference `int8_block` /
-/// `int8_tensor` / `int8_row` method ids).
-fn format_id(m: ScalingModeArg) -> &'static str {
-    match m {
-        ScalingModeArg::Tensor => "int8_tensor",
-        ScalingModeArg::Row => "int8_row",
-        ScalingModeArg::Block => "int8_block",
+/// Format id used for auto-naming tags. INT8 mirrors the reference
+/// `int8_block` / `int8_tensor` / `int8_row` method ids; the new formats use
+/// their COMFY_FORMATS registry ids (plan OQ-4: `fp8_e4m3` for all three FP8
+/// scaling modes — the registry has a single id; `mxfp8`; `nvfp4`).
+fn format_id(format: FormatArg, mode: ScalingModeArg) -> &'static str {
+    match format {
+        FormatArg::Int8 => match mode {
+            ScalingModeArg::Tensor => "int8_tensor",
+            ScalingModeArg::Row => "int8_row",
+            ScalingModeArg::Block => "int8_block",
+        },
+        FormatArg::Fp8E4m3 => "fp8_e4m3",
+        FormatArg::Mxfp8 => "mxfp8",
+        FormatArg::Nvfp4 => "nvfp4",
     }
 }
 
@@ -49,15 +56,39 @@ fn orig_dtype(d: OrigDtypeArg) -> &'static str {
     }
 }
 
-/// Build the core [`QuantConfig`] from CLI args.
+/// Build the core [`QuantConfig`] from CLI args (plan A.4).
+///
+/// INT8/FP8 take the (optional) `--scaling-mode` / `--block-size` with the
+/// historical defaults `block` / 128. MXFP8/NVFP4 have FIXED scaling
+/// parameters (block scaling at the format's own block size, 32/16) — the
+/// caller must have rejected explicit overrides already.
 fn build_config(args: &QuantizeArgs) -> QuantConfig {
     // `--heur` / `--no-heur` are mutually-overriding flags; default ON.
     let skip_inefficient = !args.no_heur;
+    let (format, target_format, int8, scaling_mode, block_size) = match args.format {
+        FormatArg::Int8 => (
+            Format::Int8,
+            "int8",
+            true,
+            scaling_mode(args.scaling_mode.unwrap_or(ScalingModeArg::Block)),
+            args.block_size.unwrap_or(128),
+        ),
+        FormatArg::Fp8E4m3 => (
+            Format::Fp8E4m3,
+            "fp8",
+            false,
+            scaling_mode(args.scaling_mode.unwrap_or(ScalingModeArg::Block)),
+            args.block_size.unwrap_or(128),
+        ),
+        FormatArg::Mxfp8 => (Format::Mxfp8, "mxfp8", false, ScalingMode::Block, 32),
+        FormatArg::Nvfp4 => (Format::Nvfp4, "nvfp4", false, ScalingMode::Block, 16),
+    };
     QuantConfig {
-        target_format: "int8".into(),
-        int8: true,
-        scaling_mode: scaling_mode(args.scaling_mode),
-        block_size: args.block_size,
+        format,
+        target_format: target_format.into(),
+        int8,
+        scaling_mode,
+        block_size,
         no_learned_rounding: args.simple,
         convrot: false,
         convrot_group_size: 256,
@@ -89,7 +120,7 @@ fn resolve_output(args: &QuantizeArgs, config: &QuantConfig) -> Result<PathBuf, 
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tags = ctq_quant_tags(
-        format_id(args.scaling_mode),
+        format_id(args.format, args.scaling_mode.unwrap_or(ScalingModeArg::Block)),
         None,
         config.no_learned_rounding,
         false,
@@ -129,9 +160,24 @@ pub fn run(args: QuantizeArgs) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    if args.format != FormatArg::Int8 {
-        eprintln!("error: only `int8` is supported by the streaming quantizer");
-        return ExitCode::from(2);
+    // MXFP8/NVFP4 have FIXED scaling parameters (block scaling at the
+    // format's own block size). An explicit --scaling-mode / --block-size
+    // override is a usage error (plan A.4).
+    if args.format.has_fixed_scaling() {
+        if args.scaling_mode.is_some() {
+            eprintln!(
+                "error: --scaling-mode is not valid with --format {} (fixed block scaling)",
+                args.format.as_str()
+            );
+            return ExitCode::from(2);
+        }
+        if args.block_size.is_some() {
+            eprintln!(
+                "error: --block-size is not valid with --format {} (fixed block size)",
+                args.format.as_str()
+            );
+            return ExitCode::from(2);
+        }
     }
 
     let config = build_config(&args);
@@ -208,7 +254,7 @@ fn record_recent(
     let record = RunRecord {
         ts: now_iso8601(),
         family: "ctq".into(),
-        method: format_id(args.scaling_mode).into(),
+        method: format_id(args.format, args.scaling_mode.unwrap_or(ScalingModeArg::Block)).into(),
         output: outcome.output.to_string_lossy().into_owned(),
         status: status.into(),
         exit_code,

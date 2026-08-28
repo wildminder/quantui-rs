@@ -36,7 +36,7 @@ use crate::bias_correction::{correct_bias, CalibCache};
 use crate::comfy_schema::{encode_comfy_quant, ComfyFormat};
 use crate::discover::{ShardedModel, INDEX_NAME};
 use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
-use crate::manifest::{QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
+use crate::manifest::{Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
 use crate::quant::{dequantize_int8, quantize_int8_weight, should_skip_shape};
 use crate::st_io::header::TensorInfo;
 use crate::st_io::reader::SafetensorsReader;
@@ -94,6 +94,11 @@ pub enum StreamError {
     /// Bias correction needs a float bias (f32/f16/bf16); got something else.
     #[error("bias `{name}` has unsupported dtype {dtype} for bias correction (need f32/f16/bf16)")]
     UnsupportedBiasDtype { name: String, dtype: DType },
+    /// TEMPORARY (plan Phase A.4 → removed by Phase C.2): the orchestrator
+    /// only implements INT8 kernel routing so far. FP8/MXFP8/NVFP4 configs
+    /// must fail loudly rather than silently emit INT8 output.
+    #[error("format `{0}` is not yet implemented by the streaming orchestrator (only int8 is wired; see plan Phase C)")]
+    FormatNotYetWired(String),
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
@@ -429,6 +434,13 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     mut on_progress: Option<&mut ProgressFn>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamResult> {
+    // TEMPORARY (plan Phase A.4 → removed by Phase C.2): kernel routing is
+    // INT8-only so far. Non-INT8 configs must fail loudly here — never
+    // silently emit INT8 output for a different requested format.
+    if config.format != Format::Int8 {
+        return Err(StreamError::FormatNotYetWired(config.format.as_str().into()));
+    }
+
     let names: Vec<String> = input.names().to_vec();
     // Reference: `total = len(names)` — the full tensor count, independent of
     // how many are already done from a resumed run.

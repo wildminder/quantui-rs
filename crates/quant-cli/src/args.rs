@@ -35,12 +35,35 @@ pub enum OrigDtypeArg {
     Float16,
 }
 
-/// Target quantization format. Only `int8` is wired into the streaming
-/// orchestrator today; the FP8/MXFP8/NVFP4 kernels exist but use separate
-/// (out-of-scope) conversion paths.
+/// Target quantization format. `int8` is the shipped streaming path;
+/// `fp8_e4m3` / `mxfp8` / `nvfp4` are being wired into the streaming
+/// orchestrator (plan docs/plans/2026-08-28-all-formats-wiring-plan.md).
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatArg {
     Int8,
+    #[value(name = "fp8_e4m3")]
+    Fp8E4m3,
+    Mxfp8,
+    Nvfp4,
+}
+
+impl FormatArg {
+    /// The CLI value name (used in error messages).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FormatArg::Int8 => "int8",
+            FormatArg::Fp8E4m3 => "fp8_e4m3",
+            FormatArg::Mxfp8 => "mxfp8",
+            FormatArg::Nvfp4 => "nvfp4",
+        }
+    }
+
+    /// Formats with FIXED scaling parameters (block scaling at the format's
+    /// own block size). Explicit `--scaling-mode` / `--block-size` for these
+    /// is a usage error (exit 2).
+    pub fn has_fixed_scaling(&self) -> bool {
+        matches!(self, FormatArg::Mxfp8 | FormatArg::Nvfp4)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -54,17 +77,21 @@ pub struct QuantizeArgs {
     /// suggested automatically (`<base>-int8-simple-heur.safetensors` etc.).
     pub output: Option<PathBuf>,
 
-    /// Target format (only `int8` is supported by the streaming quantizer).
+    /// Target format (`int8`, `fp8_e4m3`, `mxfp8`, `nvfp4`).
     #[arg(long, value_enum, default_value_t = FormatArg::Int8)]
     pub format: FormatArg,
 
-    /// INT8 scaling mode.
-    #[arg(long, short = 'm', value_enum, default_value_t = ScalingModeArg::Block)]
-    pub scaling_mode: ScalingModeArg,
+    /// Scaling mode. INT8/FP8: `tensor | row | block` (default `block`).
+    /// MXFP8/NVFP4 have fixed block scaling — passing this flag with those
+    /// formats is a usage error.
+    #[arg(long, short = 'm', value_enum)]
+    pub scaling_mode: Option<ScalingModeArg>,
 
-    /// Block size for `--scaling-mode block` (64, 128 or 256).
-    #[arg(long, short = 'b', default_value_t = 128)]
-    pub block_size: u32,
+    /// Block size for `--scaling-mode block` (64, 128 or 256; default 128).
+    /// MXFP8/NVFP4 have fixed block sizes (32/16) — passing this flag with
+    /// those formats is a usage error.
+    #[arg(long, short = 'b')]
+    pub block_size: Option<u32>,
 
     /// Enable the skip-inefficient-layers heuristic (on by default; layers
     /// whose dims are not divisible by the block size are copied unchanged).

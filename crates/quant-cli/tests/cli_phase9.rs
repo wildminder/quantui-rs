@@ -272,3 +272,105 @@ fn quantize_help_documents_p0_options() {
         assert!(stdout.contains(opt), "help must document {opt}:\n{stdout}");
     }
 }
+
+// --------------------------------------------------------------------------- //
+// Phase A.4: format values + fixed-scaling validation
+// --------------------------------------------------------------------------- //
+
+#[test]
+fn quantize_help_lists_all_format_values() {
+    let out = bin().args(["quantize", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for fmt in ["int8", "fp8_e4m3", "mxfp8", "nvfp4"] {
+        assert!(stdout.contains(fmt), "help must list format {fmt}:\n{stdout}");
+    }
+}
+
+#[test]
+fn mxfp8_block_size_override_is_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors").to_str().unwrap(),
+            tmp.path().join("o.safetensors").to_str().unwrap(),
+            "--format",
+            "mxfp8",
+            "--block-size",
+            "64",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "explicit --block-size with mxfp8 must be exit 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--block-size"),
+        "stderr must name the offending flag:\n{stderr}"
+    );
+}
+
+#[test]
+fn nvfp4_scaling_mode_override_is_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors").to_str().unwrap(),
+            tmp.path().join("o.safetensors").to_str().unwrap(),
+            "--format",
+            "nvfp4",
+            "--scaling-mode",
+            "row",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "explicit --scaling-mode with nvfp4 must be exit 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--scaling-mode"),
+        "stderr must name the offending flag:\n{stderr}"
+    );
+}
+
+/// TEMPORARY (plan Phase A.4 → replaced by parity tests in Phase C/E): the
+/// orchestrator is INT8-only so far, so a non-INT8 run must fail with a
+/// clean runtime error (exit 1) — never silently emit INT8 output.
+#[test]
+fn unwired_format_fails_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("o.safetensors");
+    let out = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors").to_str().unwrap(),
+            out_path.to_str().unwrap(),
+            "--format",
+            "mxfp8",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "unwired format must be a runtime failure"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "stderr must explain the format is not wired yet:\n{stderr}"
+    );
+    assert!(
+        !out_path.exists(),
+        "no output file may be created for an unwired format"
+    );
+}
