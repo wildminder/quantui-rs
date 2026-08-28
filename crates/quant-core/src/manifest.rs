@@ -29,11 +29,85 @@ impl ScalingMode {
     }
 }
 
+/// Calibration RNG draw order for the bias-correction cache (plan §3.4).
+///
+/// INT8/FP8 draw over ALL 2D `.weight` keys in FILE order (mirrors ctq
+/// `convert_to_fp8_scaled`); MXFP8/NVFP4 draw over `sorted(2D .weight keys)`
+/// only (mirrors the dedicated ctq format modules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibOrder {
+    FileOrderAll2D,
+    SortedWeightsOnly,
+}
+
+/// Target quantization format family (plan Phase A.1). INT8 is the shipped
+/// streaming path; FP8/MXFP8/NVFP4 kernels exist and are being wired in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    #[default]
+    Int8,
+    Fp8E4m3,
+    Mxfp8,
+    Nvfp4,
+}
+
+impl Format {
+    /// The `target_format` string carried in the config-hash payload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Format::Int8 => "int8",
+            Format::Fp8E4m3 => "fp8",
+            Format::Mxfp8 => "mxfp8",
+            Format::Nvfp4 => "nvfp4",
+        }
+    }
+
+    /// Block size used by the skip-inefficient heuristic predicate. INT8/FP8
+    /// use the config's (user-selectable) block size; MXFP8/NVFP4 have fixed
+    /// format block sizes (32 / 16).
+    pub fn heur_block_size(&self, config_block_size: u32) -> u32 {
+        match self {
+            Format::Int8 | Format::Fp8E4m3 => config_block_size,
+            Format::Mxfp8 => 32,
+            Format::Nvfp4 => 16,
+        }
+    }
+
+    /// Calibration RNG draw order for this format family (plan §3.4).
+    pub fn calib_order(&self) -> CalibOrder {
+        match self {
+            Format::Int8 | Format::Fp8E4m3 => CalibOrder::FileOrderAll2D,
+            Format::Mxfp8 | Format::Nvfp4 => CalibOrder::SortedWeightsOnly,
+        }
+    }
+
+    /// Whether this format's output carries file-level `__metadata__`
+    /// (`_quantization_metadata`). Only MXFP8/NVFP4 (plan §3.3).
+    pub fn carries_file_metadata(&self) -> bool {
+        matches!(self, Format::Mxfp8 | Format::Nvfp4)
+    }
+
+    /// Fixed group size for the comfy_quant blob, if the format has one.
+    /// INT8/FP8 group size is mode-dependent (handled at emission); MXFP8=32,
+    /// NVFP4=16.
+    pub fn fixed_group_size(&self) -> Option<u32> {
+        match self {
+            Format::Int8 | Format::Fp8E4m3 => None,
+            Format::Mxfp8 => Some(32),
+            Format::Nvfp4 => Some(16),
+        }
+    }
+}
+
 /// Streaming-quantization configuration — mirrors `QuantConfig`'s hash-relevant
 /// fields exactly. Field names in [`QuantConfig::config_hash`] must match the
 /// Python dict keys character-for-character.
 #[derive(Debug, Clone)]
 pub struct QuantConfig {
+    /// Format family (plan Phase A.1). Drives kernel routing, calibration
+    /// draw order, and the config-hash payload. Defaults to INT8 — the
+    /// shipped streaming path.
+    pub format: Format,
     pub target_format: String, // "int8"
     pub int8: bool,            // true
     pub scaling_mode: ScalingMode,
@@ -53,6 +127,7 @@ pub struct QuantConfig {
 impl Default for QuantConfig {
     fn default() -> Self {
         Self {
+            format: Format::Int8,
             target_format: "int8".into(),
             int8: true,
             scaling_mode: ScalingMode::Block,
@@ -198,6 +273,46 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_enum_properties() {
+        // as_str = the target_format strings (plan §3.2).
+        assert_eq!(Format::Int8.as_str(), "int8");
+        assert_eq!(Format::Fp8E4m3.as_str(), "fp8");
+        assert_eq!(Format::Mxfp8.as_str(), "mxfp8");
+        assert_eq!(Format::Nvfp4.as_str(), "nvfp4");
+
+        // heur block sizes: INT8/FP8 follow the config block size;
+        // MXFP8=32, NVFP4=16 (plan §3.2 / ground truth #5).
+        assert_eq!(Format::Int8.heur_block_size(128), 128);
+        assert_eq!(Format::Int8.heur_block_size(64), 64);
+        assert_eq!(Format::Fp8E4m3.heur_block_size(128), 128);
+        assert_eq!(Format::Fp8E4m3.heur_block_size(256), 256);
+        assert_eq!(Format::Mxfp8.heur_block_size(128), 32);
+        assert_eq!(Format::Nvfp4.heur_block_size(128), 16);
+
+        // Calibration draw order per format family (plan §3.4).
+        assert_eq!(Format::Int8.calib_order(), CalibOrder::FileOrderAll2D);
+        assert_eq!(Format::Fp8E4m3.calib_order(), CalibOrder::FileOrderAll2D);
+        assert_eq!(Format::Mxfp8.calib_order(), CalibOrder::SortedWeightsOnly);
+        assert_eq!(Format::Nvfp4.calib_order(), CalibOrder::SortedWeightsOnly);
+
+        // File-level metadata only for MXFP8/NVFP4 (plan §3.3).
+        assert!(!Format::Int8.carries_file_metadata());
+        assert!(!Format::Fp8E4m3.carries_file_metadata());
+        assert!(Format::Mxfp8.carries_file_metadata());
+        assert!(Format::Nvfp4.carries_file_metadata());
+
+        // Fixed group sizes (plan §3.2).
+        assert_eq!(Format::Int8.fixed_group_size(), None);
+        assert_eq!(Format::Fp8E4m3.fixed_group_size(), None);
+        assert_eq!(Format::Mxfp8.fixed_group_size(), Some(32));
+        assert_eq!(Format::Nvfp4.fixed_group_size(), Some(16));
+
+        // Default format is INT8 (old configs / manifests stay INT8).
+        assert_eq!(Format::default(), Format::Int8);
+        assert_eq!(QuantConfig::default().format, Format::Int8);
+    }
 
     #[test]
     fn config_hash_matches_python_reference() {
