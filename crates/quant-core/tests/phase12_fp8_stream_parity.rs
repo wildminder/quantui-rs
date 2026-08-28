@@ -151,6 +151,38 @@ fn fp8_heur_block_size_is_mode_aware() {
     );
 }
 
+// ---- determinism (plan C.5) ----------------------------------------------- //
+
+/// Double-run determinism: two fresh runs over the same input must produce
+/// byte-identical output files (pinned seed, no GPU, deterministic writer).
+/// Exercised in block mode (the most complex FP8 path).
+#[test]
+fn fp8_double_run_identical() {
+    let dir = golden("linear_basic_bf16");
+    let tmp = tempfile::tempdir().unwrap();
+    let out1 = tmp.path().join("run1.safetensors");
+    let out2 = tmp.path().join("run2.safetensors");
+
+    stream_quantize(
+        dir.join("input.safetensors"),
+        &out1,
+        &fp8_config(ScalingMode::Block),
+    )
+    .unwrap();
+    stream_quantize(
+        dir.join("input.safetensors"),
+        &out2,
+        &fp8_config(ScalingMode::Block),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "two fresh FP8 runs must be byte-identical"
+    );
+}
+
 // ---- divisibility policy (plan §3.6 / C.3) -------------------------------- //
 
 /// FP8 block mode with the skip heuristic OFF must NOT error on indivisible

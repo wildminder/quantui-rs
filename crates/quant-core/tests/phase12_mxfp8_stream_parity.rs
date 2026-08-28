@@ -60,3 +60,69 @@ fn mxfp8_conv_net() {
 fn mxfp8_zero_blocks() {
     run_mxfp8("zero_blocks");
 }
+
+// ---- determinism + resume (plan C.5) -------------------------------------- //
+
+/// Double-run determinism: two fresh runs over the same input must produce
+/// byte-identical output files (pinned seed, no GPU, deterministic writer).
+#[test]
+fn mxfp8_double_run_identical() {
+    let dir = golden("linear_basic_bf16");
+    let tmp = tempfile::tempdir().unwrap();
+    let out1 = tmp.path().join("run1.safetensors");
+    let out2 = tmp.path().join("run2.safetensors");
+
+    stream_quantize(dir.join("input.safetensors"), &out1, &mxfp8_config()).unwrap();
+    stream_quantize(dir.join("input.safetensors"), &out2, &mxfp8_config()).unwrap();
+
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "two fresh MXFP8 runs must be byte-identical"
+    );
+}
+
+/// Resume smoke: cancel mid-run (after 2 tensors), then re-run to resume; the
+/// final output must be payload-identical to an uninterrupted full run.
+#[test]
+fn mxfp8_resume_to_parity() {
+    use quant_core::stream::{stream_quantize_cancellable, StreamError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = golden("linear_basic_bf16");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out.safetensors");
+
+    // Cancel after the 2nd tensor completes.
+    let cancel = AtomicBool::new(false);
+    let mut events = 0usize;
+    let result = {
+        let mut cb = |_cur: usize, _total: usize| {
+            events += 1;
+            if events >= 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        stream_quantize_cancellable(
+            dir.join("input.safetensors"),
+            &out,
+            &mxfp8_config(),
+            Some(&mut cb),
+            &cancel,
+        )
+    };
+    assert!(
+        matches!(result, Err(StreamError::Cancelled { .. })),
+        "expected Cancelled, got {result:?}"
+    );
+
+    // Resume to completion.
+    stream_quantize(dir.join("input.safetensors"), &out, &mxfp8_config()).unwrap();
+
+    // Payload-identical to the golden (which an uninterrupted run matches).
+    assert_payload_parity(
+        &out,
+        &dir.join("output_mxfp8.safetensors"),
+        "linear_basic_bf16/mxfp8 (resumed)",
+    );
+}
