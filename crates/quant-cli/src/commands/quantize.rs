@@ -120,7 +120,10 @@ fn resolve_output(args: &QuantizeArgs, config: &QuantConfig) -> Result<PathBuf, 
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tags = ctq_quant_tags(
-        format_id(args.format, args.scaling_mode.unwrap_or(ScalingModeArg::Block)),
+        format_id(
+            args.format,
+            args.scaling_mode.unwrap_or(ScalingModeArg::Block),
+        ),
         None,
         config.no_learned_rounding,
         false,
@@ -254,7 +257,11 @@ fn record_recent(
     let record = RunRecord {
         ts: now_iso8601(),
         family: "ctq".into(),
-        method: format_id(args.format, args.scaling_mode.unwrap_or(ScalingModeArg::Block)).into(),
+        method: format_id(
+            args.format,
+            args.scaling_mode.unwrap_or(ScalingModeArg::Block),
+        )
+        .into(),
         output: outcome.output.to_string_lossy().into_owned(),
         status: status.into(),
         exit_code,

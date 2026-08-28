@@ -283,7 +283,10 @@ fn quantize_help_lists_all_format_values() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     for fmt in ["int8", "fp8_e4m3", "mxfp8", "nvfp4"] {
-        assert!(stdout.contains(fmt), "help must list format {fmt}:\n{stdout}");
+        assert!(
+            stdout.contains(fmt),
+            "help must list format {fmt}:\n{stdout}"
+        );
     }
 }
 
@@ -293,7 +296,9 @@ fn mxfp8_block_size_override_is_usage_error() {
     let out = bin()
         .args([
             "quantize",
-            golden("linear_basic_bf16/input.safetensors").to_str().unwrap(),
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
             tmp.path().join("o.safetensors").to_str().unwrap(),
             "--format",
             "mxfp8",
@@ -320,7 +325,9 @@ fn nvfp4_scaling_mode_override_is_usage_error() {
     let out = bin()
         .args([
             "quantize",
-            golden("linear_basic_bf16/input.safetensors").to_str().unwrap(),
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
             tmp.path().join("o.safetensors").to_str().unwrap(),
             "--format",
             "nvfp4",
@@ -351,7 +358,9 @@ fn unwired_format_fails_cleanly() {
     let out = bin()
         .args([
             "quantize",
-            golden("linear_basic_bf16/input.safetensors").to_str().unwrap(),
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
             out_path.to_str().unwrap(),
             "--format",
             "mxfp8",

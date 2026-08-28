@@ -366,11 +366,16 @@ mod tests {
             ("gamma.weight".into(), Some(96)), // duplicate n=96 → dedup
         ];
 
-        let got = CalibCache::build(pairs.clone().into_iter(), CalibOrder::FileOrderAll2D, 233983427);
+        let got = CalibCache::build(
+            pairs.clone().into_iter(),
+            CalibOrder::FileOrderAll2D,
+            233983427,
+        );
 
         // Legacy algorithm (verbatim pre-A.3 loop).
         let mut rng = TorchRng::manual_seed(233983427);
-        let mut legacy: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+        let mut legacy: std::collections::HashMap<usize, Vec<f32>> =
+            std::collections::HashMap::new();
         for (_name, n) in pairs.iter() {
             let Some(n) = n else { continue };
             if legacy.contains_key(n) {
@@ -384,7 +389,9 @@ mod tests {
             let have = got.get(*n).expect("entry present");
             assert_eq!(have.len(), want.len());
             assert!(
-                have.iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                have.iter()
+                    .zip(want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "FileOrderAll2D entry n={n} must be bit-identical to legacy"
             );
         }
@@ -403,10 +410,12 @@ mod tests {
             ("alpha.weight".into(), Some(64)),
         ];
 
-        let file_order =
-            CalibCache::build(pairs.clone().into_iter(), CalibOrder::FileOrderAll2D, 233983427);
-        let sorted =
-            CalibCache::build(pairs.into_iter(), CalibOrder::SortedWeightsOnly, 233983427);
+        let file_order = CalibCache::build(
+            pairs.clone().into_iter(),
+            CalibOrder::FileOrderAll2D,
+            233983427,
+        );
+        let sorted = CalibCache::build(pairs.into_iter(), CalibOrder::SortedWeightsOnly, 233983427);
 
         // Both caches hold the same keys…
         assert_eq!(file_order.entries.len(), 2);
@@ -415,7 +424,10 @@ mod tests {
         let differs = [64usize, 96]
             .iter()
             .any(|n| file_order.get(*n).unwrap() != sorted.get(*n).unwrap());
-        assert!(differs, "sorted order must shift the RNG stream vs file order");
+        assert!(
+            differs,
+            "sorted order must shift the RNG stream vs file order"
+        );
 
         // And SortedWeightsOnly must equal a reference that draws in sorted
         // name order: alpha (n=64) first, then zeta (n=96).
@@ -451,7 +463,14 @@ mod tests {
     /// mirroring the original (pre-parallelization) loop order exactly:
     /// s outer, i middle, j inner with 128-element K chunks. Used to prove the
     /// parallelized `correct_bias` is bit-identical.
-    fn sequential_correct_bias(x: &[f32], w_orig: &[f32], w_dq: &[f32], bias: &[f32], m: usize, n: usize) -> Vec<f32> {
+    fn sequential_correct_bias(
+        x: &[f32],
+        w_orig: &[f32],
+        w_dq: &[f32],
+        bias: &[f32],
+        m: usize,
+        n: usize,
+    ) -> Vec<f32> {
         const K_CHUNK: usize = 128;
         let mut out_err = vec![0.0f32; CALIB_SAMPLES * m];
         for s in 0..CALIB_SAMPLES {
@@ -495,7 +514,9 @@ mod tests {
         // K-chunk tail, m spanning both the 32-group and ilp-tail reduction paths.
         let (m, n) = (40usize, 300usize);
         let mut state = 0x1234_5678_9ABC_DEF0u64;
-        let x: Vec<f32> = (0..CALIB_SAMPLES * n).map(|_| next_f32(&mut state)).collect();
+        let x: Vec<f32> = (0..CALIB_SAMPLES * n)
+            .map(|_| next_f32(&mut state))
+            .collect();
         let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
         let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
         let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();
@@ -517,7 +538,9 @@ mod tests {
     fn correct_bias_returns_none_when_cancelled() {
         let (m, n) = (8usize, 64usize);
         let mut state = 42u64;
-        let x: Vec<f32> = (0..CALIB_SAMPLES * n).map(|_| next_f32(&mut state)).collect();
+        let x: Vec<f32> = (0..CALIB_SAMPLES * n)
+            .map(|_| next_f32(&mut state))
+            .collect();
         let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
         let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
         let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();

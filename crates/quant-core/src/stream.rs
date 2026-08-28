@@ -438,7 +438,9 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     // INT8-only so far. Non-INT8 configs must fail loudly here — never
     // silently emit INT8 output for a different requested format.
     if config.format != Format::Int8 {
-        return Err(StreamError::FormatNotYetWired(config.format.as_str().into()));
+        return Err(StreamError::FormatNotYetWired(
+            config.format.as_str().into(),
+        ));
     }
 
     let names: Vec<String> = input.names().to_vec();
