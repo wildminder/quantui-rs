@@ -491,23 +491,28 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
 
     // ---- bias-correction calibration cache (Phase 7.3) --------------------- //
     // Unique in_features among ALL 2D `.weight` tensors (quantizable or not),
-    // in file order, from one shared generator seeded once. This mirrors
+    // from one shared generator seeded once. This mirrors
     // `_build_torch_calibration_cache` exactly: it iterates every name ending
     // in `.weight` with a 2D shape and draws `randn(3072, in_features)` per
     // unique in_features — it does NOT filter by quantizability/exclusion.
     // (Skipping the draw for skipped weights would shift the RNG stream and
     // corrupt bias correction whenever a skipped weight sorts before a
     // quantized one — confirmed by probe.)
+    //
+    // The DRAW ORDER is format-dependent (plan §3.4): INT8/FP8 draw in file
+    // order over all 2D weights; MXFP8/NVFP4 draw over sorted(weights-only).
     let calib = CalibCache::build(
         names.iter().map(|n| {
             let info = input.info(n);
-            match info {
+            let nf = match info {
                 Some(i) if n.ends_with(".weight") && i.shape.len() == 2 => {
                     Some(i.shape[1] as usize)
                 }
                 _ => None,
-            }
+            };
+            (n.clone(), nf)
         }),
+        config.format.calib_order(),
         config.calib_seed as u64,
     );
 

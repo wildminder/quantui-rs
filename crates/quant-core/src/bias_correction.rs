@@ -31,6 +31,7 @@
 //! - Column parallelization splits columns only; per-column order unchanged.
 //! - mean = cascade sum then f32 division by S; bias update b - corr in f32.
 
+use crate::manifest::CalibOrder;
 use crate::torch_rng::TorchRng;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,16 +45,51 @@ pub struct CalibCache {
 
 impl CalibCache {
     /// Build the calibration cache: one shared generator seeded once, drawing
-    /// randn(CALIB_SAMPLES, in_features) per unique in_features in file order.
-    pub fn build(shapes_in_file_order: impl Iterator<Item = Option<usize>>, seed: u64) -> Self {
+    /// randn(CALIB_SAMPLES, in_features) per unique in_features.
+    ///
+    /// `pairs` yields `(tensor_name, Option<in_features>)` for every tensor in
+    /// FILE order (`None` for non-2D-`.weight` tensors). The DRAW ORDER
+    /// depends on the format family (plan §3.4, parity-critical):
+    ///
+    /// - [`CalibOrder::FileOrderAll2D`] (INT8/FP8, ctq
+    ///   `convert_to_fp8_scaled`): iterate in file order, draw for every
+    ///   `Some(n)`, dedup by `n` — exactly the legacy INT8 behavior.
+    /// - [`CalibOrder::SortedWeightsOnly`] (MXFP8/NVFP4, ctq
+    ///   `mxfp8_conversion.py:193-206` / `nvfp4_conversion.py`): collect the
+    ///   `Some(n)` entries, sort by NAME, then draw per unique `n` in that
+    ///   sorted order.
+    ///
+    /// Skipping a draw (or changing the order) shifts the shared RNG stream
+    /// and corrupts every subsequent bias correction — the order is part of
+    /// the byte-parity contract.
+    pub fn build(
+        pairs: impl Iterator<Item = (String, Option<usize>)>,
+        order: CalibOrder,
+        seed: u64,
+    ) -> Self {
         let mut rng = TorchRng::manual_seed(seed);
         let mut entries = std::collections::HashMap::new();
-        for n in shapes_in_file_order {
-            let Some(n) = n else { continue };
-            if entries.contains_key(&n) {
-                continue;
+        match order {
+            CalibOrder::FileOrderAll2D => {
+                for (_name, n) in pairs {
+                    let Some(n) = n else { continue };
+                    if entries.contains_key(&n) {
+                        continue;
+                    }
+                    entries.insert(n, rng.randn_f32(CALIB_SAMPLES * n));
+                }
             }
-            entries.insert(n, rng.randn_f32(CALIB_SAMPLES * n));
+            CalibOrder::SortedWeightsOnly => {
+                let mut weighted: Vec<(String, usize)> =
+                    pairs.filter_map(|(name, n)| n.map(|n| (name, n))).collect();
+                weighted.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_name, n) in weighted {
+                    if entries.contains_key(&n) {
+                        continue;
+                    }
+                    entries.insert(n, rng.randn_f32(CALIB_SAMPLES * n));
+                }
+            }
         }
         Self { entries }
     }
@@ -311,6 +347,94 @@ pub fn correct_bias(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// A.3 gate: `CalibOrder::FileOrderAll2D` must reproduce the LEGACY
+    /// build loop byte-for-byte (iterate in file order, draw per unique
+    /// in_features, dedup by n). The reference below is an inline
+    /// reimplementation of the pre-A.3 code path.
+    #[test]
+    fn calib_cache_file_order_matches_legacy() {
+        // Fixture: mixed tensor names in a deliberately non-sorted file order,
+        // with duplicate in_features and non-weight / non-2D entries (None).
+        let pairs: Vec<(String, Option<usize>)> = vec![
+            ("zeta.weight".into(), Some(96)),
+            ("alpha.bias".into(), None),
+            ("alpha.weight".into(), Some(64)),
+            ("norm.weight".into(), Some(64)), // duplicate n=64 → dedup
+            ("conv.weight".into(), None),     // 4D conv → None
+            ("beta.weight".into(), Some(128)),
+            ("gamma.weight".into(), Some(96)), // duplicate n=96 → dedup
+        ];
+
+        let got = CalibCache::build(pairs.clone().into_iter(), CalibOrder::FileOrderAll2D, 233983427);
+
+        // Legacy algorithm (verbatim pre-A.3 loop).
+        let mut rng = TorchRng::manual_seed(233983427);
+        let mut legacy: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+        for (_name, n) in pairs.iter() {
+            let Some(n) = n else { continue };
+            if legacy.contains_key(n) {
+                continue;
+            }
+            legacy.insert(*n, rng.randn_f32(CALIB_SAMPLES * n));
+        }
+
+        assert_eq!(got.entries.len(), legacy.len(), "same unique-n count");
+        for (n, want) in &legacy {
+            let have = got.get(*n).expect("entry present");
+            assert_eq!(have.len(), want.len());
+            assert!(
+                have.iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "FileOrderAll2D entry n={n} must be bit-identical to legacy"
+            );
+        }
+    }
+
+    /// A.3: `SortedWeightsOnly` draws per unique in_features in NAME-sorted
+    /// order (ctq mxfp8/nvfp4 modules). When file order != sorted order the
+    /// RNG stream differs from FileOrderAll2D — this test pins that semantic.
+    #[test]
+    fn calib_cache_sorted_weights_only_draws_in_sorted_order() {
+        // File order puts zeta (n=96) BEFORE alpha (n=64); sorted order is
+        // alpha, zeta. The two orders must therefore produce different bytes
+        // for the same (name, n) set.
+        let pairs: Vec<(String, Option<usize>)> = vec![
+            ("zeta.weight".into(), Some(96)),
+            ("alpha.weight".into(), Some(64)),
+        ];
+
+        let file_order =
+            CalibCache::build(pairs.clone().into_iter(), CalibOrder::FileOrderAll2D, 233983427);
+        let sorted =
+            CalibCache::build(pairs.into_iter(), CalibOrder::SortedWeightsOnly, 233983427);
+
+        // Both caches hold the same keys…
+        assert_eq!(file_order.entries.len(), 2);
+        assert_eq!(sorted.entries.len(), 2);
+        // …but the draw order differs → different bytes for at least one n.
+        let differs = [64usize, 96]
+            .iter()
+            .any(|n| file_order.get(*n).unwrap() != sorted.get(*n).unwrap());
+        assert!(differs, "sorted order must shift the RNG stream vs file order");
+
+        // And SortedWeightsOnly must equal a reference that draws in sorted
+        // name order: alpha (n=64) first, then zeta (n=96).
+        let mut rng = TorchRng::manual_seed(233983427);
+        let want_64 = rng.randn_f32(CALIB_SAMPLES * 64);
+        let want_96 = rng.randn_f32(CALIB_SAMPLES * 96);
+        assert!(sorted
+            .get(64)
+            .unwrap()
+            .iter()
+            .zip(&want_64)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(sorted
+            .get(96)
+            .unwrap()
+            .iter()
+            .zip(&want_96)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
 
     /// Deterministic pseudo-random f32 in [-1, 1) from a 64-bit state (SplitMix64).
     fn next_f32(state: &mut u64) -> f32 {
