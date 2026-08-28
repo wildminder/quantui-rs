@@ -50,7 +50,9 @@
 
 use rayon::prelude::*;
 
-use crate::dtype::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_fp8_e4m3_bits, fp8_e4m3_bits_to_f32};
+use crate::dtype::{
+    bf16_bits_to_f32, f32_to_bf16_bits, f32_to_fp8_e4m3_bits, fp8_e4m3_bits_to_f32,
+};
 use crate::quant_fp8::FP8_MAX;
 
 /// MXFP8 fixed block size.
@@ -485,8 +487,17 @@ mod tests {
     #[test]
     fn from_blocked_inverts_to_blocked() {
         // Round-trip on multiple shapes incl. non-multiples of 128/4.
-        for &(rows, cols) in &[(128usize, 4usize), (130, 5), (1, 1), (32, 8), (256, 12), (33, 3)] {
-            let src: Vec<u8> = (0..rows * cols).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        for &(rows, cols) in &[
+            (128usize, 4usize),
+            (130, 5),
+            (1, 1),
+            (32, 8),
+            (256, 12),
+            (33, 3),
+        ] {
+            let src: Vec<u8> = (0..rows * cols)
+                .map(|i| ((i * 7 + 3) % 251) as u8)
+                .collect();
             let (blocked, shape) = to_blocked_u8(&src, rows, cols);
             assert_eq!(shape[0] as usize % 128, 0);
             assert_eq!(shape[1] as usize % 4, 0);
@@ -514,7 +525,10 @@ mod tests {
         for (i, (&o, &v)) in dq.iter().zip(w.iter()).enumerate() {
             let rem = (o / 0.125).fract();
             assert_eq!(rem, 0.0, "dq[{i}] = {o} not on the 0.125 grid");
-            assert!((o - v).abs() <= 16.0 * 0.125 + 1e-6, "dq[{i}] too far from {v}");
+            assert!(
+                (o - v).abs() <= 16.0 * 0.125 + 1e-6,
+                "dq[{i}] too far from {v}"
+            );
         }
     }
 

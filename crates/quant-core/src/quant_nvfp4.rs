@@ -57,7 +57,7 @@ use crate::dtype::{
     bf16_bits_to_f32, f32_to_bf16_bits, f32_to_fp8_e4m3_bits, fp8_e4m3_bits_to_f32,
 };
 use crate::quant_fp8::FP8_MAX;
-use crate::quant_mxfp8::to_blocked_u8;
+use crate::quant_mxfp8::{from_blocked_u8, to_blocked_u8};
 
 /// NVFP4 fixed block size (`FP4_BLOCK_SIZE`).
 pub const BLOCK_SIZE: usize = 16;
@@ -263,6 +263,69 @@ pub fn quantize_nvfp4_weight(w: &[f32], m: usize, n: usize) -> Nvfp4QuantResult 
     }
 }
 
+/// E2M1 code → f32 LUT (reference `E2M1_LUT` in
+/// `comfy_kitchen/backends/eager/quantization.py`): codes 0..7 →
+/// 0, 0.5, 1, 1.5, 2, 3, 4, 6; codes 8..15 → their negatives (code 8 = -0.0).
+/// All values are exact dyadics, so every product below is correctly rounded.
+const E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Dequantize an NVFP4 result back to f32 for bias correction — bit-exact
+/// port of the reference eager `dequantize_nvfp4`
+/// (`comfy_kitchen/backends/eager/quantization.py:174`), which the CPU
+/// goldens exercise (the format module calls `converter.dequantize(...,
+/// output_dtype=torch.float32)`).
+///
+/// Pipeline (reference lines 186-219):
+/// 1. Unpack the uint4 pairs hi-first (even index = high nibble, matching
+///    `pack_uint4(hi_first=True)` used at quantize time).
+/// 2. `E2M1_LUT[code]` per element.
+/// 3. `from_blocked` the E4M3 block-scale bytes over `(m_pad, num_blocks)` —
+///    the PADDED quantize dims, exactly as the reference derives them from
+///    the unpacked shape.
+/// 4. `total = per_tensor_scale × f32(scale_byte)` (keep this association —
+///    plan §3.5), then `value × total` per 16-block.
+/// 5. Crop the padded `(m_pad, n_pad)` result to the original `[m, n]`
+///    (the format module slices `dequant_w[:m, :n]` after dequantize).
+///
+/// Zero blocks: scale byte 0x00 → f32 0.0 → total 0.0 → `0.0 × 0.0 = +0.0`
+/// (codes there are all 0 → LUT[0] = +0.0), matching the reference.
+pub fn dequantize_nvfp4(r: &Nvfp4QuantResult, m: usize, n: usize) -> Vec<f32> {
+    let m_pad = r.qdata_shape[0] as usize;
+    let n_pad = r.qdata_shape[1] as usize * 2; // qdata stores n_pad/2 packed bytes
+    debug_assert!(m <= m_pad && n <= n_pad);
+    let num_blocks = n_pad / BLOCK_SIZE;
+
+    // Unswizzle the E4M3 block scales over the padded grid, then decode.
+    let scale_bytes = from_blocked_u8(&r.scale, m_pad, num_blocks);
+
+    let mut padded = vec![0.0f32; m_pad * n_pad];
+    for row in 0..m_pad {
+        for b in 0..num_blocks {
+            let scale_f32 = fp8_e4m3_bits_to_f32(scale_bytes[row * num_blocks + b]);
+            // Reference association: total = pts * block_scale_f32.
+            let total = r.per_tensor_scale * scale_f32;
+            let packed = &r.qdata[row * (n_pad / 2) + b * (BLOCK_SIZE / 2)
+                ..row * (n_pad / 2) + (b + 1) * (BLOCK_SIZE / 2)];
+            let out = &mut padded[row * n_pad + b * BLOCK_SIZE..row * n_pad + (b + 1) * BLOCK_SIZE];
+            for (pair, &byte) in out.chunks_exact_mut(2).zip(packed.iter()) {
+                let hi = (byte >> 4) as usize;
+                let lo = (byte & 0x0F) as usize;
+                pair[0] = E2M1_LUT[hi] * total;
+                pair[1] = E2M1_LUT[lo] * total;
+            }
+        }
+    }
+
+    // Crop to the original [m, n].
+    let mut out = Vec::with_capacity(m * n);
+    for row in 0..m {
+        out.extend_from_slice(&padded[row * n_pad..row * n_pad + n]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +495,137 @@ mod tests {
         let (seq_blocked, seq_shape) = to_blocked_u8(&seq_s, m_pad, num_blocks);
         assert_eq!(par.scale, seq_blocked);
         assert_eq!(par.scale_shape, seq_shape);
+    }
+
+    // --- Phase B.3: dequantize_nvfp4 --------------------------------------- //
+
+    #[test]
+    fn dequantize_nvfp4_hand_computed() {
+        // Reuse the single_block_known_codes fixture: pts = 1.0, scale byte
+        // 0x7E (448) → total = 1.0 × 448 = 448. Codes 7 1 2 3 4 5 6 7 |
+        // 9 10 11 12 13 14 15 0 → LUT values × 448.
+        let vals = [
+            2688.0, 224.0, 448.0, 672.0, 896.0, 1344.0, 1792.0, 2688.0, -224.0, -448.0, -672.0,
+            -896.0, -1344.0, -1792.0, -2688.0, 0.0,
+        ];
+        let r = quantize_nvfp4_weight(&vals, 1, 16);
+        let dq = dequantize_nvfp4(&r, 1, 16);
+        let expect: [f32; 16] = [
+            2688.0, 224.0, 448.0, 672.0, 896.0, 1344.0, 1792.0, 2688.0, -224.0, -448.0, -672.0,
+            -896.0, -1344.0, -1792.0, -2688.0, 0.0,
+        ];
+        assert_eq!(dq.len(), 16);
+        for (i, (&o, &e)) in dq.iter().zip(expect.iter()).enumerate() {
+            assert_eq!(o.to_bits(), e.to_bits(), "dq[{i}] = {o}, expected {e}");
+        }
+    }
+
+    #[test]
+    fn dequantize_nvfp4_total_scale_order() {
+        // total = per_tensor_scale × block_scale_f32 (reference association,
+        // plan §3.5), then value × total. Non-dyadic pts exercises the product:
+        // w = [3.0, 0×15] → amax 3.0 → pts = 3/2688 = 1/896 (non-dyadic).
+        // block_scale = 3/6 = 0.5; scaled = 0.5/(1/896) = 448 → byte 0x7E →
+        // scaled_f32 = 448; total = (1/896) × 448 = 0.5. Element 3.0/0.5 = 6
+        // → code 7 → LUT 6.0; dequant = 6.0 × 0.5 = 3.0 exactly.
+        let mut w = vec![0.0f32; 16];
+        w[0] = 3.0;
+        let r = quantize_nvfp4_weight(&w, 1, 16);
+        assert_eq!(r.per_tensor_scale, 3.0 / 2688.0);
+        let dq = dequantize_nvfp4(&r, 1, 16);
+        assert_eq!(
+            dq[0].to_bits(),
+            3.0f32.to_bits(),
+            "value × (pts × scale) = 3.0"
+        );
+        // Remaining elements are +0.0 (code 0 → LUT[0] = +0.0 × total).
+        for &v in &dq[1..] {
+            assert_eq!(v, 0.0);
+            assert!(v.is_sign_positive());
+        }
+    }
+
+    #[test]
+    fn dequantize_nvfp4_crops_padding() {
+        // 3×5 all-ones → padded 16×16. Dequant must crop back to 3×5, all 1.0
+        // (1.0/(pts×448) ≈ 6 → code 7 → LUT 6.0; total = pts×448; 6×total/6
+        // reconstructs 1.0 within the E2M1 grid — here exactly, since the
+        // block max lands on the LUT).
+        let w = vec![1.0f32; 3 * 5];
+        let r = quantize_nvfp4_weight(&w, 3, 5);
+        assert_eq!(r.qdata_shape, vec![16, 8]);
+        let dq = dequantize_nvfp4(&r, 3, 5);
+        assert_eq!(dq.len(), 15);
+        // All-ones block: every element is the block max → code 7 → LUT 6.0;
+        // dequant = 6.0 × total where total = pts × 448. Verify bounded and
+        // close to 1.0 (E2M1 grid spacing at this magnitude).
+        for &v in &dq {
+            assert!(v.is_finite());
+            assert!((v - 1.0).abs() < 0.25, "dq {v} not near 1.0");
+        }
+    }
+
+    #[test]
+    fn dequantize_nvfp4_zero_block_is_zero() {
+        // 1×32: first block nonzero, second all zeros. Zero block → scale
+        // byte 0x00 → total 0.0 → dequant +0.0 (codes all 0 → LUT[0] = +0.0).
+        let mut w = vec![0.0f32; 32];
+        w[0] = 448.0;
+        let r = quantize_nvfp4_weight(&w, 1, 32);
+        let dq = dequantize_nvfp4(&r, 1, 32);
+        assert!(dq[0] > 0.0, "nonzero block element must be positive");
+        for &v in &dq[16..] {
+            assert_eq!(v, 0.0);
+            assert!(v.is_sign_positive(), "zero block must dequant to +0.0");
+        }
+    }
+
+    #[test]
+    fn dequant_roundtrip_bounded_nvfp4() {
+        // Phase B.4 (NVFP4 arm): quantize a random matrix, dequantize, assert
+        // finite + bounded, and that the reconstruction error is bounded by
+        // the E2M1 grid.
+        //
+        // NOTE: unlike MXFP8, NVFP4 dequant values are NOT an exact fixed
+        // point of quantize→dequantize — the per-tensor scale is non-dyadic,
+        // so dequant values are not bf16-representable, and re-quantization's
+        // bf16 input rounding perturbs them. The meaningful B.4 property here
+        // is bounded reconstruction error: the E2M1 grid {0,.5,1,1.5,2,3,4,6}
+        // has max spacing 2 over max value 6, so the worst-case relative error
+        // is ~1/6 ≈ 0.167 (measured 0.1674 on this fixture). We assert a
+        // generous 0.25·amax bound.
+        let (m, n) = (64usize, 48usize);
+        let mut w = vec![0.0f32; m * n];
+        let mut x: u64 = 0x243F6A8885A308D3;
+        for v in &mut w {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *v = ((x % 20_000) as f32 / 10_000.0) - 1.0;
+        }
+        let amax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+
+        let r = quantize_nvfp4_weight(&w, m, n);
+        let dq = dequantize_nvfp4(&r, m, n);
+        assert_eq!(dq.len(), m * n);
+        for &v in &dq {
+            assert!(v.is_finite(), "dequant produced non-finite value");
+        }
+        let dq_max = dq.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        assert!(
+            dq_max <= amax * 1.01,
+            "dequant amax {dq_max} exceeds bound {}",
+            amax * 1.01
+        );
+        // Bounded reconstruction error (E2M1 grid).
+        let mut max_err = 0.0f32;
+        for (&a, &b) in w.iter().zip(dq.iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        assert!(
+            max_err <= amax * 0.25,
+            "reconstruction error {max_err} exceeds 0.25·amax = {}",
+            amax * 0.25
+        );
     }
 }

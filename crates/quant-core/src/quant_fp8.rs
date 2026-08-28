@@ -427,8 +427,16 @@ mod tests {
         assert_eq!(r.qdata, [0x7E, 0x3C]);
         let dq = dequantize_fp8(&w, &r, 1, 2, Fp8ScalingMode::Tensor, 128);
         assert_eq!(bits(dq[0]), 0x3C80_0000, "elem0 = 448/28672 = 0.015625");
-        assert_eq!(bits(dq[1]), 0x385B_6DB7, "elem1 must be IEEE division, not ×(1/qs)");
-        assert_ne!(bits(dq[1]), 0x385B_6DB8, "reciprocal-multiply would give this");
+        assert_eq!(
+            bits(dq[1]),
+            0x385B_6DB7,
+            "elem1 must be IEEE division, not ×(1/qs)"
+        );
+        assert_ne!(
+            bits(dq[1]),
+            0x385B_6DB8,
+            "reciprocal-multiply would give this"
+        );
 
         // Row mode (reference :1998): same division, per-row quant_scale.
         // Row 0 = tensor case above; row 1 amax = 0.03125 → qs = 14336.
@@ -443,7 +451,11 @@ mod tests {
         assert_eq!(bits(dq2[0]), 0x3C80_0000);
         assert_eq!(bits(dq2[1]), 0x385B_6DB7);
         assert_eq!(bits(dq2[2]), 0x3D00_0000); // 0.03125
-        assert_eq!(bits(dq2[3]), 0x38DB_6DB7, "row1 elem1 must be IEEE division");
+        assert_eq!(
+            bits(dq2[3]),
+            0x38DB_6DB7,
+            "row1 elem1 must be IEEE division"
+        );
     }
 
     #[test]
@@ -465,7 +477,11 @@ mod tests {
         assert_eq!(r.scale_shape, vec![1, 1]);
         let dq = dequantize_fp8(&w, &r, 2, 2, Fp8ScalingMode::Block, 2);
         assert_eq!(bits(dq[0]), 0x3C80_0000, "elem0 (tile max) = 0.015625");
-        assert_eq!(bits(dq[1]), 0x385B_6DB8, "elem1 must be multiply, not division");
+        assert_eq!(
+            bits(dq[1]),
+            0x385B_6DB8,
+            "elem1 must be multiply, not division"
+        );
         assert_ne!(bits(dq[1]), 0x385B_6DB7, "division would give this");
         assert_eq!(dq[2], 0.0);
         assert_eq!(dq[3], 0.0);
