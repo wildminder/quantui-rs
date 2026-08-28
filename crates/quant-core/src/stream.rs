@@ -24,16 +24,21 @@
 //!   shards in union mode)
 //! - manifest saved after EVERY tensor; resume skips names in `done`
 //! - config-hash mismatch → clean restart from zero
-//! - the output NEVER carries `__metadata__`: the reference rebuilds the header
-//!   via `_resolve_union_header`, which drops `__metadata__`, and then passes
-//!   `header.get("__metadata__")` (always None) to the writer — confirmed by
-//!   probe even for single-file inputs that have metadata.
+//! - `__metadata__` policy (plan Phase D, §3.3): INT8/FP8 outputs NEVER carry
+//!   metadata (the INT8 reference rebuilds the header via `_resolve_union_header`,
+//!   which drops `__metadata__`; the ctq FP8 unified path only adds metadata
+//!   behind the off-by-default `--save-quant-metadata` flag — golden-verified
+//!   absent). MXFP8/NVFP4 outputs carry
+//!   `__metadata__._quantization_metadata` — a byte-exact JSON string listing
+//!   exactly the layers quantized in that file (per-shard in sharded mode).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use serde_json::Map;
+
 use crate::bias_correction::{correct_bias, CalibCache};
-use crate::comfy_schema::{encode_comfy_quant, ComfyFormat};
+use crate::comfy_schema::{encode_block_format, encode_comfy_quant, ComfyFormat};
 use crate::discover::{ShardedModel, INDEX_NAME};
 use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
 use crate::manifest::{Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
@@ -473,15 +478,24 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
         state.order = names.clone();
     }
 
+    // ---- file-level __metadata__ (plan Phase D.1, §3.3) ------------------- //
+    // MXFP8/NVFP4 outputs carry `_quantization_metadata` describing exactly
+    // the layers quantized in THIS file. Sharded mode runs this function per
+    // shard, so per-shard metadata semantics fall out for free. INT8/FP8
+    // never carry metadata (the INT8 reference rebuilds the header via
+    // `_resolve_union_header`, which drops `__metadata__`; the ctq FP8
+    // unified path only adds metadata behind the off-by-default
+    // --save-quant-metadata flag — golden-verified absent).
+    let file_metadata = build_file_metadata(input, config);
+
     // ---- open writer (resume appends; fresh truncates) --------------------- //
-    // The reference NEVER carries __metadata__ into the streaming output (the
-    // union header drops it and `header.get("__metadata__")` is always None),
-    // so a fresh file always starts without metadata — even for single-file
-    // inputs that have metadata (probe-verified).
+    // On resume the writer re-parses the existing header slot and preserves
+    // its metadata, so the value written at fresh-open time survives
+    // cancel/resume cycles unchanged.
     let mut writer = if resumed {
         IncrementalWriter::open_resume(output_path)?
     } else {
-        IncrementalWriter::open_new_with(output_path, 1 << 16, None)?
+        IncrementalWriter::open_new_with(output_path, 1 << 16, file_metadata)?
     };
 
     // ---- classify tensors --------------------------------------------------- //
@@ -794,6 +808,84 @@ fn is_quantizable(config: &QuantConfig, name: &str, shape: &[u64]) -> bool {
         return false;
     }
     true
+}
+
+/// Build the file-level `__metadata__` map for this run (plan Phase D.1, §3.3).
+///
+/// Returns `Some({"_quantization_metadata": <json string>})` for MXFP8/NVFP4
+/// when at least one layer is quantized in THIS file, else `None` (INT8/FP8
+/// never carry metadata; an all-skipped MXFP8/NVFP4 file matches ctq's
+/// `if quant_metadata:` guard and carries no `__metadata__` at all).
+///
+/// The layer set is precomputed from the source header and is EXACTLY the set
+/// `compute_weight_outputs` will quantize (same `is_quantizable` predicate),
+/// so metadata is correct without waiting for the streaming loop. Sharded
+/// mode runs `stream_quantize_source` per shard, giving per-shard metadata
+/// semantics for free.
+///
+/// The JSON string is hand-built to byte-match ctq's
+/// `json.dumps({"format_version": "1.0", "layers": quant_metadata})` with
+/// default separators: outer keys sorted (`format_version` < `layers`), layer
+/// keys in sorted order (ctq iterates `sorted(weight_keys)`), and inner key
+/// order `format, group_size, orig_dtype, orig_shape` — identical to the
+/// family-B blob, so the per-layer inner object reuses `encode_block_format`.
+fn build_file_metadata<S: TensorSource + ?Sized>(
+    input: &S,
+    config: &QuantConfig,
+) -> Option<Map<String, serde_json::Value>> {
+    if !config.format.carries_file_metadata() {
+        return None;
+    }
+
+    // Collect (base, pre-padding shape) for every quantizable layer.
+    let mut layers: Vec<(String, Vec<u64>)> = Vec::new();
+    for name in input.names() {
+        let Some(info) = input.info(name) else {
+            continue;
+        };
+        if !is_quantizable(config, name, &info.shape) {
+            continue;
+        }
+        layers.push((base_of(name).to_string(), info.shape.clone()));
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    // ctq dict insertion order == iteration of sorted(weight_keys).
+    layers.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let fmt_str = config.format.as_str();
+    let group = config
+        .format
+        .fixed_group_size()
+        .expect("family-B format has a fixed group size");
+    let orig = resolve_orig_dtype_str(&config.orig_dtype);
+
+    let inner: Vec<String> = layers
+        .iter()
+        .map(|(base, shape)| {
+            let obj = encode_block_format(fmt_str, group, &orig, shape);
+            // serde_json escapes the key string exactly like json.dumps.
+            let key = serde_json::to_string(base).expect("string serialization cannot fail");
+            format!(
+                "{}: {}",
+                key,
+                std::str::from_utf8(&obj).expect("blob is ascii")
+            )
+        })
+        .collect();
+
+    let s = format!(
+        r#"{{"format_version": "1.0", "layers": {{{}}}}}"#,
+        inner.join(", ")
+    );
+
+    let mut meta = Map::new();
+    meta.insert(
+        "_quantization_metadata".to_string(),
+        serde_json::Value::String(s),
+    );
+    Some(meta)
 }
 
 /// Castable float dtypes for skipped weights (mirrors `_CASTABLE_FLOAT_DTYPE_NAMES`
@@ -1318,6 +1410,163 @@ mod tests {
         assert!(
             matches!(err, StreamError::NotDivisible { .. }),
             "expected NotDivisible, got {err:?}"
+        );
+    }
+
+    // ---- Phase D.1: _quantization_metadata builder ------------------------ //
+
+    /// Locate `tests/golden/<name>` from a unit test (crate manifest dir is
+    /// `crates/quant-core`).
+    fn golden_dir(name: &str) -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p.pop();
+        p.join("tests/golden").join(name)
+    }
+
+    /// Extract the golden header's `__metadata__._quantization_metadata`
+    /// string value for byte comparison.
+    fn golden_quant_metadata(case: &str, fmt: &str) -> String {
+        let path = golden_dir(case).join(format!("output_{fmt}.safetensors"));
+        let reader = crate::st_io::reader::SafetensorsReader::open(&path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let meta = reader
+            .header()
+            .metadata()
+            .unwrap_or_else(|| panic!("{case}/{fmt}: golden has no __metadata__"));
+        match &meta["_quantization_metadata"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => panic!("{case}/{fmt}: unexpected metadata value {other:?}"),
+        }
+    }
+
+    fn family_b_config(format: Format) -> QuantConfig {
+        let (target, block_size) = match format {
+            Format::Mxfp8 => ("mxfp8", 32),
+            Format::Nvfp4 => ("nvfp4", 16),
+            _ => unreachable!(),
+        };
+        QuantConfig {
+            format,
+            target_format: target.into(),
+            int8: false,
+            scaling_mode: ScalingMode::Block,
+            block_size,
+            ..QuantConfig::default()
+        }
+    }
+
+    /// D.1 gate: the hand-built `_quantization_metadata` string must be
+    /// BYTE-IDENTICAL to the golden header's value (json.dumps default
+    /// separators, sorted outer keys, sorted layer keys, family-B inner key
+    /// order).
+    #[test]
+    fn quant_metadata_string_matches_golden_linear_basic_mxfp8() {
+        let input = golden_dir("linear_basic_bf16").join("input.safetensors");
+        let src = SingleFileSource::open(&input).unwrap();
+        let config = family_b_config(Format::Mxfp8);
+
+        let meta = build_file_metadata(&src, &config).expect("mxfp8 must build metadata");
+        let ours = match &meta["_quantization_metadata"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => panic!("unexpected metadata value {other:?}"),
+        };
+        assert_eq!(ours, golden_quant_metadata("linear_basic_bf16", "mxfp8"));
+    }
+
+    #[test]
+    fn quant_metadata_string_matches_golden_linear_basic_nvfp4() {
+        let input = golden_dir("linear_basic_bf16").join("input.safetensors");
+        let src = SingleFileSource::open(&input).unwrap();
+        let config = family_b_config(Format::Nvfp4);
+
+        let meta = build_file_metadata(&src, &config).expect("nvfp4 must build metadata");
+        let ours = match &meta["_quantization_metadata"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => panic!("unexpected metadata value {other:?}"),
+        };
+        assert_eq!(ours, golden_quant_metadata("linear_basic_bf16", "nvfp4"));
+    }
+
+    /// D.1 gate: the layer set must exclude non-2D weights, heur-skipped
+    /// weights, and AVOID_KEY_NAMES matches — exactly the layers that get
+    /// quantized. conv_net: only `head` (conv.net.weight is 4D); odd_shapes:
+    /// only `model.diffusion_model.double_block.0` (attn_norm.weight is 1D,
+    /// odd.weight [130,130] is heur-skipped at block size 32/16).
+    #[test]
+    fn quant_metadata_excludes_skipped_and_non2d() {
+        // conv_net: 4D conv weight + 2D head weight.
+        let input = golden_dir("conv_net").join("input.safetensors");
+        let src = SingleFileSource::open(&input).unwrap();
+        for format in [Format::Mxfp8, Format::Nvfp4] {
+            let config = family_b_config(format);
+            let meta = build_file_metadata(&src, &config).expect("conv_net has one layer");
+            let s = meta["_quantization_metadata"].as_str().unwrap();
+            assert!(s.contains("\"head\""), "{format:?}: must include head: {s}");
+            assert!(
+                !s.contains("conv.net"),
+                "{format:?}: must exclude 4D conv weight: {s}"
+            );
+            assert_eq!(s, golden_quant_metadata("conv_net", config.format.as_str()));
+        }
+
+        // odd_shapes: 1D norm weight + heur-skipped odd.weight [130,130].
+        let input = golden_dir("odd_shapes").join("input.safetensors");
+        let src = SingleFileSource::open(&input).unwrap();
+        for format in [Format::Mxfp8, Format::Nvfp4] {
+            let config = family_b_config(format);
+            let meta = build_file_metadata(&src, &config).expect("odd_shapes has one layer");
+            let s = meta["_quantization_metadata"].as_str().unwrap();
+            assert!(
+                s.contains("\"model.diffusion_model.double_block.0\""),
+                "{format:?}: must include the double_block layer: {s}"
+            );
+            assert!(
+                !s.contains("\"odd\""),
+                "{format:?}: must exclude heur-skipped odd.weight: {s}"
+            );
+            assert!(
+                !s.contains("attn_norm"),
+                "{format:?}: must exclude 1D norm weight: {s}"
+            );
+            assert_eq!(
+                s,
+                golden_quant_metadata("odd_shapes", config.format.as_str())
+            );
+        }
+    }
+
+    /// INT8/FP8 never carry file metadata; an all-skipped MXFP8/NVFP4 input
+    /// carries none either (ctq's `if quant_metadata:` guard).
+    #[test]
+    fn quant_metadata_none_for_int8_fp8_and_empty_layer_set() {
+        let input = golden_dir("linear_basic_bf16").join("input.safetensors");
+        let src = SingleFileSource::open(&input).unwrap();
+
+        assert!(
+            build_file_metadata(&src, &QuantConfig::default()).is_none(),
+            "INT8 must not carry file metadata"
+        );
+        let mut fp8 = QuantConfig::default();
+        fp8.format = Format::Fp8E4m3;
+        fp8.target_format = "fp8".into();
+        fp8.int8 = false;
+        assert!(
+            build_file_metadata(&src, &fp8).is_none(),
+            "FP8 must not carry file metadata"
+        );
+
+        // All-skipped MXFP8 input (single tiny weight, heur on → skipped).
+        let mut tiny = MemSource::new();
+        tiny.add(
+            "blk.weight",
+            DType::Bf16,
+            vec![16, 16],
+            vec![0u8; 16 * 16 * 2],
+        );
+        assert!(
+            build_file_metadata(&tiny, &family_b_config(Format::Mxfp8)).is_none(),
+            "all-skipped MXFP8 input must carry no metadata"
         );
     }
 }

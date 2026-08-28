@@ -37,7 +37,7 @@ impl Header {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
-        let mut obj = match value {
+        let obj = match value {
             Value::Object(m) => m,
             _ => {
                 return Err(Error::HeaderJson {
@@ -48,13 +48,22 @@ impl Header {
         };
 
         // __metadata__ is optional; remaining keys are tensors in order.
-        let metadata = obj.remove("__metadata__").map(|v| match v {
-            Value::Object(m) => m,
-            other => Map::from_iter([("__invalid__".to_string(), other)]),
-        });
-
+        // NOTE: do NOT use `obj.remove("__metadata__")` — with the
+        // `preserve_order` feature the Map is IndexMap-backed and `remove`
+        // swap-removes, which scrambles tensor order when `__metadata__` is
+        // the FIRST key (as in the MXFP8/NVFP4 goldens). Iterate and skip
+        // instead, so tensor order is preserved regardless of where
+        // `__metadata__` sits.
+        let mut metadata: Option<Map<String, Value>> = None;
         let mut tensors = Vec::with_capacity(obj.len());
         for (name, entry) in obj {
+            if name == "__metadata__" {
+                metadata = Some(match entry {
+                    Value::Object(m) => m,
+                    other => Map::from_iter([("__invalid__".to_string(), other)]),
+                });
+                continue;
+            }
             let info = Self::parse_entry(&name, &entry, path)?;
             tensors.push((name, info));
         }
@@ -142,12 +151,20 @@ impl Header {
     /// Serialize to compact JSON bytes (no sort_keys — preserves insertion
     /// order), matching Python `json.dumps(header, separators=(",", ":"))`.
     ///
+    /// `__metadata__` is emitted FIRST when present, matching the reference
+    /// `save_file` output (golden-verified for the MXFP8/NVFP4 goldens). INT8
+    /// streaming never carries metadata, so this ordering is a no-op for the
+    /// INT8 whole-file parity contract.
+    ///
     /// NOTE on float formatting: headers produced by the reference pipeline
     /// contain no floats (dtypes are strings, shapes/offsets integers,
     /// metadata values are strings), so serde_json's integer formatting
     /// matches Python's for our golden corpus.
     pub fn serialize_json(&self) -> Vec<u8> {
         let mut obj = Map::new();
+        if let Some(meta) = &self.metadata {
+            obj.insert("__metadata__".into(), Value::Object(meta.clone()));
+        }
         for (name, info) in &self.tensors {
             let mut entry = Map::new();
             entry.insert("dtype".into(), Value::String(info.dtype_raw.clone()));
@@ -163,9 +180,6 @@ impl Header {
                 ]),
             );
             obj.insert(name.clone(), Value::Object(entry));
-        }
-        if let Some(meta) = &self.metadata {
-            obj.insert("__metadata__".into(), Value::Object(meta.clone()));
         }
         // Compact separators: serde_json::to_vec uses no extra whitespace by default.
         serde_json::to_vec(&Value::Object(obj)).expect("header serialization cannot fail")

@@ -6,13 +6,12 @@
 //! corrected biases, and all copied/skipped tensors) against
 //! `output_mxfp8.safetensors`.
 //!
-//! Parity is per-tensor payload + `(dtype, shape)` (plan §3.3). `__metadata__`
-//! is carried by the MXFP8 goldens but emitted in Phase D, so the helper
-//! ignores it here.
+//! Parity is per-tensor payload + `(dtype, shape)` (plan §3.3). Phase D adds
+//! the file-level `__metadata__._quantization_metadata` byte-parity check.
 
 mod common;
 
-use common::{assert_payload_parity, golden};
+use common::{assert_metadata_parity, assert_payload_parity, golden};
 use quant_core::manifest::{Format, QuantConfig, ScalingMode};
 use quant_core::stream::stream_quantize;
 
@@ -59,6 +58,28 @@ fn mxfp8_conv_net() {
 #[test]
 fn mxfp8_zero_blocks() {
     run_mxfp8("zero_blocks");
+}
+
+// ---- Phase D.2: file-level __metadata__ parity ---------------------------- //
+
+/// D.2 gate: the streamed MXFP8 output's `__metadata__` must equal the
+/// golden's byte-for-byte (the `_quantization_metadata` JSON string), for
+/// every golden case.
+#[test]
+fn mxfp8_file_metadata_matches_golden() {
+    for case in ["linear_basic_bf16", "odd_shapes", "conv_net", "zero_blocks"] {
+        let dir = golden(case);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.safetensors");
+
+        stream_quantize(dir.join("input.safetensors"), &out, &mxfp8_config()).unwrap();
+
+        assert_metadata_parity(
+            &out,
+            &dir.join("output_mxfp8.safetensors"),
+            &format!("{case}/mxfp8 metadata"),
+        );
+    }
 }
 
 // ---- determinism + resume (plan C.5) -------------------------------------- //

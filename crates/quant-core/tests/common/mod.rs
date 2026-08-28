@@ -119,3 +119,30 @@ pub fn bf16_weight_bytes(m: usize, n: usize) -> Vec<u8> {
         })
         .collect()
 }
+
+/// Read a file's `__metadata__` map (None when the file carries no metadata).
+pub fn read_metadata(path: &std::path::Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    load(path).header().metadata().cloned()
+}
+
+/// Assert that `ours` carries the SAME `__metadata__` as `golden` — including
+/// byte-equality of the `_quantization_metadata` JSON string (plan Phase D.2).
+pub fn assert_metadata_parity(ours: &std::path::Path, golden: &std::path::Path, label: &str) {
+    let g_meta = read_metadata(golden)
+        .unwrap_or_else(|| panic!("{label}: golden unexpectedly has no __metadata__"));
+    let o_meta = read_metadata(ours)
+        .unwrap_or_else(|| panic!("{label}: streamed output is missing __metadata__"));
+    assert_eq!(
+        o_meta, g_meta,
+        "{label}: __metadata__ differs (ours {o_meta:?} vs golden {g_meta:?})"
+    );
+}
+
+/// Assert that `ours` carries NO `__metadata__` at all (plan Phase D.2:
+/// INT8/FP8 outputs are metadata-free).
+pub fn assert_no_metadata(ours: &std::path::Path, label: &str) {
+    assert!(
+        read_metadata(ours).is_none(),
+        "{label}: output must carry no __metadata__"
+    );
+}

@@ -7,12 +7,11 @@
 //!
 //! Parity is per-tensor payload + `(dtype, shape)` (plan §3.3): ctq writes in
 //! its own processing order, so whole-file compare is not possible for the new
-//! formats. `__metadata__` is absent for FP8 (plan §3.3) and is ignored by the
-//! helper regardless (Phase D concern).
+//! formats. `__metadata__` is absent for FP8 (plan §3.3 / Phase D.2 pins it).
 
 mod common;
 
-use common::{assert_payload_parity, golden, load};
+use common::{assert_no_metadata, assert_payload_parity, golden, load};
 use quant_core::manifest::{Format, QuantConfig, ScalingMode};
 use quant_core::stream::stream_quantize;
 
@@ -246,4 +245,32 @@ fn odd_shapes_odd_weight_skipped_all_fp8_modes() {
             "{suffix}: odd.weight [130,130] must stay BF16 (heur-skipped)"
         );
     }
+}
+
+// ---- Phase D.2: FP8/INT8 outputs carry NO __metadata__ -------------------- //
+
+/// D.2 gate: FP8 (all three scaling modes) and INT8 streaming outputs must
+/// carry NO `__metadata__` at all (plan §3.3: only MXFP8/NVFP4 do). The FP8
+/// goldens are golden-verified metadata-free; INT8 whole-file parity already
+/// pins the metadata-free header.
+#[test]
+fn fp8_and_int8_outputs_have_no_metadata() {
+    let dir = golden("linear_basic_bf16");
+
+    for (suffix, mode) in [
+        ("fp8", ScalingMode::Block),
+        ("fp8_tensor", ScalingMode::Tensor),
+        ("fp8_row", ScalingMode::Row),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.safetensors");
+        stream_quantize(dir.join("input.safetensors"), &out, &fp8_config(mode)).unwrap();
+        assert_no_metadata(&out, &format!("linear_basic_bf16/{suffix}"));
+    }
+
+    // INT8 (default config) — the shipped path must stay metadata-free.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("int8.safetensors");
+    stream_quantize(dir.join("input.safetensors"), &out, &QuantConfig::default()).unwrap();
+    assert_no_metadata(&out, "linear_basic_bf16/int8");
 }
