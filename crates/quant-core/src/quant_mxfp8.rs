@@ -50,7 +50,7 @@
 
 use rayon::prelude::*;
 
-use crate::dtype::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_fp8_e4m3_bits};
+use crate::dtype::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_fp8_e4m3_bits, fp8_e4m3_bits_to_f32};
 use crate::quant_fp8::FP8_MAX;
 
 /// MXFP8 fixed block size.
@@ -208,6 +208,91 @@ pub fn quantize_mxfp8_weight(w: &[f32], m: usize, n: usize) -> Mxfp8QuantResult 
         scale,
         scale_shape,
     }
+}
+
+/// E8M0 byte → f32 dequant scale: `2^(e-127)`, or 0.0 for `e == 0`.
+/// Verbatim port of `float_utils.e8m0_to_f32` (pure exponent format).
+#[inline]
+pub fn e8m0_to_f32(e: u8) -> f32 {
+    if e == 0 {
+        0.0
+    } else {
+        f32::from_bits(u32::from(e) << 23)
+    }
+}
+
+/// Inverse of `to_blocked_u8`: cuBLAS tiled layout → row-major `(rows, cols)`,
+/// cropping the zero padding. Port of `float_utils.from_blocked` (the reshape/
+/// transpose chain is exactly the inverse of the `to_blocked` closed form).
+///
+/// `blocked` must be the `(roundup(rows,128), roundup(cols,4))` buffer.
+pub fn from_blocked_u8(blocked: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let nrb = roundup(rows, 128) / 128;
+    let ncb = roundup(cols, 4) / 4;
+    let padded_cols = ncb * 4;
+    debug_assert_eq!(blocked.len(), nrb * 128 * padded_cols);
+    let mut out = vec![0u8; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let rb = r / 128;
+            let rrem = r % 128;
+            let cb = c / 4;
+            let crem = c % 4;
+            let b = rb * ncb + cb;
+            let r0 = rrem / 32;
+            let r1 = rrem % 32;
+            let flat = b * 512 + r1 * 16 + r0 * 4 + crem;
+            out[r * cols + c] = blocked[flat];
+        }
+    }
+    out
+}
+
+/// Dequantize an MXFP8 result back to f32 for bias correction — bit-exact
+/// port of the reference eager `dequantize_mxfp8`
+/// (`comfy_kitchen/backends/eager/quantization.py:330`), which the CPU goldens
+/// exercise (the format module calls `converter.dequantize(...,
+/// output_dtype=torch.float32)` → comfy_kitchen eager path).
+///
+/// Pipeline (reference lines 344-366):
+/// 1. `from_blocked` the E8M0 scale bytes over `(m_pad, num_blocks)` —
+///    `m_pad`/`num_blocks` are the PADDED quantize dims (the qdata shape),
+///    exactly as the reference derives them from `qx.shape`.
+/// 2. `e8m0_to_f32` per scale.
+/// 3. `f32(E4M3_code) × scale` per 32-block (elementwise multiply — the
+///    reference is `data_f32 * block_scales_f32.unsqueeze(-1)`).
+/// 4. Crop the padded `(m_pad, n_pad)` result to the original `[m, n]`
+///    (the format module slices `dequant_w[:m, :n]` after dequantize).
+///
+/// Zero blocks: the stored e8m0 byte is 0 → scale 0.0 → `0 × 0 = +0.0`,
+/// matching the reference (qdata there is all 0x00 = +0.0 by construction).
+pub fn dequantize_mxfp8(r: &Mxfp8QuantResult, m: usize, n: usize) -> Vec<f32> {
+    let m_pad = r.qdata_shape[0] as usize;
+    let n_pad = r.qdata_shape[1] as usize;
+    debug_assert!(m <= m_pad && n <= n_pad);
+    let num_blocks = n_pad / BLOCK_SIZE;
+
+    // Unswizzle the E8M0 scales over the padded grid, then decode.
+    let scales = from_blocked_u8(&r.scale, m_pad, num_blocks);
+
+    let mut padded = vec![0.0f32; m_pad * n_pad];
+    for row in 0..m_pad {
+        for b in 0..num_blocks {
+            let scale = e8m0_to_f32(scales[row * num_blocks + b]);
+            let q = &r.qdata[row * n_pad + b * BLOCK_SIZE..row * n_pad + (b + 1) * BLOCK_SIZE];
+            let out = &mut padded[row * n_pad + b * BLOCK_SIZE..row * n_pad + (b + 1) * BLOCK_SIZE];
+            for (o, &byte) in out.iter_mut().zip(q.iter()) {
+                *o = fp8_e4m3_bits_to_f32(byte) * scale;
+            }
+        }
+    }
+
+    // Crop to the original [m, n].
+    let mut out = Vec::with_capacity(m * n);
+    for row in 0..m {
+        out.extend_from_slice(&padded[row * n_pad..row * n_pad + n]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -383,5 +468,126 @@ mod tests {
         let (seq_blocked, seq_shape) = to_blocked_u8(&seq_e, m_pad, num_blocks);
         assert_eq!(par.scale, seq_blocked);
         assert_eq!(par.scale_shape, seq_shape);
+    }
+
+    // --- Phase B.2: e8m0_to_f32 / from_blocked_u8 / dequantize_mxfp8 ------- //
+
+    #[test]
+    fn e8m0_to_f32_values() {
+        assert_eq!(e8m0_to_f32(0), 0.0);
+        assert_eq!(e8m0_to_f32(127), 1.0);
+        assert_eq!(e8m0_to_f32(124), 0.125); // 2^-3
+        assert_eq!(e8m0_to_f32(254), 2.0f32.powi(127));
+        assert_eq!(e8m0_to_f32(1), 2.0f32.powi(-126)); // smallest normal
+        assert_eq!(e8m0_to_f32(119), 2.0f32.powi(-8));
+    }
+
+    #[test]
+    fn from_blocked_inverts_to_blocked() {
+        // Round-trip on multiple shapes incl. non-multiples of 128/4.
+        for &(rows, cols) in &[(128usize, 4usize), (130, 5), (1, 1), (32, 8), (256, 12), (33, 3)] {
+            let src: Vec<u8> = (0..rows * cols).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+            let (blocked, shape) = to_blocked_u8(&src, rows, cols);
+            assert_eq!(shape[0] as usize % 128, 0);
+            assert_eq!(shape[1] as usize % 4, 0);
+            let back = from_blocked_u8(&blocked, rows, cols);
+            assert_eq!(back, src, "round trip failed for ({rows}, {cols})");
+        }
+    }
+
+    #[test]
+    fn dequantize_mxfp8_hand_computed() {
+        // 1×32 row, values 1..=32: block_max = 32 → scale_needed = 32/448 →
+        // e8m0 = 124 → scale_f32 = 0.125. Dequant = f32(code) × 0.125.
+        //   v=1:  1/0.125 = 8   → E4M3 8   → dequant 8 × 0.125   = 1.0
+        //   v=16: 16/0.125 = 128 → E4M3 128 → dequant 128 × 0.125 = 16.0
+        //   v=32: 32/0.125 = 256 → E4M3 256 → dequant 256 × 0.125 = 32.0
+        let w: Vec<f32> = (1..=32).map(|v| v as f32).collect();
+        let r = quantize_mxfp8_weight(&w, 1, 32);
+        let dq = dequantize_mxfp8(&r, 1, 32);
+        assert_eq!(dq.len(), 32);
+        assert_eq!(dq[0], 1.0);
+        assert_eq!(dq[15], 16.0);
+        assert_eq!(dq[31], 32.0);
+        // Every dequantized value is a multiple of 0.125 (code × 2^-3) and
+        // within one block quantum of the original.
+        for (i, (&o, &v)) in dq.iter().zip(w.iter()).enumerate() {
+            let rem = (o / 0.125).fract();
+            assert_eq!(rem, 0.0, "dq[{i}] = {o} not on the 0.125 grid");
+            assert!((o - v).abs() <= 16.0 * 0.125 + 1e-6, "dq[{i}] too far from {v}");
+        }
+    }
+
+    #[test]
+    fn dequantize_mxfp8_crops_padding() {
+        // 3×5 all-ones → padded 32×32. Dequant must crop back to 3×5, all 1.0
+        // (1/2^-8 = 256 → E4M3 256 → 256 × 2^-8 = 1.0).
+        let w = vec![1.0f32; 3 * 5];
+        let r = quantize_mxfp8_weight(&w, 3, 5);
+        assert_eq!(r.qdata_shape, vec![32, 32]);
+        let dq = dequantize_mxfp8(&r, 3, 5);
+        assert_eq!(dq.len(), 15);
+        assert!(dq.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn dequantize_mxfp8_zero_block_is_zero() {
+        // 1×64: first block nonzero, second all zeros. Zero block → e8m0 0 →
+        // scale 0.0 → dequant +0.0 (not NaN, not negative zero).
+        let mut w = vec![0.0f32; 64];
+        w[0] = 448.0;
+        let r = quantize_mxfp8_weight(&w, 1, 64);
+        let dq = dequantize_mxfp8(&r, 1, 64);
+        assert_eq!(dq[0], 448.0); // 448/1 = 448 → code 0x7E → 448 × 1.0
+        for &v in &dq[32..] {
+            assert_eq!(v, 0.0);
+            assert!(v.is_sign_positive(), "zero block must dequant to +0.0");
+        }
+    }
+
+    #[test]
+    fn dequant_roundtrip_bounded_mxfp8() {
+        // Phase B.4 (MXFP8 arm): quantize a random matrix, dequantize, assert
+        // finite + bounded, and that the dequantized values are an EXACT
+        // fixed point of the quantize→dequantize cycle.
+        //
+        // NOTE: strict code idempotency does NOT hold for MXFP8 — e8m0 scales
+        // are powers of two, and when a block's max code rounds to ≤ 224 the
+        // re-quantization shrinks the scale by one exponent and doubles the
+        // codes (e.g. 224×2^0 → 448×2^-1). The representation changes but the
+        // dequantized values are bit-identical (code×2^e == 2·code×2^(e-1),
+        // both exact dyadic products), which is what bias correction consumes.
+        let (m, n) = (64usize, 48usize);
+        let mut w = vec![0.0f32; m * n];
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        for v in &mut w {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *v = ((x % 20_000) as f32 / 10_000.0) - 1.0;
+        }
+        let amax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+
+        let r = quantize_mxfp8_weight(&w, m, n);
+        let dq = dequantize_mxfp8(&r, m, n);
+        assert_eq!(dq.len(), m * n);
+        for &v in &dq {
+            assert!(v.is_finite(), "dequant produced non-finite value");
+        }
+        let dq_max = dq.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        assert!(
+            dq_max <= amax * 1.01,
+            "dequant amax {dq_max} exceeds bound {}",
+            amax * 1.01
+        );
+        // Fixed point: re-quantizing the dequant and dequantizing again must
+        // reproduce the same f32 values bit-for-bit.
+        let r2 = quantize_mxfp8_weight(&dq, m, n);
+        let dq2 = dequantize_mxfp8(&r2, m, n);
+        assert_eq!(
+            dq2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            dq.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "dequant values are not a fixed point of quantize→dequantize"
+        );
     }
 }
