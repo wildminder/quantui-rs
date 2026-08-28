@@ -417,14 +417,35 @@ fn stream_quantize_sharded_inner(
 /// Cached output specs per processed weight (mirrors quantized_specs_cache in
 /// reference stream_quant.py): computed once when the weight (or its earlier
 /// bias) is reached, written at the weight's own file position.
+///
+/// Generalized across all four formats (plan Phase C.1, §3.2/§3.3). The
+/// emission order is fixed and format-agnostic:
+/// `weight`, `weight_scale`, [`weight_scale_2`], `comfy_quant`, [`input_scale`].
+/// INT8 populates `q_dtype=I8`, `q_shape=[m,n]`, `scale_dtype=F32`,
+/// `scale2=None`, `input_scale=(block mode)` — byte-identical to the pre-C.1
+/// INT8 emission (proven by `phase5_stream_e2e.rs` whole-file parity).
 struct WeightOutputs {
+    /// Quantized weight payload (`<base>.weight`).
     q_bytes: Vec<u8>,
+    /// Dtype of the quantized weight: I8 (INT8), F8_E4M3 (FP8/MXFP8), U8 (NVFP4).
+    q_dtype: DType,
+    /// Shape of the quantized weight. INT8/FP8 = `[m,n]`; MXFP8 = padded
+    /// `[m_pad,n_pad]`; NVFP4 = packed `[m_pad, n_pad/2]`.
+    q_shape: Vec<u64>,
+    /// `<base>.weight_scale` payload.
     scale_bytes: Vec<u8>,
+    /// Dtype of `weight_scale`: F32 (INT8/FP8), U8 (MXFP8 E8M0), F8_E4M3 (NVFP4).
+    scale_dtype: DType,
+    /// Shape of `weight_scale` (already squeezed for 1-element INT8/FP8 scales).
     scale_shape: Vec<u64>,
+    /// Optional `<base>.weight_scale_2` (NVFP4 per-tensor scale only):
+    /// `(bytes, dtype, shape)` = `(f32 le bytes, F32, [])`.
+    scale2: Option<(Vec<u8>, DType, Vec<u64>)>,
+    /// `<base>.comfy_quant` U8 JSON blob (family A or B).
     blob: Vec<u8>,
+    /// Whether to emit `<base>.input_scale` (F32 `[]` = 1.0). INT8 block only;
+    /// never for FP8/MXFP8/NVFP4 (plan §3.3).
     input_scale: bool,
-    m: u64,
-    n: u64,
 }
 
 fn stream_quantize_source<S: TensorSource + ?Sized>(
@@ -590,15 +611,24 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
                 }
             }
             let o = &weight_outputs[name];
-            writer.add_tensor(name, DType::I8, None, &[o.m, o.n], &o.q_bytes)?;
+            writer.add_tensor(name, o.q_dtype, None, &o.q_shape, &o.q_bytes)?;
             let base = base_of(name);
             writer.add_tensor(
                 &format!("{base}.weight_scale"),
-                DType::F32,
+                o.scale_dtype,
                 None,
                 &o.scale_shape,
                 &o.scale_bytes,
             )?;
+            if let Some((s2_bytes, s2_dtype, s2_shape)) = &o.scale2 {
+                writer.add_tensor(
+                    &format!("{base}.weight_scale_2"),
+                    *s2_dtype,
+                    None,
+                    s2_shape,
+                    s2_bytes,
+                )?;
+            }
             writer.add_tensor(
                 &format!("{base}.comfy_quant"),
                 DType::U8,
@@ -796,12 +826,14 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
         name.to_string(),
         WeightOutputs {
             q_bytes,
+            q_dtype: DType::I8,
+            q_shape: vec![m as u64, n as u64],
             scale_bytes,
+            scale_dtype: DType::F32,
             scale_shape,
+            scale2: None,
             blob,
             input_scale,
-            m: m as u64,
-            n: n as u64,
         },
     );
 
@@ -958,4 +990,121 @@ fn copy_tensor<S: TensorSource + ?Sized>(
     // Verbatim passthrough with original dtype string.
     writer.add_tensor(name, info.dtype, Some(&info.dtype_raw), &info.shape, data)?;
     Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// Tests (plan Phase C.1 gate: INT8 emission layout provably unchanged).
+// --------------------------------------------------------------------------- //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::st_io::header::TensorInfo;
+
+    /// Minimal in-memory [`TensorSource`] for unit-testing the orchestrator
+    /// without touching the filesystem for inputs.
+    struct MemSource {
+        names: Vec<String>,
+        infos: HashMap<String, TensorInfo>,
+        bytes: HashMap<String, Vec<u8>>,
+    }
+
+    impl MemSource {
+        fn new() -> Self {
+            Self {
+                names: Vec::new(),
+                infos: HashMap::new(),
+                bytes: HashMap::new(),
+            }
+        }
+        fn add(&mut self, name: &str, dtype: DType, shape: Vec<u64>, data: Vec<u8>) {
+            let info = TensorInfo {
+                dtype,
+                dtype_raw: dtype.as_header_str().to_string(),
+                shape,
+                data_offsets: (0, data.len() as u64),
+            };
+            self.names.push(name.to_string());
+            self.infos.insert(name.to_string(), info);
+            self.bytes.insert(name.to_string(), data);
+        }
+    }
+
+    impl TensorSource for MemSource {
+        fn names(&self) -> &[String] {
+            &self.names
+        }
+        fn info(&self, name: &str) -> Option<&TensorInfo> {
+            self.infos.get(name)
+        }
+        fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
+            Ok(self.bytes.get(name).map(|v| v.as_slice()).unwrap_or(&[]))
+        }
+    }
+
+    /// Read back the output file's header as `(name, dtype_raw, shape)` in
+    /// header (insertion) order.
+    fn read_header(path: &Path) -> Vec<(String, String, Vec<u64>)> {
+        let reader =
+            crate::st_io::reader::SafetensorsReader::open(path).expect("output must be loadable");
+        reader
+            .header()
+            .iter()
+            .map(|(n, i)| (n.clone(), i.dtype_raw.clone(), i.shape.clone()))
+            .collect()
+    }
+
+    /// C.1 gate: the generalized `WeightOutputs` + write block must emit the
+    /// EXACT same INT8 tensor set, dtypes, shapes, and order as before C.1:
+    /// `<name>` I8 `[m,n]`, `<base>.weight_scale` F32, `<base>.comfy_quant`
+    /// U8, and (block mode) `<base>.input_scale` F32 `[]`. Whole-file INT8
+    /// parity is additionally proven by `phase5_stream_e2e.rs`.
+    #[test]
+    fn weight_outputs_int8_layout_unchanged() {
+        // One quantizable 2D weight (block mode, bs=128 → divisible) + bias.
+        let (m, n) = (128usize, 128usize);
+        let mut src = MemSource::new();
+        // Deterministic non-zero bf16 weight.
+        let w: Vec<u8> = (0..m * n)
+            .flat_map(|i| {
+                let v = ((i as f32) * 0.001).sin();
+                crate::dtype::f32_to_bf16_bits(v).to_le_bytes()
+            })
+            .collect();
+        src.add("blk.weight", DType::Bf16, vec![m as u64, n as u64], w);
+        let b: Vec<u8> = (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        src.add("blk.bias", DType::F32, vec![n as u64], b);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.safetensors");
+        let config = QuantConfig::default(); // INT8, block, bs=128, heur on
+        stream_quantize_source(&src, &out, &config, None, None).unwrap();
+
+        let hdr = read_header(&out);
+        // Emission order at the weight's position: weight, weight_scale,
+        // comfy_quant, input_scale (block). Bias is corrected in place.
+        let by_name: HashMap<&str, &(String, String, Vec<u64>)> =
+            hdr.iter().map(|e| (e.0.as_str(), e)).collect();
+
+        let w_e = by_name["blk.weight"];
+        assert_eq!(w_e.1, "I8", "INT8 weight dtype must stay I8");
+        assert_eq!(w_e.2, vec![m as u64, n as u64], "INT8 weight shape [m,n]");
+
+        let s_e = by_name["blk.weight_scale"];
+        assert_eq!(s_e.1, "F32", "INT8 weight_scale dtype must stay F32");
+
+        let c_e = by_name["blk.comfy_quant"];
+        assert_eq!(c_e.1, "U8", "comfy_quant blob dtype must be U8");
+
+        // Block mode emits input_scale (F32 scalar).
+        let i_e = by_name["blk.input_scale"];
+        assert_eq!(i_e.1, "F32");
+        assert_eq!(i_e.2, Vec::<u64>::new(), "input_scale is a scalar []");
+
+        // No weight_scale_2 for INT8.
+        assert!(
+            !by_name.contains_key("blk.weight_scale_2"),
+            "INT8 must not emit weight_scale_2"
+        );
+    }
 }
