@@ -6,13 +6,16 @@ hard contract: **outputs are byte-exact against the Python/torch reference** on
 all supported paths.
 
 It quantizes Hugging Face `safetensors` models (single file or sharded folder)
-to ComfyUI-compatible INT8 outputs, converts HF models to GGUF, validates
-quantized files, and inspects safetensors headers — with resumable streaming,
-progress bars, and graceful Ctrl-C stops.
+to ComfyUI-compatible **INT8, FP8 E4M3, MXFP8 and NVFP4** outputs, converts HF
+models to GGUF, validates quantized files, and inspects safetensors headers —
+with resumable streaming, progress bars, and graceful Ctrl-C stops.
 
 ## Highlights
 
-- **Byte-exact parity** with the Python reference: INT8 streaming quantization
+- **Four target formats**: `--format int8` (default), `fp8_e4m3`, `mxfp8`,
+  `nvfp4` — all reachable from the CLI, all verified against Python/torch
+  goldens.
+- **Byte-exact parity** with the Python reference: streaming quantization
   (including bias correction via a bit-exact port of torch's MT19937 RNG),
   comfy_quant blob encoding, header layout, manifest checkpoints — verified by
   golden byte-compare tests.
@@ -120,9 +123,16 @@ with `block` mode.
 
 Omit the output path and a ctq-compatible name is generated from the
 *effective* config: `<base>-<format>-simple-heur.safetensors`, where
-`<format>` is `int8_block` / `int8_row` / `int8_tensor`. Example:
-`mymodel-int8_block-simple-heur.safetensors`. An explicit `.safetensors`
-output path always wins.
+`<format>` is `int8_block` / `int8_row` / `int8_tensor` (INT8 encodes the
+scaling mode) or `fp8_e4m3` / `mxfp8` / `nvfp4` (these use a single id for
+all modes, matching the reference registry). Examples:
+
+```
+mymodel-int8_block-simple-heur.safetensors
+mymodel-mxfp8-simple-heur.safetensors
+```
+
+An explicit `.safetensors` output path always wins.
 
 ### Resume & Ctrl-C
 
@@ -172,7 +182,70 @@ this pinning is what makes streaming runs reproducible and byte-identical to
 the reference. Don't change the seed unless you intentionally want a different
 (but still valid) correction.
 
-### `quantize` CLI reference
+## Beyond INT8: FP8 E4M3 / MXFP8 / NVFP4
+
+```sh
+quantui-rs quantize mymodel.safetensors --format fp8_e4m3
+quantui-rs quantize mymodel.safetensors --format mxfp8
+quantui-rs quantize mymodel.safetensors --format nvfp4
+```
+
+These mirror `convert_to_quant`'s dedicated format paths. Everything else —
+resume, Ctrl-C, sharded input, both output modes, `validate`, `info` — works
+identically to INT8.
+
+### Per-format behaviour
+
+Given a 256×128 layer, the streaming output looks like this:
+
+| | `int8` | `fp8_e4m3` | `mxfp8` | `nvfp4` |
+|---|---|---|---|---|
+| `X.weight` dtype | `I8` `[256,128]` | `F8_E4M3` `[256,128]` | `F8_E4M3` `[256,128]` | `U8` `[256,64]` (2×E2M1 packed/byte) |
+| `X.weight_scale` | `F32` | `F32` | `U8` (e8m0) | `F8_E4M3` |
+| Scale layout | per mode | per mode | swizzled (blocked) `[256,4]` | swizzled (blocked) `[256,8]` |
+| `X.weight_scale_2` | — | — | — | `F32` scalar (per-tensor) |
+| `X.input_scale` | `F32` 1.0 | — | — | — |
+| Scaling modes | `tensor`/`row`/`block` | `tensor`/`row`/`block` | fixed `block` | fixed `block` |
+| Block size | 64/128/256 | 64/128/256 | fixed 32 | fixed 16 |
+| Dims not divisible by block | skipped (with `--heur`) | block→row fallback | padded internally | padded internally |
+| `AVOID_KEY_NAMES` exclusions (`norm`, `bias`, `lm_head`, …) | no | no | **yes** | **yes** |
+| `__metadata__` on output | no | no | **yes** | **yes** |
+
+Detected per-layer format strings (`quantui-rs info`): `int8_blockwise`,
+`float8_e4m3fn` / `float8_e4m3fn_rowwise` / `float8_e4m3fn_blockwise`,
+`mxfp8`, `nvfp4`.
+
+MXFP8/NVFP4 scales are written in ctq's *swizzled* (blocked) layout; NVFP4
+additionally carries a per-tensor `weight_scale_2`. `validate` understands
+all of these.
+
+### `__metadata__._quantization_metadata`
+
+MXFP8/NVFP4 outputs carry a file-level `__metadata__` entry — a JSON string
+listing every quantized layer, byte-identical to ctq's:
+
+```json
+{"format_version": "1.0", "layers": {"blocks.0": {"format": "mxfp8",
+ "group_size": 32, "orig_dtype": "torch.bfloat16", "orig_shape": [256, 128]}}}
+```
+
+Only **quantized** layers appear; outer and layer keys are sorted, and
+`orig_dtype` uses ctq's `torch.*` spelling. INT8 and FP8 outputs never carry
+`__metadata__` (matching ctq, where `save_quant_metadata` defaults off on
+those paths), and neither does a MXFP8/NVFP4 run in which every layer was
+skipped.
+
+### Parity contract for the non-INT8 formats
+
+INT8 is verified **whole-file** byte-for-byte. The newer formats are verified
+**per-tensor**: every tensor's payload bytes plus its `(dtype, shape)`, and the
+exact `__metadata__` string. Whole-file equality is structurally impossible
+here, because ctq writes tensors in its own processing order with sorted
+header keys and minimal padding, while the streaming orchestrator writes in
+input order with a 64 KiB header slot. Per-tensor parity is the same guarantee
+at the level that matters — no numeric or layout detail is left unchecked.
+
+## `quantize` CLI reference
 
 ```
 quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
@@ -181,9 +254,13 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
   [OUTPUT]                .safetensors file (single/merged) or directory
                           (sharded); omitted = auto-named
 
-      --format <FORMAT>   Target format [default: int8]  (int8 only)
+      --format <FORMAT>   int8 | fp8_e4m3 | mxfp8 | nvfp4  [default: int8]
   -m, --scaling-mode <M>  tensor | row | block            [default: block]
+                          (INT8/FP8 only; MXFP8/NVFP4 are fixed-block —
+                           passing it with those exits 2)
   -b, --block-size <BS>   64 | 128 | 256                  [default: 128]
+                          (INT8/FP8 only; MXFP8=32, NVFP4=16 are fixed —
+                           passing it with those exits 2)
       --heur / --no-heur  Skip-inefficient-layers heuristic [default: on]
       --exclude-layers <RE>  Regex; matching layers stay full precision
       --output-mode <M>   sharded | single                [default: sharded]
@@ -274,8 +351,16 @@ table plus detected comfy_quant formats per layer.
   skipped-weight dtype casting, bias correction (bit-exact torch MT19937 +
   randn + oneDNN-style sgemm + cascade-sum ports), comfy_quant blobs, header
   8-byte alignment, manifest checkpoints — single-file and sharded, both
-  output modes.
-- FP8 / MXFP8 / NVFP4 kernels (standalone, golden-verified).
+  output modes. Verified **whole-file** byte-for-byte.
+- FP8 (tensor/row/block), MXFP8 and NVFP4 streaming: kernels, per-format
+  dequant for bias correction, swizzled scales, NVFP4 `weight_scale_2`,
+  `__metadata__._quantization_metadata`, resume + Ctrl-C, sharded + union
+  modes — verified **per-tensor** (payload bytes + `dtype`/`shape` + metadata
+  string); see the contract above for why whole-file equality doesn't apply.
+- Calibration draw order, which differs between INT8 (file order, via the
+  reference streamer) and the ctq formats (alphabetical, since ctq builds its
+  key list from `safetensors.safe_open.keys()`, which is always sorted) —
+  locked in both directions by `tests/golden/sharded_unsorted`.
 - GGUF legacy encoders F16/BF16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1 — byte-identical to
   gguf-py (49/49 golden cases).
 
@@ -318,7 +403,7 @@ docs/plans/            design plan + execution log
 ## Development
 
 ```sh
-cargo test --workspace                 # 210 tests incl. golden byte-parity
+cargo test --workspace                 # 304 tests incl. golden byte-parity
 cargo clippy --workspace --all-targets # clean with -D warnings
 cargo fmt --check
 cargo bench -p quant-core              # throughput benchmarks (needs fixture)
