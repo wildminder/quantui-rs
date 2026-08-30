@@ -73,11 +73,38 @@ impl Format {
         }
     }
 
-    /// Calibration RNG draw order for this format family (plan §3.4).
+    /// Calibration RNG draw order for this format family (plan §3.4, revised
+    /// by the E.5 discriminating fixture).
+    ///
+    /// The split is NOT "INT8+FP8 vs MXFP8+NVFP4" — it is **which reference
+    /// implementation owns the format's bias correction**:
+    ///
+    /// * `Int8` — bias correction comes from the quantui reference streaming
+    ///   path (`docs/ref/quantui/stream_quant.py::_build_torch_calibration_cache`),
+    ///   which reads the header RAW (`read_safetensors_header`) and walks
+    ///   `names` in **on-disk file order**.
+    /// * `Fp8E4m3` / `Mxfp8` / `Nvfp4` — bias correction comes from ctq
+    ///   (`formats/{fp8,mxfp8,nvfp4}_conversion.py`). Every ctq loader builds
+    ///   its key list from `safetensors.safe_open(...).keys()`, which returns
+    ///   keys **sorted alphabetically** (verified deterministic across files
+    ///   and repeated opens — `tools/probe_safe_open_keys.py`), NOT in file
+    ///   order. FP8 then iterates that sorted `all_keys`; MXFP8/NVFP4
+    ///   pre-filter and `sorted()` it. Same result: **sorted order**.
+    ///
+    /// The two orders only differ when a file's 2D `.weight` tensors are NOT
+    /// in alphabetical on-disk order — which `safetensors.torch.save_file`
+    /// usually hides (it groups by dtype and sorts within each group) but is
+    /// perfectly legal and occurs in real checkpoints. `tests/golden/
+    /// sharded_unsorted` is the fixture that pins this down: it fails under
+    /// the wrong assignment for FP8.
+    ///
+    /// NOTE: ctq's FP8 in `low_memory=True` mode builds `_all_keys` from the
+    /// raw header (file order) instead. The goldens — and this port — use the
+    /// default `low_memory=False` (sorted) path.
     pub fn calib_order(&self) -> CalibOrder {
         match self {
-            Format::Int8 | Format::Fp8E4m3 => CalibOrder::FileOrderAll2D,
-            Format::Mxfp8 | Format::Nvfp4 => CalibOrder::SortedWeightsOnly,
+            Format::Int8 => CalibOrder::FileOrderAll2D,
+            Format::Fp8E4m3 | Format::Mxfp8 | Format::Nvfp4 => CalibOrder::SortedWeightsOnly,
         }
     }
 
@@ -311,9 +338,11 @@ mod tests {
         assert_eq!(Format::Mxfp8.heur_block_size(128), 32);
         assert_eq!(Format::Nvfp4.heur_block_size(128), 16);
 
-        // Calibration draw order per format family (plan §3.4).
+        // Calibration draw order: INT8 follows the quantui reference streaming
+        // path (raw header -> file order); every ctq-owned format (FP8/MXFP8/
+        // NVFP4) goes through `safe_open.keys()`, which is SORTED (E.5).
         assert_eq!(Format::Int8.calib_order(), CalibOrder::FileOrderAll2D);
-        assert_eq!(Format::Fp8E4m3.calib_order(), CalibOrder::FileOrderAll2D);
+        assert_eq!(Format::Fp8E4m3.calib_order(), CalibOrder::SortedWeightsOnly);
         assert_eq!(Format::Mxfp8.calib_order(), CalibOrder::SortedWeightsOnly);
         assert_eq!(Format::Nvfp4.calib_order(), CalibOrder::SortedWeightsOnly);
 

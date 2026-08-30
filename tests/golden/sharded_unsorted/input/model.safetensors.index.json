@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "total_size": 0
+  },
+  "weight_map": {
+    "zzz.weight": "model-00001-of-00002.safetensors",
+    "aaa.weight": "model-00001-of-00002.safetensors",
+    "zzz.bias": "model-00001-of-00002.safetensors",
+    "aaa.bias": "model-00001-of-00002.safetensors",
+    "bbb.weight": "model-00002-of-00002.safetensors",
+    "bbb.bias": "model-00002-of-00002.safetensors"
+  }
+}
