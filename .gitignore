@@ -3,6 +3,9 @@
 __pycache__/
 .workbuddy-ai/
 _backup
+# Auto-generated workspace backups (hundreds of MB) land in the repo root too,
+# not just in _backup/ — ignore them so `git add -A` can't sweep one in.
+*.rar
 # Phase 11.1: large generated benchmark fixture + criterion HTML reports.
 /tests/bench/*.safetensors
 /crates/quant-core/target/
