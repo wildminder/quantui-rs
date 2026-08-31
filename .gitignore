@@ -10,3 +10,4 @@ _backup
 /tests/bench/*.safetensors
 /crates/quant-core/target/
 target/criterion/
+docs/
