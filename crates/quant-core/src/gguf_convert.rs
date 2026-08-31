@@ -39,6 +39,8 @@ pub enum GgufError {
     UnknownMethod(String, String),
     #[error("method '{0}' is an Unsloth Dynamic 2.0 per-layer variant and is not supported natively (proprietary heuristic). Use a plain method instead.")]
     DynamicMethod(String),
+    #[error("method '{0}' cannot run: the backend has no encoder for it. {1}")]
+    NoEncoder(String, String),
     #[error("tensor {name}: unsupported source dtype {dtype:?} for GGUF conversion")]
     BadDtype { name: String, dtype: DType },
     #[error("safetensors: {0}")]
@@ -78,6 +80,10 @@ pub struct GgufConvertReport {
     pub kept_f32: usize,
     /// Output file size in bytes.
     pub output_bytes: u64,
+    /// GGUF names of every tensor that fell back to F16 (Phase 2.3: silent
+    /// degradation is not acceptable — the CLI prints one warning line per
+    /// entry and tests assert the exact list).
+    pub fallback_tensors: Vec<String>,
 }
 
 /// Convert a HF safetensors input (single file or sharded folder) to GGUF.
@@ -91,15 +97,22 @@ pub fn convert_hf_to_gguf(
     cfg: &GgufConvertConfig,
     mut on_progress: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Result<GgufConvertReport, GgufError> {
-    // 1. Resolve the method (reject unknown + Dynamic 2.0 up front).
+    // 1. Resolve the method (reject unknown, Dynamic 2.0, and no-encoder
+    //    up front — Phase 2.1: every rejection names the specific cause).
     let entry = gguf_registry::get_method(&cfg.method_id).ok_or_else(|| {
         GgufError::UnknownMethod(
             cfg.method_id.clone(),
-            gguf_registry::supported_ids().join(", "),
+            gguf_registry::usable_ids().join(", "),
         )
     })?;
     if entry.method.dynamic_v2 {
         return Err(GgufError::DynamicMethod(cfg.method_id.clone()));
+    }
+    if let gguf_registry::BackendSupport::NoEncoder(reason) = entry.method.support {
+        return Err(GgufError::NoEncoder(
+            cfg.method_id.clone(),
+            reason.to_string(),
+        ));
     }
 
     // 2. Classify the input.
@@ -140,6 +153,7 @@ pub fn convert_hf_to_gguf(
     let mut quantized = 0usize;
     let mut fallback_f16 = 0usize;
     let mut kept_f32 = 0usize;
+    let mut fallback_tensors: Vec<String> = Vec::new();
     for (done, (name, shard_idx)) in names.iter().enumerate() {
         let reader = &readers[*shard_idx];
         let info = reader.header().get(name).expect("name came from header");
@@ -157,7 +171,9 @@ pub fn convert_hf_to_gguf(
         })?;
 
         // Encode; fall back to F16 if the element count doesn't divide the
-        // scheme's block size (keeps the output valid GGUF).
+        // scheme's block size (keeps the output valid GGUF). Phase 2.3:
+        // the fallback must never be silent — one stderr warning per
+        // degraded tensor, and the report carries the exact list.
         let (bytes, dtype) = match quantize(&floats, ggml) {
             Ok(b) => {
                 if scheme != GgufScheme::F32 {
@@ -167,10 +183,17 @@ pub fn convert_hf_to_gguf(
                 }
                 (b, ggml)
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!(
+                    "warning: tensor '{gguf_name}' fell back to F16: \
+                     method '{method}' scheme {scheme:?} cannot encode it ({e}); \
+                     output is valid GGUF but this tensor is NOT {method}-quantized",
+                    method = cfg.method_id,
+                );
                 let b =
                     quantize(&floats, GgmlType::F16).map_err(|e| GgufError::Gguf(e.to_string()))?;
                 fallback_f16 += 1;
+                fallback_tensors.push(gguf_name.clone());
                 (b, GgmlType::F16)
             }
         };
@@ -205,6 +228,7 @@ pub fn convert_hf_to_gguf(
         fallback_f16,
         kept_f32,
         output_bytes,
+        fallback_tensors,
     })
 }
 

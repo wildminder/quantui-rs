@@ -16,13 +16,21 @@ use crate::args::GgufArgs;
 use crate::progress::{BarSink, NullSink, ProgressSink};
 
 /// Print the method table (mirrors the reference `list_line` format:
-/// `id           bpw  [DYNAMIC 2.0] description`).
+/// `id           bpw  [DYNAMIC 2.0] description`), plus the Unsloth-plan
+/// capability markers: `[IMATRIX]` for methods official Unsloth gates
+/// behind `imatrix_file=`, and `(unsupported natively)` for rejected ids.
 fn print_methods() {
     println!("GGUF quantization methods (quantui-rs native):");
     println!();
     for e in gguf_registry::METHODS {
         let m = &e.method;
-        let badge = if m.dynamic_v2 { "[DYNAMIC 2.0] " } else { "" };
+        let badge = if m.dynamic_v2 {
+            "[DYNAMIC 2.0] "
+        } else if m.requires_imatrix {
+            "[IMATRIX] "
+        } else {
+            ""
+        };
         let bpw = match m.approx_bpw {
             Some(b) => format!("{b:>4}bpw "),
             None => "      ".to_string(),
@@ -61,12 +69,14 @@ pub fn run(args: GgufArgs) -> ExitCode {
     };
 
     // Validate the method early so a typo fails with exit 2 (usage), not 1.
+    // Phase 2.1: every rejection names the specific cause and suggests only
+    // methods that can actually run (usable_ids).
     match gguf_registry::get_method(&args.method) {
         None => {
             eprintln!(
                 "error: unknown GGUF method '{}'. Supported: {}",
                 args.method,
-                gguf_registry::supported_ids().join(", ")
+                gguf_registry::usable_ids().join(", ")
             );
             return ExitCode::from(2);
         }
@@ -76,7 +86,19 @@ pub fn run(args: GgufArgs) -> ExitCode {
                 args.method
             );
             eprintln!("The proprietary per-layer bit-width heuristic is a documented out-of-scope boundary.");
-            eprintln!("Supported: {}", gguf_registry::supported_ids().join(", "));
+            eprintln!("Supported: {}", gguf_registry::usable_ids().join(", "));
+            return ExitCode::from(2);
+        }
+        Some(e)
+            if matches!(
+                e.method.support,
+                gguf_registry::BackendSupport::NoEncoder(_)
+            ) =>
+        {
+            if let Some(reason) = gguf_registry::rejection_reason(&args.method) {
+                eprintln!("error: method '{}' cannot run: {}", args.method, reason);
+            }
+            eprintln!("Supported: {}", gguf_registry::usable_ids().join(", "));
             return ExitCode::from(2);
         }
         Some(_) => {}
@@ -108,6 +130,19 @@ pub fn run(args: GgufArgs) -> ExitCode {
 
     match result {
         Ok(report) => {
+            // Phase 2.3: a silent F16 degrade is a bug, not a feature. The
+            // per-tensor warnings already went to stderr during conversion;
+            // restate the summary here so it is impossible to miss, without
+            // failing the run (resume semantics — see plan §3-H).
+            if report.fallback_f16 > 0 {
+                eprintln!(
+                    "warning: {} of {} tensors were NOT quantized with '{}' and were stored as F16: [{}]",
+                    report.fallback_f16,
+                    report.tensors,
+                    args.method,
+                    report.fallback_tensors.join(", ")
+                );
+            }
             println!(
                 "wrote {} ({} tensors: {} quantized, {} kept F32, {} F16-fallback; arch {}; {:.1} MB in {:.2}s)",
                 report.output.display(),
@@ -128,7 +163,8 @@ pub fn run(args: GgufArgs) -> ExitCode {
             let code = match &e {
                 GgufError::UnknownMethod(..)
                 | GgufError::DynamicMethod(_)
-                | GgufError::BadInput(_) => 2,
+                | GgufError::BadInput(_)
+                | GgufError::NoEncoder(..) => 2,
                 _ => 1,
             };
             eprintln!("error: {e}");

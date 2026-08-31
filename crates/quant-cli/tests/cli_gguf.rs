@@ -115,6 +115,177 @@ fn gguf_list_methods_exit_0() {
     assert!(s.contains("[DYNAMIC 2.0]"));
 }
 
+// ─── Phase 0.3 / 2: capability markers + honest fallback ────────────
+
+#[test]
+fn gguf_list_methods_marks_imatrix_and_rejected() {
+    let out = bin().args(["gguf", "--list-methods"]).output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+
+    // The four iq* methods are in official Unsloth IMATRIX_QUANTS — they
+    // must be visibly marked so a user knows an imatrix is expected.
+    for id in ["iq4_nl", "iq3_xxs", "iq2_xxs", "iq2_xs"] {
+        let line = s
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or_else(|| panic!("no listing line for {id}"));
+        assert!(
+            line.contains("[IMATRIX]"),
+            "{id} line lacks [IMATRIX]: {line}"
+        );
+    }
+
+    // Plain methods must NOT be marked.
+    for id in ["f16", "q8_0", "q4_k_m", "q4_1", "q5_1"] {
+        let line = s
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or_else(|| panic!("no listing line for {id}"));
+        assert!(
+            !line.contains("[IMATRIX]"),
+            "{id} wrongly marked [IMATRIX]: {line}"
+        );
+    }
+
+    // The wrongly-rejected-then-fixed pair is now advertised as runnable.
+    for id in ["q4_1", "q5_1"] {
+        let line = s
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or_else(|| panic!("no listing line for {id}"));
+        assert!(
+            !line.contains("unsupported natively"),
+            "{id} still listed as unsupported: {line}"
+        );
+    }
+}
+
+/// Phase 2.3: an indivisible tensor must produce exactly one per-tensor
+/// warning naming the tensor, plus the summary warning — and still exit 0
+/// (resume semantics; a hard fail would break the contract).
+#[test]
+fn gguf_f16_fallback_is_loud() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    // 100 columns: not divisible by Q8_0's block size 32 → fallback.
+    // 2-D weight (10 rows x 100 cols = 1000 elements) + a divisible norm
+    // so the fixture is otherwise clean.
+    let vals = synth(10 * 100, 42);
+    let tensors = vec![
+        Tensor {
+            name: "model.layers.0.self_attn.q_proj.weight",
+            dtype: "BF16",
+            shape: vec![10, 100],
+            bytes: bf16_bytes(&vals),
+        },
+        Tensor {
+            name: "model.norm.weight",
+            dtype: "BF16",
+            shape: vec![32],
+            bytes: bf16_bytes(&synth(32, 7)),
+        },
+    ];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 100,
+            "num_hidden_layers": 1,
+            "vocab_size": 8
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("m-q8_0.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fallback must not fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Exactly one per-tensor warning line, naming the GGUF-side tensor.
+    let per_tensor: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("fell back to F16"))
+        .collect();
+    assert_eq!(
+        per_tensor.len(),
+        1,
+        "expected 1 per-tensor warning, got: {stderr}"
+    );
+    assert!(
+        per_tensor[0].contains("blk.0.attn_q.weight"),
+        "warning must name the tensor: {}",
+        per_tensor[0]
+    );
+
+    // And the summary line names the method and the tensor list.
+    let summary: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("were NOT quantized with 'q8_0'"))
+        .collect();
+    assert_eq!(
+        summary.len(),
+        1,
+        "expected 1 summary warning, got: {stderr}"
+    );
+    assert!(summary[0].contains("blk.0.attn_q.weight"));
+}
+
+/// The counterpart: a clean fixture produces NO fallback warnings.
+#[test]
+fn gguf_clean_convert_has_no_fallback_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("m-q8_0.gguf");
+
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("fell back to F16"),
+        "clean fixture must not warn, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("were NOT quantized"),
+        "clean fixture must not summarize a fallback, stderr: {stderr}"
+    );
+}
+
 #[test]
 fn gguf_convert_single_file_exit_0() {
     let tmp = tempfile::tempdir().unwrap();
