@@ -227,3 +227,139 @@ fn gguf_bad_input_path_exit_2() {
         .unwrap();
     assert_eq!(status.code(), Some(2));
 }
+
+// ─── Phase 1.2: q4_1 / q5_1 end-to-end parity lock ──────────────────
+//
+// Phase 1 of the 2026-08-31 Unsloth coverage plan reclassified q4_1/q5_1
+// as usable (official Unsloth ALLOWED_QUANTS save.py:163,170). The
+// encoder-level goldens already pass (gguf_parity.rs); this test locks the
+// FULL CLI conversion path: every 2-D tensor must come out byte-identical
+// to quantizing the same f32 source with the same encoder, and no tensor
+// may silently fall back to F16.
+
+fn golden_dir() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // quant-cli
+    p.pop(); // crates/
+    p.join("tests/golden/gguf_quants")
+}
+
+/// Deterministic case from the gguf-py golden generator (randn_256): the
+/// exact 256-element f32 vector whose Q4_1/Q5_1 encodings are committed
+/// as goldens. Re-deriving it here would duplicate the generator, so we
+/// read the committed f32 golden instead.
+fn load_golden_f32(case: &str) -> Vec<f32> {
+    let raw = std::fs::read(golden_dir().join(format!("{case}.f32.bin"))).unwrap();
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
+}
+
+#[test]
+fn gguf_q4_1_q5_1_end_to_end_byte_parity() {
+    // 256 elements: divisible by every legacy block size (32), so no F16
+    // fallback is legitimate for these 2-D tensors.
+    let case = load_golden_f32("randn_256");
+    assert_eq!(case.len(), 256);
+    let w_bytes: Vec<u8> = case.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // Direct encodings of the same source — the byte-parity expectations.
+    let f16_want = rlx_gguf::quantize(&case, rlx_gguf::GgmlType::F16).unwrap();
+
+    for (method, ggml) in [
+        ("q4_1", rlx_gguf::GgmlType::Q4_1),
+        ("q5_1", rlx_gguf::GgmlType::Q5_1),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("m");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // Two 2-D tensors carrying the SAME 256-element golden vector:
+        //  - embed_tokens → token_embd.weight → embd_scheme F16 (policy)
+        //  - q_proj      → blk.0.attn_q.weight → default scheme (the method)
+        // plus one 1-D norm, which must stay F32.
+        let tensors = vec![
+            Tensor {
+                name: "model.embed_tokens.weight",
+                dtype: "F32",
+                shape: vec![4, 64],
+                bytes: w_bytes.clone(),
+            },
+            Tensor {
+                name: "model.layers.0.self_attn.q_proj.weight",
+                dtype: "F32",
+                shape: vec![4, 64],
+                bytes: w_bytes.clone(),
+            },
+            Tensor {
+                name: "model.norm.weight",
+                dtype: "F32",
+                shape: vec![8],
+                bytes: case[..8].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            },
+        ];
+        std::fs::write(
+            model_dir.join("model.safetensors"),
+            build_safetensors(&tensors),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_string(&serde_json::json!({
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 64,
+                "num_hidden_layers": 1,
+                "vocab_size": 4
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = tmp.path().join(format!("m-{method}.gguf"));
+        let status = bin()
+            .args([
+                "gguf",
+                model_dir.join("model.safetensors").to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--method",
+                method,
+                "--no-progress",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{method}: CLI exited non-zero");
+        assert!(out.exists(), "{method}: output missing");
+
+        let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+
+        // The regular 2-D weight must carry the method's own dtype with
+        // bytes identical to a direct encode of the same f32 source.
+        let attn_q = f.tensors.get("blk.0.attn_q.weight").unwrap();
+        assert_eq!(attn_q.dtype, ggml, "{method}: attn_q dtype");
+        let got = f.tensor_bytes(attn_q).unwrap();
+        let want = rlx_gguf::quantize(&case, ggml).unwrap();
+        assert_eq!(
+            got,
+            &want[..],
+            "{method}: attn_q bytes differ from direct encode"
+        );
+
+        // Embeddings use the embd_scheme (F16) — also byte-checked, so a
+        // future policy change cannot silently alter embedding bytes either.
+        let embd = f.tensors.get("token_embd.weight").unwrap();
+        assert_eq!(embd.dtype, rlx_gguf::GgmlType::F16, "{method}: embd dtype");
+        let got_embd = f.tensor_bytes(embd).unwrap();
+        assert_eq!(got_embd, &f16_want[..], "{method}: embd bytes");
+
+        // 1-D norm stays F32 untouched.
+        let norm = f
+            .tensors
+            .iter()
+            .find(|(k, _)| k.ends_with("norm.weight"))
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("{method}: no norm tensor found"));
+        assert_eq!(norm.dtype, rlx_gguf::GgmlType::F32);
+    }
+}

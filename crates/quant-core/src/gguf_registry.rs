@@ -8,12 +8,17 @@
 //!
 //! Scope boundary (plan §1 / §7): the Unsloth Dynamic 2.0 per-layer
 //! selective variants (`q4_k_xl` / `q3_k_xl` / `q2_k_xl`, and the
-//! `dynamic_v2`-tagged `q5_1` / `q4_1` / `q4_nl` entries) are NOT
-//! supported natively — the proprietary per-layer bit-width heuristic is a
-//! permanent Python-only boundary. They are kept in the registry data
-//! (verbatim ids/labels/bpw/descriptions, `dynamic_v2 = true`) so the CLI
-//! can list them and reject them with a clear message instead of a silent
-//! typo failure.
+//! `dynamic_v2`-tagged `q4_nl` entry) are NOT supported natively — the
+//! proprietary per-layer bit-width heuristic is a permanent Python-only
+//! boundary. They are kept in the registry data (verbatim ids/labels/bpw/
+//! descriptions, `dynamic_v2 = true`) so the CLI can list them and reject
+//! them with a clear message instead of a silent typo failure.
+//!
+//! Note: `q4_1` and `q5_1` are NOT in that rejected set. The ported
+//! reference `quant_methods.py` mislabelled them "Dynamic 2.0 format", but
+//! official Unsloth's `ALLOWED_QUANTS` (save.py:163-170) and llama.cpp both
+//! treat them as plain legacy types with ftypes and encoders; they were
+//! reclassified in the 2026-08-31 Unsloth coverage plan (Phase 1).
 //!
 //! The registry is pure data + lookup: no IO, no rlx-gguf types leak into
 //! the public surface (callers map [`GgufScheme`] → `GgmlType` at the
@@ -205,12 +210,21 @@ pub static METHODS: &[RegistryEntry] = &[
             rules: &[],
         },
     ),
+    // NOTE: the ported reference `docs/ref/quantui/quant_methods.py:131`
+    // labels q5_1 a "Dynamic 2.0 format", which is why this entry used to be
+    // rejected. That is wrong, and per the project's source-of-truth order
+    // (official Unsloth > llama.cpp > the quantui reference) it does not
+    // govern: `ref/unsloth/unsloth/save.py:170` lists q5_1 in ALLOWED_QUANTS
+    // as a plain legacy type, and llama.cpp has LLAMA_FTYPE_MOSTLY_Q5_1
+    // (include/llama.h:126) with an encoder in the ggml_quantize_chunk
+    // dispatch (ggml/src/ggml.c:7999). Byte-parity goldens for it already
+    // pass. Do not "restore" dynamic_v2 here without re-checking Unsloth.
     entry(
         "q5_1",
-        "Q5_1 (Dynamic 2.0 format)",
-        true,
+        "Q5_1",
+        false,
         Some(5.5),
-        "New Dynamic 2.0 efficiency format (ARM / Apple Silicon).",
+        "Even higher accuracy, resource usage and slower inference.",
         MethodPolicy {
             default: GgufScheme::Q5_1,
             embd_scheme: F16,
@@ -253,12 +267,17 @@ pub static METHODS: &[RegistryEntry] = &[
             rules: &[],
         },
     ),
+    // See the q5_1 note: the ported reference (`quant_methods.py:124`) is
+    // wrong here too. Official Unsloth `ALLOWED_QUANTS`
+    // (`ref/unsloth/unsloth/save.py:164`) lists q4_1 as a plain legacy type,
+    // and llama.cpp has LLAMA_FTYPE_MOSTLY_Q4_1 (include/llama.h:120) with an
+    // encoder in the ggml_quantize_chunk dispatch (ggml/src/ggml.c:7998).
     entry(
         "q4_1",
-        "Q4_1 (Dynamic 2.0 format)",
-        true,
+        "Q4_1",
+        false,
         Some(4.8),
-        "New Dynamic 2.0 format. Higher accuracy than Q4_0.",
+        "Higher accuracy than q4_0 but not as high as q5_0. However has quicker inference than q5 models.",
         MethodPolicy {
             default: GgufScheme::Q4_1,
             embd_scheme: F16,
@@ -546,10 +565,10 @@ mod tests {
             ),
             (
                 "q5_1",
-                "Q5_1 (Dynamic 2.0 format)",
-                true,
+                "Q5_1",
+                false,
                 Some(5.5),
-                "New Dynamic 2.0 efficiency format (ARM / Apple Silicon).",
+                "Even higher accuracy, resource usage and slower inference.",
             ),
             (
                 "q4_k_m",
@@ -568,10 +587,10 @@ mod tests {
             ("q4_0", "Q4_0", false, Some(4.55), "Original 4-bit method."),
             (
                 "q4_1",
-                "Q4_1 (Dynamic 2.0 format)",
-                true,
+                "Q4_1",
+                false,
                 Some(4.8),
-                "New Dynamic 2.0 format. Higher accuracy than Q4_0.",
+                "Higher accuracy than q4_0 but not as high as q5_0. However has quicker inference than q5 models.",
             ),
             (
                 "q4_nl",
@@ -725,11 +744,30 @@ mod tests {
 
     #[test]
     fn dynamic_variants_are_exactly_the_reference_dynamic_set() {
+        // q4_1 and q5_1 were removed from this set: official Unsloth lists
+        // both as plain legacy types in ALLOWED_QUANTS (save.py:163,170) and
+        // llama.cpp gives them ftypes + encoders. The ported quantui reference
+        // that tagged them Dynamic 2.0 is wrong (see the entries' notes).
         assert_eq!(
             dynamic_ids(),
-            vec!["q5_1", "q4_1", "q4_nl", "q4_k_xl", "q3_k_xl", "q2_k_xl"]
+            vec!["q4_nl", "q4_k_xl", "q3_k_xl", "q2_k_xl"]
         );
-        assert_eq!(supported_ids().len(), METHODS.len() - 6);
+        assert_eq!(supported_ids().len(), METHODS.len() - 4);
+    }
+
+    #[test]
+    fn q4_1_and_q5_1_are_usable() {
+        // Phase 1 lock: these two must stay resolvable, non-dynamic, and
+        // must resolve to their own encoders. If this test fails because
+        // someone "restored" the dynamic_v2 tag, re-read the Unsloth
+        // ALLOWED_QUANTS table before changing anything else.
+        for id in ["q4_1", "q5_1"] {
+            let e = get_method(id).unwrap_or_else(|| panic!("{id} missing"));
+            assert!(!e.method.dynamic_v2, "{id} must not be dynamic_v2");
+            assert!(supported_ids().contains(&id), "{id} must be usable");
+        }
+        assert_eq!(get_method("q4_1").unwrap().policy.default, GgufScheme::Q4_1);
+        assert_eq!(get_method("q5_1").unwrap().policy.default, GgufScheme::Q5_1);
     }
 
     #[test]
