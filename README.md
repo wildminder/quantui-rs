@@ -35,7 +35,7 @@ Requires Rust (stable, ≥ 1.89):
 
 ```sh
 cargo build --release
-# binary: target/release/quantui-rs(.exe)  (~2.5 MB, LTO + stripped)
+# binary: target/release/quantui-rs(.exe)  (~2.6 MB, LTO + stripped)
 ```
 
 ## Quick start: quantize a model to INT8
