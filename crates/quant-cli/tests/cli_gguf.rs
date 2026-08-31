@@ -125,7 +125,10 @@ fn gguf_list_methods_marks_imatrix_and_rejected() {
 
     // The four iq* methods are in official Unsloth IMATRIX_QUANTS — they
     // must be visibly marked so a user knows an imatrix is expected.
-    for id in ["iq4_nl", "iq3_xxs", "iq2_xxs", "iq2_xs"] {
+    // Phase 3 extends the set with the five new IMATRIX_QUANTS members.
+    for id in [
+        "iq4_nl", "iq3_xxs", "iq2_xxs", "iq2_xs", "iq1_s", "iq1_m", "iq2_s", "iq3_s", "iq4_xs",
+    ] {
         let line = s
             .lines()
             .find(|l| l.starts_with(id))
@@ -136,8 +139,11 @@ fn gguf_list_methods_marks_imatrix_and_rejected() {
         );
     }
 
-    // Plain methods must NOT be marked.
-    for id in ["f16", "q8_0", "q4_k_m", "q4_1", "q5_1"] {
+    // Plain methods must NOT be marked. Phase 3's f32/bf16/ternary/q1_0/
+    // q2_0 are plain list entries per decision Q4 (no gating flag).
+    for id in [
+        "f16", "f32", "bf16", "q8_0", "q4_k_m", "q4_1", "q5_1", "tq1_0", "tq2_0", "q1_0", "q2_0",
+    ] {
         let line = s
             .lines()
             .find(|l| l.starts_with(id))
@@ -145,6 +151,10 @@ fn gguf_list_methods_marks_imatrix_and_rejected() {
         assert!(
             !line.contains("[IMATRIX]"),
             "{id} wrongly marked [IMATRIX]: {line}"
+        );
+        assert!(
+            !line.contains("unsupported natively"),
+            "{id} wrongly listed as unsupported: {line}"
         );
     }
 

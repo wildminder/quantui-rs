@@ -337,6 +337,16 @@ fn scheme_to_ggml(s: GgufScheme) -> GgmlType {
         GgufScheme::Iq2Xs => GgmlType::IQ2XS,
         GgufScheme::Iq3Xxs => GgmlType::IQ3XXS,
         GgufScheme::Iq4Nl => GgmlType::IQ4NL,
+        // Unsloth coverage plan Phase 3:
+        GgufScheme::Iq1S => GgmlType::IQ1S,
+        GgufScheme::Iq1M => GgmlType::IQ1M,
+        GgufScheme::Iq2S => GgmlType::IQ2S,
+        GgufScheme::Iq3S => GgmlType::IQ3S,
+        GgufScheme::Iq4Xs => GgmlType::IQ4XS,
+        GgufScheme::Tq1_0 => GgmlType::TQ1_0,
+        GgufScheme::Tq2_0 => GgmlType::TQ2_0,
+        GgufScheme::Q1_0 => GgmlType::Q1_0,
+        GgufScheme::Q2_0 => GgmlType::Q2_0,
     }
 }
 
@@ -582,6 +592,16 @@ mod tests {
             GgufScheme::Iq2Xs,
             GgufScheme::Iq3Xxs,
             GgufScheme::Iq4Nl,
+            // Phase 3 additions (Unsloth coverage plan):
+            GgufScheme::Iq1S,
+            GgufScheme::Iq1M,
+            GgufScheme::Iq2S,
+            GgufScheme::Iq3S,
+            GgufScheme::Iq4Xs,
+            GgufScheme::Tq1_0,
+            GgufScheme::Tq2_0,
+            GgufScheme::Q1_0,
+            GgufScheme::Q2_0,
         ] {
             let _ = scheme_to_ggml(s);
         }

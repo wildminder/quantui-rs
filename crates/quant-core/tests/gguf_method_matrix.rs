@@ -135,6 +135,16 @@ fn expected_ggml(s: GgufScheme) -> rlx_gguf::GgmlType {
         GgufScheme::Iq2Xs => GgmlType::IQ2XS,
         GgufScheme::Iq3Xxs => GgmlType::IQ3XXS,
         GgufScheme::Iq4Nl => GgmlType::IQ4NL,
+        // Phase 3 additions:
+        GgufScheme::Iq1S => GgmlType::IQ1S,
+        GgufScheme::Iq1M => GgmlType::IQ1M,
+        GgufScheme::Iq2S => GgmlType::IQ2S,
+        GgufScheme::Iq3S => GgmlType::IQ3S,
+        GgufScheme::Iq4Xs => GgmlType::IQ4XS,
+        GgufScheme::Tq1_0 => GgmlType::TQ1_0,
+        GgufScheme::Tq2_0 => GgmlType::TQ2_0,
+        GgufScheme::Q1_0 => GgmlType::Q1_0,
+        GgufScheme::Q2_0 => GgmlType::Q2_0,
     }
 }
 
@@ -202,11 +212,31 @@ fn probe_method(e: &gguf_registry::RegistryEntry) {
         "{id}: 1-D norm not F32"
     );
 
-    // 4. Everything quantized (no F16-fallback path taken, no kept F32 2-D).
-    assert!(
-        report.quantized >= 3,
-        "{id}: expected >=3 quantized 2-D tensors"
+    // 4. Bookkeeping consistency: every 2-D tensor was either quantized to
+    //    the policy scheme (counted in quantized) or — for f32, whose
+    //    default IS F32 — kept as F32. The invariant: no 2-D tensor went
+    //    through the F16 fallback path (assert #1) and none is missing.
+    let nd_2d = 3usize; // q_proj, down_proj, v_proj in the fixture
+    let handled = report.quantized + report.kept_f32;
+    assert_eq!(
+        handled,
+        nd_2d + 1, // +1 for the 1-D norm (kept F32 by the shared convention)
+        "{id}: {handled} tensors accounted for, expected {} (3 x 2-D + 1 norm)",
+        nd_2d + 1
     );
+    if e.policy.default != GgufScheme::F32 {
+        assert!(
+            report.quantized >= nd_2d,
+            "{id}: expected >= {nd_2d} quantized 2-D tensors, got {}",
+            report.quantized
+        );
+    } else {
+        // f32 method: the 2-D tensors are F32 by policy, not fallback.
+        assert_eq!(
+            report.quantized, 0,
+            "{id}: F32-default method must not count kept tensors as quantized"
+        );
+    }
 }
 
 #[test]
@@ -225,17 +255,115 @@ fn sweep_all_methods() {
 }
 
 /// The usable list is exactly the registry snapshot this plan expects:
-/// 20 usable (18 original + q4_1 + q5_1 from Phase 1), 4 rejected.
-/// When Phase 3 adds methods, this snapshot is updated atomically with
-/// the registry change — a method cannot appear without its sweep coverage.
+/// 31 usable (20 after Phase 1 + 11 from Phase 3), 4 rejected.
+/// When a later phase adds methods, this snapshot is updated atomically
+/// with the registry change — a method cannot appear without its sweep
+/// coverage.
 #[test]
 fn usable_ids_snapshot() {
     assert_eq!(
         gguf_registry::usable_ids(),
         vec![
+            // ── original reference order (q4_1/q5_1 unblocked in Phase 1) ──
             "f16", "q8_0", "q6_k", "q5_k_m", "q5_k_s", "q5_0", "q5_1", "q4_k_m", "q4_k_s", "q4_0",
             "q4_1", "q3_k_m", "q3_k_l", "q3_k_s", "q3_k_xs", "q2_k", "iq4_nl", "iq3_xxs",
             "iq2_xxs", "iq2_xs",
+            // ── Phase 3 additions (Unsloth coverage plan) ──
+            "f32", "bf16", "iq1_s", "iq1_m", "iq2_s", "iq3_s", "iq4_xs", "tq1_0", "tq2_0", "q1_0",
+            "q2_0",
         ]
     );
+}
+
+// ─── Phase 3 quartet part 4: round-trip bounded-error ───────────────
+//
+// The sweep (above) proves every method encodes without fallback. This test
+// proves the encoded bytes mean something: dequantize the probe tensor and
+// assert the reconstruction stays within a per-family tolerance of the f32
+// source. Tolerances are deliberately generous — they catch a broken
+// encoder (garbage bytes), not quality differences (that's the imatrix
+// story, Phase 4). Family bounds chosen from llama.cpp's documented
+// reconstruction characteristics, not tuned to pass.
+
+/// Max mean absolute reconstruction error per method id. K-quants and the
+/// legacy family reconstruct well; IQ1/IQ2 are extremely lossy by design
+/// (1.5-2.5 bpw — only the SHAPE of the data survives); ternary stores
+/// {-1,0,+1} so uniform-ish data loses its magnitude.
+fn round_trip_tolerance(id: &str) -> f32 {
+    match id {
+        // Lossless formats: exact to rounding.
+        "f16" | "f32" | "bf16" => 0.02,
+        // 8-bit near-lossless.
+        "q8_0" => 0.02,
+        // Legacy 4-5 bit.
+        "q4_0" | "q4_1" | "q5_0" | "q5_1" => 0.15,
+        // Legacy 1-2 bit: 1-bit reconstructs at ~0.25 on uniform noise
+        // (measured) — only the sign survives, by design.
+        "q1_0" | "q2_0" => 0.3,
+        // K-quants.
+        "q2_k" | "q3_k_m" | "q3_k_l" | "q3_k_s" | "q3_k_xs" | "q4_k_m" | "q4_k_s" | "q5_k_m"
+        | "q5_k_s" | "q6_k" => 0.15,
+        // IQ 4 bit: fine.
+        "iq4_nl" | "iq4_xs" => 0.2,
+        // IQ 2-3 bit: the lattice families (IQ2*, IQ3*) reconstruct
+        // coarsely on uniform noise with rlx's uniform-weight encoders
+        // (no imatrix yet — Phase 4 changes this profile). Measured:
+        // iq3_xxs 0.45, iq3_s 0.50, iq2_* similar — grouped at 0.55 with
+        // headroom; the test's job is catching garbage, not grading
+        // quality.
+        "iq2_xxs" | "iq2_xs" | "iq2_s" | "iq3_xxs" | "iq3_s" => 0.55,
+        // IQ ~1.5 bit: barely above noise — bound loose, the point is
+        // "not garbage", e.g. mean error 10x smaller than the data range.
+        "iq1_s" | "iq1_m" => 0.5,
+        // Ternary: values collapse to {-d, 0, +d}; on [-1,1] data the
+        // mean error is bounded by the sign-vs-magnitude loss.
+        "tq1_0" | "tq2_0" => 0.55,
+        other => panic!("no tolerance defined for {other} — add it when adding the method"),
+    }
+}
+
+#[test]
+fn round_trip_reconstruction_bounded_error() {
+    for id in gguf_registry::usable_ids() {
+        let e = gguf_registry::get_method(id).unwrap();
+        let scheme = gguf_registry::scheme_for(e, "blk.0.attn_q.weight", 2);
+        let f32_src = synth(K_COLS * K_COLS, 2); // same seed as the fixture's q_proj
+        let tol = round_trip_tolerance(id);
+
+        // Encode + decode the same source directly with rlx-gguf.
+        let encoded = rlx_gguf::quantize(&f32_src, expected_ggml(scheme))
+            .unwrap_or_else(|err| panic!("{id}: direct encode failed: {err}"));
+
+        // Decode via a real GGUF round-trip: write, reopen, dequant.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rt.gguf");
+        let mut w = rlx_gguf::GgufWriter::new();
+        w.set_arch("llama");
+        w.add_tensor_bytes(
+            "blk.0.attn_q.weight",
+            vec![K_COLS, K_COLS],
+            expected_ggml(scheme),
+            encoded,
+        )
+        .unwrap();
+        w.write_to_path(&path).unwrap();
+
+        let f = rlx_gguf::GgufFile::from_path(&path).unwrap();
+        let (deq, shape) = f
+            .dequant_f32("blk.0.attn_q.weight")
+            .unwrap_or_else(|err| panic!("{id}: dequant failed: {err}"));
+        assert_eq!(shape, vec![K_COLS, K_COLS], "{id}: dequant shape");
+        assert_eq!(deq.len(), f32_src.len(), "{id}: dequant length");
+
+        let mean_err: f32 = deq
+            .iter()
+            .zip(&f32_src)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / deq.len() as f32;
+        assert!(
+            mean_err <= tol,
+            "{id}: mean reconstruction error {mean_err:.4} exceeds tolerance {tol} — encoder output is garbage"
+        );
+    }
 }

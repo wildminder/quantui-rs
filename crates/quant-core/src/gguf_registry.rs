@@ -84,6 +84,16 @@ pub enum GgufScheme {
     Iq2Xs,
     Iq3Xxs,
     Iq4Nl,
+    // ── added by the Unsloth coverage plan Phase 3 ──
+    Iq1S,
+    Iq1M,
+    Iq2S,
+    Iq3S,
+    Iq4Xs,
+    Tq1_0,
+    Tq2_0,
+    Q1_0,
+    Q2_0,
 }
 
 /// Per-tensor quantization policy of a method.
@@ -434,6 +444,162 @@ pub static METHODS: &[RegistryEntry] = &[
         BackendSupport::Encodable,
         true,
     ),
+    // ══ Unsloth coverage plan Phase 3 additions (2026-08-31) ══════════
+    // The original 20 entries above stay in the exact reference order.
+    // New methods follow, each with the Unsloth/llama.cpp citation.
+    //
+    // 3.1 — f32 / bf16: Unsloth ALLOWED_QUANTS (save.py:152,153). f32 is a
+    // passthrough (llama.cpp dispatch ggml.c:8021, memcpy); bf16 keeps the
+    // source dtype when the model is already bf16.
+    entry(
+        "f32",
+        "F32 (32-bit, lossless)",
+        false,
+        Some(32.6),
+        "Not recommended. Retains 100% accuracy, but super slow and memory hungry.",
+        MethodPolicy {
+            default: F32,
+            embd_scheme: F32,
+            rules: &[],
+        },
+    ),
+    entry(
+        "bf16",
+        "BF16 (bfloat16, lossless)",
+        false,
+        Some(16.6),
+        "Bfloat16 - Fastest conversion + retains 100% accuracy. Slow and memory hungry.",
+        MethodPolicy {
+            default: GgufScheme::Bf16,
+            embd_scheme: GgufScheme::Bf16,
+            rules: &[],
+        },
+    ),
+    // 3.3 — iq1_s / iq1_m / iq2_s / iq3_s / iq4_xs: Unsloth
+    // IMATRIX_QUANTS (save.py:176-188). All require an imatrix; the CLI
+    // gate ships with Phase 4.2/4.3 per plan Q5, until then the metadata
+    // marks them and the encoder runs with uniform weights (documented).
+    entry_full(
+        "iq1_s",
+        "IQ1_S (imatrix)",
+        false,
+        Some(1.56),
+        "1.56 bpw. Smallest, lowest quality. Needs an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq1S,
+            embd_scheme: F16,
+            rules: &[],
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    entry_full(
+        "iq1_m",
+        "IQ1_M (imatrix)",
+        false,
+        Some(1.75),
+        "1.75 bpw. Very small. Needs an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq1M,
+            embd_scheme: F16,
+            rules: &[],
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    entry_full(
+        "iq2_s",
+        "IQ2_S (imatrix)",
+        false,
+        Some(2.5),
+        "2.5 bpw. Needs an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq2S,
+            embd_scheme: F16,
+            rules: &[],
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    entry_full(
+        "iq3_s",
+        "IQ3_S (imatrix)",
+        false,
+        Some(3.44),
+        "3.44 bpw. Needs an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq3S,
+            embd_scheme: F16,
+            rules: &[],
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    entry_full(
+        "iq4_xs",
+        "IQ4_XS (imatrix)",
+        false,
+        Some(4.25),
+        "4.25 bpw. Benefits from an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq4Xs,
+            embd_scheme: F16,
+            rules: &[],
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    // 3.7 / 3.8 — llama.cpp-only types (decision Q4: plain list entries,
+    // no gating flag). LLAMA_FTYPE_MOSTLY_TQ1_0/TQ2_0 (llama.h:153-154),
+    // Q1_0/Q2_0 (llama.h:157-158); encoders verified in rlx-gguf dispatch.
+    entry(
+        "tq1_0",
+        "TQ1_0 (ternary 1-bit)",
+        false,
+        Some(1.69),
+        "Ternary quantization for BitNet models (1.58-bit).",
+        MethodPolicy {
+            default: GgufScheme::Tq1_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "tq2_0",
+        "TQ2_0 (ternary 2-bit)",
+        false,
+        Some(2.06),
+        "Ternary 2-bit for BitNet b1.58 models.",
+        MethodPolicy {
+            default: GgufScheme::Tq2_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q1_0",
+        "Q1_0 (1-bit)",
+        false,
+        Some(1.7),
+        "1-bit quantization (llama.cpp only, not in Unsloth's list).",
+        MethodPolicy {
+            default: GgufScheme::Q1_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
+    entry(
+        "q2_0",
+        "Q2_0 (2-bit)",
+        false,
+        Some(2.7),
+        "2-bit quantization (llama.cpp only, not in Unsloth's list).",
+        MethodPolicy {
+            default: GgufScheme::Q2_0,
+            embd_scheme: F16,
+            rules: &[],
+        },
+    ),
     // ── Unsloth Dynamic 2.0 per-layer selective (unsupported natively) ──
     entry(
         "q4_k_xl",
@@ -744,6 +910,84 @@ mod tests {
                 Some(2.31),
                 "Importance quant.",
             ),
+            // ── Phase 3 additions (Unsloth coverage plan) ──
+            (
+                "f32",
+                "F32 (32-bit, lossless)",
+                false,
+                Some(32.6),
+                "Not recommended. Retains 100% accuracy, but super slow and memory hungry.",
+            ),
+            (
+                "bf16",
+                "BF16 (bfloat16, lossless)",
+                false,
+                Some(16.6),
+                "Bfloat16 - Fastest conversion + retains 100% accuracy. Slow and memory hungry.",
+            ),
+            (
+                "iq1_s",
+                "IQ1_S (imatrix)",
+                false,
+                Some(1.56),
+                "1.56 bpw. Smallest, lowest quality. Needs an imatrix.",
+            ),
+            (
+                "iq1_m",
+                "IQ1_M (imatrix)",
+                false,
+                Some(1.75),
+                "1.75 bpw. Very small. Needs an imatrix.",
+            ),
+            (
+                "iq2_s",
+                "IQ2_S (imatrix)",
+                false,
+                Some(2.5),
+                "2.5 bpw. Needs an imatrix.",
+            ),
+            (
+                "iq3_s",
+                "IQ3_S (imatrix)",
+                false,
+                Some(3.44),
+                "3.44 bpw. Needs an imatrix.",
+            ),
+            (
+                "iq4_xs",
+                "IQ4_XS (imatrix)",
+                false,
+                Some(4.25),
+                "4.25 bpw. Benefits from an imatrix.",
+            ),
+            (
+                "tq1_0",
+                "TQ1_0 (ternary 1-bit)",
+                false,
+                Some(1.69),
+                "Ternary quantization for BitNet models (1.58-bit).",
+            ),
+            (
+                "tq2_0",
+                "TQ2_0 (ternary 2-bit)",
+                false,
+                Some(2.06),
+                "Ternary 2-bit for BitNet b1.58 models.",
+            ),
+            (
+                "q1_0",
+                "Q1_0 (1-bit)",
+                false,
+                Some(1.7),
+                "1-bit quantization (llama.cpp only, not in Unsloth's list).",
+            ),
+            (
+                "q2_0",
+                "Q2_0 (2-bit)",
+                false,
+                Some(2.7),
+                "2-bit quantization (llama.cpp only, not in Unsloth's list).",
+            ),
             (
                 "q4_k_xl",
                 "UD-Q4_K_XL (Dynamic 2.0)",
@@ -815,6 +1059,15 @@ mod tests {
                             | GgufScheme::Iq2Xs
                             | GgufScheme::Iq3Xxs
                             | GgufScheme::Iq4Nl
+                            | GgufScheme::Iq1S
+                            | GgufScheme::Iq1M
+                            | GgufScheme::Iq2S
+                            | GgufScheme::Iq3S
+                            | GgufScheme::Iq4Xs
+                            | GgufScheme::Tq1_0
+                            | GgufScheme::Tq2_0
+                            | GgufScheme::Q1_0
+                            | GgufScheme::Q2_0
                     ),
                     "method {} uses scheme {:?} without an rlx-gguf encoder",
                     e.method.id,
