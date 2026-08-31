@@ -40,6 +40,23 @@ pub struct GgufMethod {
     pub approx_bpw: Option<f64>,
     /// Description, verbatim from the reference.
     pub description: &'static str,
+    /// Backend encoder capability (Unsloth plan Phase 0.2).
+    pub support: BackendSupport,
+    /// Whether official Unsloth gates this method behind `imatrix_file=`
+    /// (save.py:2162: every `iq*` id in `IMATRIX_QUANTS`).
+    pub requires_imatrix: bool,
+}
+
+/// What the pinned backend (`rlx-gguf` 0.2.14) can actually do with a
+/// method. A method is only listed as usable when this is `Encodable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendSupport {
+    /// Every scheme the policy can select has an rlx-gguf encoder.
+    Encodable,
+    /// Kept in the registry for honest listing/rejection, but the backend
+    /// has no encoder for at least one scheme the policy would select.
+    /// Carries the reason for the CLI's error message.
+    NoEncoder(&'static str),
 }
 
 /// Storage scheme for one tensor.
@@ -356,7 +373,12 @@ pub static METHODS: &[RegistryEntry] = &[
             rules: RULES_ATTN_V_Q4K,
         },
     ),
-    entry(
+    // The four iq* entries: all are in official Unsloth IMATRIX_QUANTS
+    // (save.py:176-188), so requires_imatrix = true — the metadata records
+    // the Unsloth contract. The CLI gate is deliberately NOT enforced yet:
+    // per plan §6-Q5 it ships together with the weighted quantizers
+    // (Phase 4.3/4.2), otherwise every iq* method becomes unusable today.
+    entry_full(
         "iq4_nl",
         "IQ4_NL (imatrix)",
         false,
@@ -367,8 +389,10 @@ pub static METHODS: &[RegistryEntry] = &[
             embd_scheme: F16,
             rules: &[],
         },
+        BackendSupport::Encodable,
+        true,
     ),
-    entry(
+    entry_full(
         "iq3_xxs",
         "IQ3_XXS (imatrix)",
         false,
@@ -379,8 +403,10 @@ pub static METHODS: &[RegistryEntry] = &[
             embd_scheme: F16,
             rules: &[],
         },
+        BackendSupport::Encodable,
+        true,
     ),
-    entry(
+    entry_full(
         "iq2_xxs",
         "IQ2_XXS (imatrix)",
         false,
@@ -391,8 +417,10 @@ pub static METHODS: &[RegistryEntry] = &[
             embd_scheme: F16,
             rules: &[],
         },
+        BackendSupport::Encodable,
+        true,
     ),
-    entry(
+    entry_full(
         "iq2_xs",
         "IQ2_XS (imatrix)",
         false,
@@ -403,6 +431,8 @@ pub static METHODS: &[RegistryEntry] = &[
             embd_scheme: F16,
             rules: &[],
         },
+        BackendSupport::Encodable,
+        true,
     ),
     // ── Unsloth Dynamic 2.0 per-layer selective (unsupported natively) ──
     entry(
@@ -451,6 +481,30 @@ const fn entry(
     description: &'static str,
     policy: MethodPolicy,
 ) -> RegistryEntry {
+    entry_full(
+        id,
+        label,
+        dynamic_v2,
+        approx_bpw,
+        description,
+        policy,
+        BackendSupport::Encodable,
+        false,
+    )
+}
+
+/// Full constructor with explicit capability metadata (Phase 0.2).
+#[allow(clippy::too_many_arguments)] // data-driven table constructor
+const fn entry_full(
+    id: &'static str,
+    label: &'static str,
+    dynamic_v2: bool,
+    approx_bpw: Option<f64>,
+    description: &'static str,
+    policy: MethodPolicy,
+    support: BackendSupport,
+    requires_imatrix: bool,
+) -> RegistryEntry {
     RegistryEntry {
         method: GgufMethod {
             id,
@@ -458,6 +512,8 @@ const fn entry(
             dynamic_v2,
             approx_bpw,
             description,
+            support,
+            requires_imatrix,
         },
         policy,
     }
@@ -475,6 +531,32 @@ pub fn supported_ids() -> Vec<&'static str> {
         .filter(|e| !e.method.dynamic_v2)
         .map(|e| e.method.id)
         .collect()
+}
+
+/// Ids a conversion can actually run with today: non-dynamic AND every
+/// scheme the policy selects has a backend encoder. This — not
+/// [`supported_ids`] — is what `--list-methods` advertises as runnable
+/// and what the unknown-method error should suggest once the first
+/// `NoEncoder` entry lands (Unsloth plan Phase 2.1).
+pub fn usable_ids() -> Vec<&'static str> {
+    METHODS
+        .iter()
+        .filter(|e| !e.method.dynamic_v2 && e.method.support == BackendSupport::Encodable)
+        .map(|e| e.method.id)
+        .collect()
+}
+
+/// Whether a conversion attempt with `id` would fail before any tensor is
+/// encoded, and why (dynamic_v2 proprietary, or missing backend encoder).
+pub fn rejection_reason(id: &str) -> Option<&'static str> {
+    let e = get_method(id)?;
+    if e.method.dynamic_v2 {
+        return Some("Unsloth Dynamic 2.0 per-layer variant (proprietary)");
+    }
+    match e.method.support {
+        BackendSupport::NoEncoder(reason) => Some(reason),
+        BackendSupport::Encodable => None,
+    }
 }
 
 /// All Dynamic 2.0 ids (listed by the CLI, rejected at conversion time).
@@ -768,6 +850,74 @@ mod tests {
         }
         assert_eq!(get_method("q4_1").unwrap().policy.default, GgufScheme::Q4_1);
         assert_eq!(get_method("q5_1").unwrap().policy.default, GgufScheme::Q5_1);
+    }
+
+    #[test]
+    fn every_method_declares_support() {
+        // Phase 0.2: every entry carries explicit capability metadata, and
+        // today's NoEncoder set is EMPTY — the 2026-08-31 plan removed the
+        // last wrongly-assumed members (iq2_m/iq3_m are policy variants,
+        // not missing encoders; they don't exist in this registry yet).
+        // When Phase 3 adds iq2_m/iq3_m as usable entries, this assertion
+        // stays empty-set; if someone adds a NoEncoder method, they must
+        // update this test deliberately.
+        let no_encoder: Vec<&str> = METHODS
+            .iter()
+            .filter(|e| matches!(e.method.support, BackendSupport::NoEncoder(_)))
+            .map(|e| e.method.id)
+            .collect();
+        assert_eq!(no_encoder, Vec::<&str>::new());
+        for e in METHODS {
+            assert!(
+                matches!(
+                    e.method.support,
+                    BackendSupport::Encodable | BackendSupport::NoEncoder(_)
+                ),
+                "{}: support must be declared",
+                e.method.id
+            );
+        }
+    }
+
+    #[test]
+    fn usable_ids_equals_supported_ids_while_all_encodable() {
+        // Today every non-dynamic entry is encodable, so the two lists agree.
+        // The moment a NoEncoder entry lands (plan Phase 2.1), this test
+        // must be replaced by an explicit delta assertion.
+        assert_eq!(usable_ids(), supported_ids());
+        assert_eq!(usable_ids().len(), METHODS.len() - 4);
+    }
+
+    #[test]
+    fn rejection_reason_matches_dynamic_and_encoder_gaps() {
+        assert_eq!(
+            rejection_reason("q4_k_xl"),
+            Some("Unsloth Dynamic 2.0 per-layer variant (proprietary)")
+        );
+        assert_eq!(
+            rejection_reason("q4_nl"),
+            Some("Unsloth Dynamic 2.0 per-layer variant (proprietary)")
+        );
+        // q4_1/q5_1: reclassified in Phase 1 — must NOT be rejected.
+        assert_eq!(rejection_reason("q4_1"), None);
+        assert_eq!(rejection_reason("q5_1"), None);
+        assert_eq!(rejection_reason("q4_k_m"), None);
+        assert_eq!(rejection_reason("bogus"), None); // unknown → unknown-method path
+    }
+
+    #[test]
+    fn requires_imatrix_matches_iq_prefix() {
+        // Unsloth's gate (save.py:2162) is exactly "id in IMATRIX_QUANTS",
+        // and every IMATRIX_QUANTS key starts with "iq". Phase 4.2 will
+        // enforce the CLI gate; this test pins the metadata contract.
+        for e in METHODS {
+            assert_eq!(
+                e.method.requires_imatrix,
+                e.method.id.starts_with("iq"),
+                "{}: requires_imatrix must match the iq* prefix rule",
+                e.method.id
+            );
+        }
     }
 
     #[test]
