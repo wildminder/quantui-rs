@@ -415,6 +415,22 @@ pub static METHODS: &[RegistryEntry] = &[
             engine: LlamaPolicy::Q2K,
         },
     ),
+    // q2_k_l — Unsloth preset, not a native llama.cpp ftype (plan §3-C):
+    // Unsloth runs llama-quantize with q2_k --output-tensor-type q8_0
+    // --token-embedding-type q8_0 (ref/unsloth/unsloth/save.py:377-395).
+    entry(
+        "q2_k_l",
+        "Q2_K_L (2-bit large)",
+        false,
+        Some(3.0),
+        "Q2_K_L with q8_0 output/token embeddings for higher quality than plain Q2_K.",
+        MethodPolicy {
+            default: Q2K,
+            embd_scheme: GgufScheme::Q8_0,
+            rules: RULES_ATTN_V_Q4K,
+            engine: LlamaPolicy::Q2KL,
+        },
+    ),
     // The four iq* entries: all are in official Unsloth IMATRIX_QUANTS
     // (save.py:176-188), so requires_imatrix = true — the metadata records
     // the Unsloth contract. The CLI gate is deliberately NOT enforced yet:
@@ -431,6 +447,40 @@ pub static METHODS: &[RegistryEntry] = &[
             embd_scheme: F16,
             rules: &[],
             engine: LlamaPolicy::Flat,
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    // iq2_m / iq3_m — policy variants, NOT missing encoders (plan §3-D
+    // correction): llama.cpp resolves the ftypes to IQ2_S / IQ3_S with a
+    // different per-tensor policy (llama-quant.cpp:858,870). Both are in
+    // official Unsloth IMATRIX_QUANTS (save.py:184,187) — 2.7 / 3.66 bpw.
+    entry_full(
+        "iq2_m",
+        "IQ2_M (imatrix)",
+        false,
+        Some(2.7),
+        "2.7 bpw. Needs an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq2S,
+            embd_scheme: F16,
+            rules: &[],
+            engine: LlamaPolicy::Iq2M,
+        },
+        BackendSupport::Encodable,
+        true,
+    ),
+    entry_full(
+        "iq3_m",
+        "IQ3_M (imatrix)",
+        false,
+        Some(3.66),
+        "3.66 bpw quantization mix. Needs an imatrix.",
+        MethodPolicy {
+            default: GgufScheme::Iq3S,
+            embd_scheme: F16,
+            rules: &[],
+            engine: LlamaPolicy::Iq3M,
         },
         BackendSupport::Encodable,
         true,
@@ -933,11 +983,32 @@ mod tests {
                 "2-bit. Q4_K for key tensors.",
             ),
             (
+                "q2_k_l",
+                "Q2_K_L (2-bit large)",
+                false,
+                Some(3.0),
+                "Q2_K_L with q8_0 output/token embeddings for higher quality than plain Q2_K.",
+            ),
+            (
                 "iq4_nl",
                 "IQ4_NL (imatrix)",
                 false,
                 Some(4.5),
                 "Importance-matrix 4-bit (needs an imatrix file).",
+            ),
+            (
+                "iq2_m",
+                "IQ2_M (imatrix)",
+                false,
+                Some(2.7),
+                "2.7 bpw. Needs an imatrix.",
+            ),
+            (
+                "iq3_m",
+                "IQ3_M (imatrix)",
+                false,
+                Some(3.66),
+                "3.66 bpw quantization mix. Needs an imatrix.",
             ),
             (
                 "iq3_xxs",

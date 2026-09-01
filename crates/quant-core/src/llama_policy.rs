@@ -171,6 +171,18 @@ pub enum LlamaPolicy {
     /// `q2_k_l` (Unsloth preset, save.py:377): Q2_K base + output AND
     /// token-embedding forced to Q8_0.
     Q2KL,
+    /// `iq2_m` (ftype :29 → GGML_TYPE_IQ2_S, llama-quant.cpp:858).
+    /// Rules (:509-531, :500, :472): attn_v → IQ3_S when n_gqa<4 (else
+    /// Q4_K when n_gqa>=4 or n_expert>=4); ffn_down first n/8 → IQ3_S;
+    /// tok_embd → IQ3_S; output → Q5_K; base IQ2_S.
+    Iq2M,
+    /// `iq3_m` (ftype :27 → GGML_TYPE_IQ3_S, llama-quant.cpp:870).
+    /// Rules (:547, :605-608, :649): attn_v → Q4_K always; ffn_down first
+    /// n/8 (or use_more_bits for 8-expert) → Q4_K; attn_output → Q4_K;
+    /// tok_embd → base IQ3_S (falls through :495-508); output → Q6_K
+    /// (via the generic :474-476 rule — IQ3_M is not in the Q5_K list);
+    /// base IQ3_S.
+    Iq3M,
 }
 
 /// Resolve the scheme for one tensor under a composite policy.
@@ -267,6 +279,61 @@ pub fn resolve(policy: &LlamaPolicy, ctx: &PolicyCtx<'_>) -> GgufScheme {
                 Output | TokenEmbd => S::Q8_0,
                 _ if ctx.ndim < 2 => S::F32,
                 _ => resolve(&LlamaPolicy::Q2K, ctx),
+            }
+        }
+        LlamaPolicy::Iq2M => {
+            // Base IQ2_S (ftype :29 → IQ2_S, :858).
+            if ctx.ndim < 2 {
+                return S::F32;
+            }
+            match ctx.category {
+                // :469-472 — IQ2_M output → Q5_K.
+                Output => S::Q5K,
+                // :499-501 — IQ2_M tok_embd → IQ3_S.
+                TokenEmbd => S::Iq3S,
+                cat if category_is_attn_v(cat) => {
+                    // :511-514 — n_gqa>=4 || n_expert>=4 → Q4_K, else IQ3_S.
+                    if ctx.facts.n_gqa >= 4 || ctx.facts.n_expert >= 4 {
+                        S::Q4K
+                    } else {
+                        S::Iq3S
+                    }
+                }
+                FfnDown => {
+                    // :519-522 — first n/8 of ffn_down → IQ3_S, else base.
+                    if ctx.state.i_ffn_down < ctx.state.n_ffn_down / 8 {
+                        S::Iq3S
+                    } else {
+                        S::Iq2S
+                    }
+                }
+                _ => S::Iq2S,
+            }
+        }
+        LlamaPolicy::Iq3M => {
+            // Base IQ3_S (ftype :27 → IQ3_S, :870).
+            if ctx.ndim < 2 {
+                return S::F32;
+            }
+            match ctx.category {
+                // :474-476 — IQ3_M is not in the Q5_K list → generic Q6_K.
+                Output => S::Q6K,
+                // :495-508 — IQ3_M is not in any tok_embd branch → base.
+                TokenEmbd => S::Iq3S,
+                cat if category_is_attn_v(cat) => S::Q4K, // :546-548
+                FfnDown => {
+                    // :605-608 — first n/8 (or 8-expert use_more_bits) → Q4_K.
+                    let first8 = ctx.state.i_ffn_down < ctx.state.n_ffn_down / 8;
+                    let expert8 = ctx.facts.n_expert == 8
+                        && use_more_bits(ctx.state.i_ffn_down, ctx.state.n_ffn_down);
+                    if first8 || expert8 {
+                        S::Q4K
+                    } else {
+                        S::Iq3S
+                    }
+                }
+                AttentionOutput => S::Q4K, // :649 (non-8-expert branch)
+                _ => S::Iq3S,
             }
         }
     }
@@ -623,6 +690,159 @@ mod tests {
                 &mk_ctx("blk.0.attn_q.weight", 2, &st, facts)
             ),
             crate::gguf_registry::GgufScheme::Q3K
+        );
+    }
+
+    // ─── Iq2M / Iq3M: the ftype-resolved policy variants ───────────
+
+    #[test]
+    fn iq2m_rules() {
+        let facts_no_gqa = ModelFacts {
+            n_gqa: 1,
+            ..Default::default()
+        };
+        let facts_gqa = ModelFacts {
+            n_gqa: 4,
+            ..Default::default()
+        };
+        // 8 ffn_down: first n/8 = 1 gets IQ3_S, the rest base IQ2_S.
+        let st8 = PolicyState {
+            n_ffn_down: 8,
+            ..Default::default()
+        };
+        // attn_v: n_gqa<4 → IQ3_S (:513); n_gqa>=4 → Q4_K (:512).
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("blk.0.attn_v.weight", 2, &st8, facts_no_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Iq3S
+        );
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("blk.0.attn_v.weight", 2, &st8, facts_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Q4K
+        );
+        // output → Q5_K (:469-472); tok_embd → IQ3_S (:499-501).
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("output.weight", 2, &st8, facts_no_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Q5K
+        );
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("token_embd.weight", 2, &st8, facts_no_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Iq3S
+        );
+        // ffn_down i=0 (<8/8=1) → IQ3_S; i=2 → base IQ2_S.
+        let st_i0 = PolicyState {
+            n_ffn_down: 8,
+            i_ffn_down: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("blk.0.ffn_down.weight", 2, &st_i0, facts_no_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Iq3S
+        );
+        let st_i2 = PolicyState {
+            n_ffn_down: 8,
+            i_ffn_down: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("blk.2.ffn_down.weight", 2, &st_i2, facts_no_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Iq2S
+        );
+        // Plain 2-D → base IQ2_S.
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq2M,
+                &mk_ctx("blk.0.attn_q.weight", 2, &st8, facts_no_gqa)
+            ),
+            crate::gguf_registry::GgufScheme::Iq2S
+        );
+    }
+
+    #[test]
+    fn iq3m_rules() {
+        let facts = ModelFacts::default();
+        let st8 = PolicyState {
+            n_ffn_down: 8,
+            ..Default::default()
+        };
+        // attn_v → Q4_K always (:546-548).
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq3M,
+                &mk_ctx("blk.0.attn_v.weight", 2, &st8, facts)
+            ),
+            crate::gguf_registry::GgufScheme::Q4K
+        );
+        // attn_output → Q4_K (:649).
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq3M,
+                &mk_ctx("blk.0.attn_output.weight", 2, &st8, facts)
+            ),
+            crate::gguf_registry::GgufScheme::Q4K
+        );
+        // output → Q6_K (:474-476, IQ3_M not in the Q5_K list).
+        assert_eq!(
+            resolve(&LlamaPolicy::Iq3M, &mk_ctx("output.weight", 2, &st8, facts)),
+            crate::gguf_registry::GgufScheme::Q6K
+        );
+        // tok_embd → base IQ3_S (no :499-508 branch matches IQ3_M).
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq3M,
+                &mk_ctx("token_embd.weight", 2, &st8, facts)
+            ),
+            crate::gguf_registry::GgufScheme::Iq3S
+        );
+        // ffn_down i=0 (<1) → Q4_K; i=2 → base IQ3_S.
+        let st_i0 = PolicyState {
+            n_ffn_down: 8,
+            i_ffn_down: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq3M,
+                &mk_ctx("blk.0.ffn_down.weight", 2, &st_i0, facts)
+            ),
+            crate::gguf_registry::GgufScheme::Q4K
+        );
+        let st_i2 = PolicyState {
+            n_ffn_down: 8,
+            i_ffn_down: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq3M,
+                &mk_ctx("blk.2.ffn_down.weight", 2, &st_i2, facts)
+            ),
+            crate::gguf_registry::GgufScheme::Iq3S
+        );
+        // Plain 2-D → base IQ3_S.
+        assert_eq!(
+            resolve(
+                &LlamaPolicy::Iq3M,
+                &mk_ctx("blk.0.attn_q.weight", 2, &st8, facts)
+            ),
+            crate::gguf_registry::GgufScheme::Iq3S
         );
     }
 

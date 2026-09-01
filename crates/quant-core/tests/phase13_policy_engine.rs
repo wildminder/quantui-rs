@@ -221,7 +221,9 @@ fn q2_k_e2e_gqa_branch_is_live() {
 /// on a synthetic name stream (guard against registry/engine drift).
 #[test]
 fn registry_composite_methods_are_engine_wired() {
-    for id in ["q4_k_m", "q5_k_m", "q2_k", "q3_k_m", "q3_k_l"] {
+    for id in [
+        "q4_k_m", "q5_k_m", "q2_k", "q2_k_l", "q3_k_m", "q3_k_l", "iq2_m", "iq3_m",
+    ] {
         let e = gguf_registry::get_method(id).unwrap();
         assert_ne!(
             e.policy.engine,
@@ -240,4 +242,83 @@ fn registry_composite_methods_are_engine_wired() {
             "{id}: simple method must stay on the flat engine"
         );
     }
+}
+
+/// q2_k_l (Unsloth preset, save.py:377): output AND token embeddings
+/// forced to Q8_0 — visible in real output dtypes, unlike every other
+/// method's embd convention.
+#[test]
+fn q2_k_l_e2e_forces_q8_embeddings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let mut tensors = Vec::new();
+    tensors.push(Tensor {
+        name: "model.embed_tokens.weight".to_string(),
+        dtype: "BF16",
+        shape: vec![64, L as u64],
+        bytes: bf16_bytes(&synth(64 * L, 5)),
+    });
+    for l in 0..8 {
+        tensors.push(Tensor {
+            name: format!("model.layers.{l}.self_attn.q_proj.weight"),
+            dtype: "BF16",
+            shape: vec![L as u64, L as u64],
+            bytes: bf16_bytes(&synth(L * L, 100 + l)),
+        });
+        tensors.push(Tensor {
+            name: format!("model.layers.{l}.mlp.down_proj.weight"),
+            dtype: "BF16",
+            shape: vec![L as u64, L as u64],
+            bytes: bf16_bytes(&synth(L * L, 300 + l)),
+        });
+    }
+    tensors.push(Tensor {
+        name: "lm_head.weight".to_string(),
+        dtype: "BF16",
+        shape: vec![64, L as u64],
+        bytes: bf16_bytes(&synth(64 * L, 6)),
+    });
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": L,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "vocab_size": 64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (report, out) = convert(&model_dir, "q2_k_l");
+    assert_eq!(report.fallback_f16, 0);
+
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    // Both embeddings forced to Q8_0 (Unsloth save.py:377-395).
+    assert_eq!(
+        f.tensors.get("token_embd.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q8_0,
+        "q2_k_l: token_embd must be Q8_0"
+    );
+    assert_eq!(
+        f.tensors.get("output.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q8_0,
+        "q2_k_l: output must be Q8_0"
+    );
+    // Body follows q2_k's rules: ffn_down → Q3_K (:593).
+    assert_eq!(
+        f.tensors.get("blk.0.ffn_down.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q3K,
+        "q2_k_l: ffn_down follows q2_k base rules"
+    );
 }

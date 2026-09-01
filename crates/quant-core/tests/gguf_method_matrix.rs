@@ -264,10 +264,11 @@ fn usable_ids_snapshot() {
     assert_eq!(
         gguf_registry::usable_ids(),
         vec![
-            // ── original reference order (q4_1/q5_1 unblocked in Phase 1) ──
+            // ── original reference order (q4_1/q5_1 unblocked in Phase 1;
+            //    q2_k_l / iq2_m / iq3_m added by Phase 3.2/3.5) ──
             "f16", "q8_0", "q6_k", "q5_k_m", "q5_k_s", "q5_0", "q5_1", "q4_k_m", "q4_k_s", "q4_0",
-            "q4_1", "q3_k_m", "q3_k_l", "q3_k_s", "q3_k_xs", "q2_k", "iq4_nl", "iq3_xxs",
-            "iq2_xxs", "iq2_xs",
+            "q4_1", "q3_k_m", "q3_k_l", "q3_k_s", "q3_k_xs", "q2_k", "q2_k_l", "iq4_nl", "iq2_m",
+            "iq3_m", "iq3_xxs", "iq2_xxs", "iq2_xs",
             // ── Phase 3 additions (Unsloth coverage plan) ──
             "f32", "bf16", "iq1_s", "iq1_m", "iq2_s", "iq3_s", "iq4_xs", "tq1_0", "tq2_0", "q1_0",
             "q2_0",
@@ -301,8 +302,8 @@ fn round_trip_tolerance(id: &str) -> f32 {
         // (measured) — only the sign survives, by design.
         "q1_0" | "q2_0" => 0.3,
         // K-quants.
-        "q2_k" | "q3_k_m" | "q3_k_l" | "q3_k_s" | "q3_k_xs" | "q4_k_m" | "q4_k_s" | "q5_k_m"
-        | "q5_k_s" | "q6_k" => 0.15,
+        "q2_k" | "q2_k_l" | "q3_k_m" | "q3_k_l" | "q3_k_s" | "q3_k_xs" | "q4_k_m" | "q4_k_s"
+        | "q5_k_m" | "q5_k_s" | "q6_k" => 0.15,
         // IQ 4 bit: fine.
         "iq4_nl" | "iq4_xs" => 0.2,
         // IQ 2-3 bit: the lattice families (IQ2*, IQ3*) reconstruct
@@ -311,7 +312,7 @@ fn round_trip_tolerance(id: &str) -> f32 {
         // iq3_xxs 0.45, iq3_s 0.50, iq2_* similar — grouped at 0.55 with
         // headroom; the test's job is catching garbage, not grading
         // quality.
-        "iq2_xxs" | "iq2_xs" | "iq2_s" | "iq3_xxs" | "iq3_s" => 0.55,
+        "iq2_xxs" | "iq2_xs" | "iq2_s" | "iq2_m" | "iq3_xxs" | "iq3_s" | "iq3_m" => 0.55,
         // IQ ~1.5 bit: barely above noise — bound loose, the point is
         // "not garbage", e.g. mean error 10x smaller than the data range.
         "iq1_s" | "iq1_m" => 0.5,
