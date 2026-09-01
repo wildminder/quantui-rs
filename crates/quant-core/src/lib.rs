@@ -18,6 +18,7 @@ pub mod bias_correction;
 pub mod discover;
 pub mod gguf_convert;
 pub mod gguf_registry;
+pub mod imatrix;
 pub mod llama_policy;
 pub mod st_io;
 pub mod torch_rng;
