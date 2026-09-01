@@ -28,7 +28,7 @@ use rlx_gguf::{quantize, GgmlType, GgufWriter, MetaValue};
 use crate::discover::{classify_input, resolve_union, InputKind};
 use crate::dtype::DType;
 use crate::gguf_registry::{self, GgufScheme};
-use crate::st_io::reader::SafetensorsReader;
+use crate::{llama_policy, st_io::reader::SafetensorsReader};
 
 /// Errors from GGUF conversion.
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +149,33 @@ pub fn convert_hf_to_gguf(
         w.set_meta(k, v);
     }
 
+    // 5.5 Phase 3.0: for composite methods, pre-compute the llama.cpp
+    // policy state (attn-v / ffn-down counters) and the model facts the
+    // policy tree consults (n_gqa from head counts, n_expert absent in
+    // dense configs = 1).
+    let engine = entry.policy.engine;
+    let mut policy_state = if engine == llama_policy::LlamaPolicy::Flat {
+        None
+    } else {
+        // Count over the GGUF-side names, in processing order.
+        let gguf_names: Vec<String> = names
+            .iter()
+            .map(|(n, _)| hf_to_gguf_name(n).unwrap_or_else(|| n.clone()))
+            .collect();
+        let refs: Vec<&str> = gguf_names.iter().map(|s| s.as_str()).collect();
+        Some(llama_policy::count_state(&refs, false))
+    };
+    let model_facts = llama_policy::ModelFacts {
+        // n_gqa = head_count / head_count_kv (llama.cpp n_gqa()); defaults
+        // to 1 (no GQA) when config.json lacks the keys.
+        n_gqa: match (arch_info.head_count, arch_info.head_count_kv) {
+            (Some(h), Some(kv)) if kv > 0 => (h / kv) as i32,
+            _ => 1,
+        },
+        n_expert: 1, // dense configs; MoE support follows with Phase 3.5.
+        is_70b_type: false,
+    };
+
     // 6. Encode each tensor.
     let mut quantized = 0usize;
     let mut fallback_f16 = 0usize;
@@ -161,7 +188,25 @@ pub fn convert_hf_to_gguf(
         let ndim = info.shape.len();
 
         let gguf_name = hf_to_gguf_name(name).unwrap_or_else(|| name.clone());
-        let scheme = gguf_registry::scheme_for(entry, &gguf_name, ndim);
+        // Phase 3.0: composite methods resolve through the llama.cpp
+        // policy engine (categories + counters + use_more_bits); simple
+        // methods keep the flat registry engine.
+        let scheme = match (&mut policy_state, engine) {
+            (Some(state), _) => {
+                let cat = llama_policy::tensor_get_category(&gguf_name);
+                let ctx = llama_policy::PolicyCtx {
+                    name: &gguf_name,
+                    ndim,
+                    category: cat,
+                    facts: model_facts,
+                    state,
+                };
+                let s = llama_policy::resolve(&engine, &ctx);
+                llama_policy::advance(state, cat);
+                s
+            }
+            (None, _) => gguf_registry::scheme_for(entry, &gguf_name, ndim),
+        };
         let ggml = scheme_to_ggml(scheme);
 
         // Decode to f32 (GGUF encoders consume f32).

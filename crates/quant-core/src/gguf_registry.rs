@@ -116,6 +116,13 @@ pub struct MethodPolicy {
     pub embd_scheme: GgufScheme,
     /// First-match-wins (GGUF-name substring, scheme) overrides.
     pub rules: &'static [(&'static str, GgufScheme)],
+    /// Which engine drives per-tensor resolution (Unsloth plan Phase 3.0).
+    /// `Flat` (the default) = the legacy name-substring rules above, used
+    /// by every simple method. The composite methods route through
+    /// [`crate::llama_policy`], which ports llama.cpp's category/counter/
+    /// use_more_bits tree — when set, `rules` above is ignored and
+    /// `default`/`embd_scheme` serve as documentation of the base scheme.
+    pub engine: LlamaPolicy,
 }
 
 /// Registry entry: method metadata + its per-tensor policy.
@@ -124,6 +131,8 @@ pub struct RegistryEntry {
     pub method: GgufMethod,
     pub policy: MethodPolicy,
 }
+
+use crate::llama_policy::LlamaPolicy;
 
 // ─── policy fragments (llama.cpp `llama-quantize` ports) ────────────
 
@@ -175,6 +184,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: F16,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -187,6 +197,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q8_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -199,6 +210,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q6K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -211,6 +223,10 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q5K,
             embd_scheme: F16,
             rules: RULES_Q5_K_M,
+            engine: LlamaPolicy::KMoreBits {
+                base: Q5K,
+                more: Q6K,
+            },
         },
     ),
     entry(
@@ -223,6 +239,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q5K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -235,6 +252,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q5_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     // NOTE: the ported reference `docs/ref/quantui/quant_methods.py:131`
@@ -256,6 +274,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q5_1,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -268,6 +287,10 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q4K,
             embd_scheme: F16,
             rules: RULES_Q4_K_M,
+            engine: LlamaPolicy::KMoreBits {
+                base: Q4K,
+                more: Q6K,
+            },
         },
     ),
     entry(
@@ -280,6 +303,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q4K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -292,6 +316,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q4_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     // See the q5_1 note: the ported reference (`quant_methods.py:124`) is
@@ -309,6 +334,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q4_1,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -321,6 +347,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq4Nl,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -333,6 +360,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q3K,
             embd_scheme: F16,
             rules: RULES_Q3_K_M,
+            engine: LlamaPolicy::Q3KM,
         },
     ),
     entry(
@@ -345,6 +373,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q3K,
             embd_scheme: F16,
             rules: RULES_Q3_K_L,
+            engine: LlamaPolicy::Q3KL,
         },
     ),
     entry(
@@ -357,6 +386,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q3K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -369,6 +399,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q3K,
             embd_scheme: F16,
             rules: RULES_ATTN_V_Q4K,
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -381,6 +412,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q2K,
             embd_scheme: F16,
             rules: RULES_ATTN_V_Q4K,
+            engine: LlamaPolicy::Q2K,
         },
     ),
     // The four iq* entries: all are in official Unsloth IMATRIX_QUANTS
@@ -398,6 +430,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq4Nl,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -412,6 +445,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq3Xxs,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -426,6 +460,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq2Xxs,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -440,6 +475,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq2Xs,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -461,6 +497,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: F32,
             embd_scheme: F32,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -473,6 +510,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Bf16,
             embd_scheme: GgufScheme::Bf16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     // 3.3 — iq1_s / iq1_m / iq2_s / iq3_s / iq4_xs: Unsloth
@@ -489,6 +527,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq1S,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -503,6 +542,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq1M,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -517,6 +557,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq2S,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -531,6 +572,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq3S,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -545,6 +587,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Iq4Xs,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
         BackendSupport::Encodable,
         true,
@@ -562,6 +605,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Tq1_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -574,6 +618,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Tq2_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -586,6 +631,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q1_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -598,6 +644,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: GgufScheme::Q2_0,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     // ── Unsloth Dynamic 2.0 per-layer selective (unsupported natively) ──
@@ -611,6 +658,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q4K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -623,6 +671,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q3K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
     entry(
@@ -635,6 +684,7 @@ pub static METHODS: &[RegistryEntry] = &[
             default: Q2K,
             embd_scheme: F16,
             rules: &[],
+            engine: LlamaPolicy::Flat,
         },
     ),
 ];
