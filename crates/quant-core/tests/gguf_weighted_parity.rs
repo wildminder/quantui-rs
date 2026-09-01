@@ -2,13 +2,13 @@
 //!
 //! Goldens in tests/golden/llamacpp/ were produced by the REAL
 //! `llama-quantize` (built from docs/ref/llama.cpp by
-//! tools/build_llamacpp.sh) running Q4_K / Q2_K with `--imatrix` on a
-//! deterministic 2x256 F32 fixture and a matching imatrix
-//! (tools/gen_golden_llamacpp_weighted.py, seeds 42/7).
+//! tools/build_llamacpp.sh) running Q4_K / Q2_K / Q3_K / Q5_K / Q6_K
+//! with `--imatrix` on a deterministic 2x256 F32 fixture and a matching
+//! imatrix (tools/gen_golden_llamacpp_weighted.py, seeds 42/7).
 //!
 //! This is the strongest parity tier we have: our
-//! `quantize_row_q{4,2}_k_weighted` must reproduce llama.cpp's weighted
-//! output BYTE-FOR-BYTE.
+//! `quantize_row_q{4,2,3,5,6}_k_weighted` must reproduce llama.cpp's
+//! weighted output BYTE-FOR-BYTE.
 //!
 //! Calling convention (llama.cpp quantize_q4_K, ggml-quants.c:1626-1640):
 //! the tensor is quantized ROW BY ROW, each row getting the SAME weight
@@ -20,7 +20,9 @@
 use std::path::PathBuf;
 
 use quant_core::gguf_quants::{
-    quantize_row_q2_k_weighted, quantize_row_q4_k_weighted, Q2_K_BLOCK_BYTES, Q4_K_BLOCK_BYTES,
+    quantize_row_q2_k_weighted, quantize_row_q3_k_weighted, quantize_row_q4_k_weighted,
+    quantize_row_q5_k_weighted, quantize_row_q6_k_weighted, Q2_K_BLOCK_BYTES, Q3_K_BLOCK_BYTES,
+    Q4_K_BLOCK_BYTES, Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
 };
 
 const QK_K: usize = 256;
@@ -96,5 +98,57 @@ fn weighted_q2_k_byte_exact_vs_llama_quantize() {
     assert_eq!(
         ours, golden,
         "weighted Q2_K bytes differ from llama-quantize"
+    );
+}
+
+/// Shared driver for the three slice-2 formats whose goldens carry the
+/// writer's 32-byte alignment padding after the true payload.
+fn padded_parity_case(golden_name: &str, per_row: RowQuantFn, block_bytes: usize, what: &str) {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join(golden_name)).unwrap();
+    assert!(
+        raw.len() >= N_ROWS * block_bytes,
+        "{golden_name}: golden too small: {} < {}",
+        raw.len(),
+        N_ROWS * block_bytes
+    );
+    let golden = &raw[..N_ROWS * block_bytes];
+
+    let ours = quantize_tensor_per_row(&src, &weights, per_row, block_bytes);
+    assert_eq!(ours.len(), N_ROWS * block_bytes);
+    assert_eq!(
+        ours, golden,
+        "weighted {what} bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_q3_k_byte_exact_vs_llama_quantize() {
+    padded_parity_case(
+        "weighted.q3_k.bin",
+        quantize_row_q3_k_weighted,
+        Q3_K_BLOCK_BYTES,
+        "Q3_K",
+    );
+}
+
+#[test]
+fn weighted_q5_k_byte_exact_vs_llama_quantize() {
+    padded_parity_case(
+        "weighted.q5_k.bin",
+        quantize_row_q5_k_weighted,
+        Q5_K_BLOCK_BYTES,
+        "Q5_K",
+    );
+}
+
+#[test]
+fn weighted_q6_k_byte_exact_vs_llama_quantize() {
+    padded_parity_case(
+        "weighted.q6_k.bin",
+        quantize_row_q6_k_weighted,
+        Q6_K_BLOCK_BYTES,
+        "Q6_K",
     );
 }

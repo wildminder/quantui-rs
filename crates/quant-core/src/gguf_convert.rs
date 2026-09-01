@@ -65,10 +65,10 @@ pub struct GgufConvertConfig {
     /// `general.name` metadata; else derived from the input base name.
     pub name: Option<String>,
     /// Importance matrix for the weighted K-quant path (Phase 4.4).
-    /// When present and the method's scheme resolves to Q4_K/Q2_K for a
-    /// tensor, that tensor is quantized with the ported llama.cpp
-    /// weighted encoders (byte-parity tier); every other scheme keeps
-    /// using rlx-gguf as before.
+    /// When present and the method's scheme resolves to Q4_K/Q2_K/
+    /// Q3_K/Q5_K/Q6_K for a tensor, that tensor is quantized with the
+    /// ported llama.cpp weighted encoders (byte-parity tier); every other
+    /// scheme keeps using rlx-gguf as before.
     pub imatrix: Option<crate::imatrix::Imatrix>,
 }
 
@@ -225,18 +225,22 @@ pub fn convert_hf_to_gguf(
 
         // Phase 4.4: weighted path. When an imatrix is configured AND it
         // carries this tensor AND the scheme is one of the ported weighted
-        // encoders (Q4_K / Q2_K — byte-parity tier vs llama-quantize),
-        // quantize row by row with the shared per-tensor weight vector,
-        // exactly as llama.cpp does (llama-quant.cpp:1260-1276 drives
-        // ggml_quantize_chunk per slab; ggml-quants.c:1626-1640 advances
-        // src per row while quant_weights stays at the entry base).
+        // encoders (Q4_K / Q2_K / Q3_K / Q5_K / Q6_K — byte-parity tier vs
+        // llama-quantize), quantize row by row with the shared per-tensor
+        // weight vector, exactly as llama.cpp does (llama-quant.cpp:1260-1276
+        // drives ggml_quantize_chunk per slab; ggml-quants.c:1626-1640
+        // advances src per row while quant_weights stays at the entry base).
         let weights = cfg
             .imatrix
             .as_ref()
             .and_then(|im| im.weights_for(&gguf_name));
         let weighted = matches!(
             (scheme, weights),
-            (GgufScheme::Q4K, Some(_)) | (GgufScheme::Q2K, Some(_))
+            (GgufScheme::Q4K, Some(_))
+                | (GgufScheme::Q2K, Some(_))
+                | (GgufScheme::Q3K, Some(_))
+                | (GgufScheme::Q5K, Some(_))
+                | (GgufScheme::Q6K, Some(_))
         );
         if weighted {
             let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
@@ -257,6 +261,15 @@ pub fn convert_hf_to_gguf(
                 let bytes = match scheme {
                     GgufScheme::Q4K => {
                         gguf_quants::quantize_row_q4_k_weighted(row, n_per_row, Some(wv))
+                    }
+                    GgufScheme::Q3K => {
+                        gguf_quants::quantize_row_q3_k_weighted(row, n_per_row, Some(wv))
+                    }
+                    GgufScheme::Q5K => {
+                        gguf_quants::quantize_row_q5_k_weighted(row, n_per_row, Some(wv))
+                    }
+                    GgufScheme::Q6K => {
+                        gguf_quants::quantize_row_q6_k_weighted(row, n_per_row, Some(wv))
                     }
                     _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
                 };

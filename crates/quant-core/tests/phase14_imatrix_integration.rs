@@ -3,10 +3,12 @@
 //!
 //! Proves the driver wiring end-to-end: given the same f32 source and the
 //! same per-tensor weights that produced tests/golden/llamacpp/, a
-//! conversion with `imatrix: Some(...)` and method q4_k_s (Q4K body
-//! scheme, flat policy) must emit tensor bytes byte-identical to
-//! llama-quantize's --imatrix output. Also proves the negative: WITHOUT
-//! the imatrix the bytes differ (rlx-gguf's unweighted path).
+//! conversion with `imatrix: Some(...)` and a flat-policy method whose
+//! body scheme is one of the weighted K-quants (q4_k_s → Q4K, and the
+//! slice-2 additions q3_k_s → Q3K, q5_k_s → Q5K, q6_k → Q6K) must emit
+//! tensor bytes byte-identical to llama-quantize's --imatrix output.
+//! Also proves the negative: WITHOUT the imatrix the bytes differ
+//! (rlx-gguf's unweighted path).
 
 use std::path::PathBuf;
 
@@ -100,19 +102,27 @@ fn build_imatrix(weights: &[f32]) -> Imatrix {
     Imatrix::load(&path).unwrap()
 }
 
-#[test]
-fn conversion_with_imatrix_matches_llama_quantize_bytes() {
+/// One flat-policy method whose body scheme hits a weighted encoder,
+/// with the matching golden payload and expected ggml dtype.
+fn run_weighted_conversion_case(
+    method_id: &str,
+    golden_name: &str,
+    expect_dtype: rlx_gguf::GgmlType,
+) {
     let src = load_f32("src.f32.bin", 512);
     let weights = load_f32("weights.f32.bin", 256);
-    let golden = std::fs::read(golden_dir().join("weighted.q4_k.bin")).unwrap();
+    let raw = std::fs::read(golden_dir().join(golden_name)).unwrap();
+    // Goldens may carry the writer's 32-byte alignment padding after the
+    // true payload; the in-memory rlx read is exactly N_ROWS blocks. The
+    // slice below requires the golden to cover the full payload.
 
     let tmp = tempfile::tempdir().unwrap();
     let model_dir = tmp.path().join("m");
     write_model(&model_dir, &src);
 
-    let out = tmp.path().join("m-q4_k_s.gguf");
+    let out = tmp.path().join("m-weighted.gguf");
     let cfg = GgufConvertConfig {
-        method_id: "q4_k_s".into(), // Flat policy: every 2-D body tensor -> Q4K
+        method_id: method_id.into(),
         arch: None,
         name: None,
         imatrix: Some(build_imatrix(&weights)),
@@ -126,15 +136,36 @@ fn conversion_with_imatrix_matches_llama_quantize_bytes() {
         .tensors
         .get("blk.0.attn_q.weight")
         .expect("tensor present");
-    assert_eq!(t.dtype, rlx_gguf::GgmlType::Q4K);
+    assert_eq!(t.dtype, expect_dtype);
     let got = f.tensor_bytes(t).unwrap();
-    // Exactly 2 blocks of 144 — no alignment padding in rlx's in-memory read.
-    assert_eq!(got.len(), golden.len());
+    // Exactly the quantized payload — no alignment padding in rlx's
+    // in-memory read. The golden may be LONGER (padding), so slice it.
+    let golden = &raw[..got.len()];
     assert_eq!(
-        got,
-        &golden[..],
-        "conversion with imatrix must reproduce llama-quantize bytes"
+        got, golden,
+        "{method_id}: conversion with imatrix must reproduce llama-quantize bytes"
     );
+}
+
+#[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes() {
+    run_weighted_conversion_case("q4_k_s", "weighted.q4_k.bin", rlx_gguf::GgmlType::Q4K);
+}
+
+#[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes_q3_k() {
+    run_weighted_conversion_case("q3_k_s", "weighted.q3_k.bin", rlx_gguf::GgmlType::Q3K);
+}
+
+#[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes_q5_k() {
+    run_weighted_conversion_case("q5_k_s", "weighted.q5_k.bin", rlx_gguf::GgmlType::Q5K);
+}
+
+#[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes_q6_k() {
+    // q6_k is itself the flat method (no _s variant).
+    run_weighted_conversion_case("q6_k", "weighted.q6_k.bin", rlx_gguf::GgmlType::Q6K);
 }
 
 #[test]

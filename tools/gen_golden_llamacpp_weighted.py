@@ -2,13 +2,13 @@
 """Generate byte-parity fixtures for the weighted K-quant port (Phase 4.3).
 
 Builds a tiny F32 GGUF model + an imatrix (GGUF format), runs the REAL
-llama-quantize (built from docs/ref/llama.cpp) with --imatrix for Q4_K and
-Q2_K, and saves the quantized tensor payloads as golden .bin files under
-tests/golden/llamacpp/.
+llama-quantize (built from docs/ref/llama.cpp) with --imatrix for Q4_K,
+Q2_K, Q3_K, Q5_K and Q6_K, and saves the quantized tensor payloads as
+golden .bin files under tests/golden/llamacpp/.
 
 The Rust tests byte-compare these payloads against
-quant_core::gguf_quants::quantize_row_q{4,2}_k_weighted on the same f32
-source + weights.
+quant_core::gguf_quants::quantize_row_q{4,2,3,5,6}_k_weighted on the
+same f32 source + weights.
 
 Requires:
   - llama-quantize.exe (tools/build_llamacpp.sh)
@@ -302,7 +302,13 @@ def main():
         build_imatrix_gguf(imx, weights)
 
         results = {}
-        for ftype, name in [("Q4_K", "q4_k"), ("Q2_K", "q2_k")]:
+        for ftype, name in [
+            ("Q4_K", "q4_k"),
+            ("Q2_K", "q2_k"),
+            ("Q3_K", "q3_k"),
+            ("Q5_K", "q5_k"),
+            ("Q6_K", "q6_k"),
+        ]:
             qout = td / f"model-{name}.gguf"
             cmd = [
                 str(tool),
@@ -322,8 +328,8 @@ def main():
         # Save goldens + the shared inputs. The imatrix entry carries ONE
         # 256-length weight vector (per ne[0]) shared by both rows; the
         # Rust parity test quantizes each row with this same vector.
-        (out_dir / "weighted.q4_k.bin").write_bytes(results["q4_k"])
-        (out_dir / "weighted.q2_k.bin").write_bytes(results["q2_k"])
+        for name in results:
+            (out_dir / f"weighted.{name}.bin").write_bytes(results[name])
         (out_dir / "src.f32.bin").write_bytes(b"".join(struct.pack("<f", v) for v in src))
         (out_dir / "weights.f32.bin").write_bytes(
             b"".join(struct.pack("<f", v) for v in weights[:QK_K])
@@ -332,7 +338,7 @@ def main():
             "n": n, "n_rows": N_ROWS, "qk_k": QK_K, "seed_src": 42, "seed_weights": 7,
             "src_bytes": n * 4, "weights_bytes": QK_K * 4,
             "weights_note": "one per-column vector (ne[0]=256), shared by all rows",
-            "q4_k_bytes": len(results["q4_k"]), "q2_k_bytes": len(results["q2_k"]),
+            **{f"{name}_bytes": len(payload) for name, payload in results.items()},
             "llama_quantize": str(tool),
         }, indent=2))
     print(f"OK: goldens written to {out_dir}")
