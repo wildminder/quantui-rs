@@ -1,0 +1,13 @@
+{
+  "n": 512,
+  "n_rows": 2,
+  "qk_k": 256,
+  "seed_src": 42,
+  "seed_weights": 7,
+  "src_bytes": 2048,
+  "weights_bytes": 1024,
+  "weights_note": "one per-column vector (ne[0]=256), shared by all rows",
+  "q4_k_bytes": 288,
+  "q2_k_bytes": 192,
+  "llama_quantize": "<LOCAL-BUILD>\\bin\\llama-quantize.exe"
+}

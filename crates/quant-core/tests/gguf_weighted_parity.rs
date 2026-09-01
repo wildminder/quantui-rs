@@ -1,0 +1,100 @@
+//! Byte-parity tests for the weighted K-quant port (plan Phase 4.3).
+//!
+//! Goldens in tests/golden/llamacpp/ were produced by the REAL
+//! `llama-quantize` (built from docs/ref/llama.cpp by
+//! tools/build_llamacpp.sh) running Q4_K / Q2_K with `--imatrix` on a
+//! deterministic 2x256 F32 fixture and a matching imatrix
+//! (tools/gen_golden_llamacpp_weighted.py, seeds 42/7).
+//!
+//! This is the strongest parity tier we have: our
+//! `quantize_row_q{4,2}_k_weighted` must reproduce llama.cpp's weighted
+//! output BYTE-FOR-BYTE.
+//!
+//! Calling convention (llama.cpp quantize_q4_K, ggml-quants.c:1626-1640):
+//! the tensor is quantized ROW BY ROW, each row getting the SAME weight
+//! vector base (the imatrix entry for the tensor, length ne[0]). Our
+//! port's `quantize_row_*_weighted(x, n_per_row, weights)` takes ONE row
+//! plus its 256 weights — the test drives it per row and concatenates,
+//! exactly mirroring the upstream loop.
+
+use std::path::PathBuf;
+
+use quant_core::gguf_quants::{
+    quantize_row_q2_k_weighted, quantize_row_q4_k_weighted, Q2_K_BLOCK_BYTES, Q4_K_BLOCK_BYTES,
+};
+
+const QK_K: usize = 256;
+const N_ROWS: usize = 2;
+
+fn golden_dir() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // crates/
+    p.pop(); // workspace root
+    p.join("tests/golden/llamacpp")
+}
+
+fn load_f32(name: &str, expect: usize) -> Vec<f32> {
+    let path = golden_dir().join(name);
+    let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_eq!(raw.len(), expect * 4, "{name}: unexpected size");
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
+}
+
+/// One weighted row-quantizer entry point.
+type RowQuantFn = fn(&[f32], usize, Option<&[f32]>) -> Vec<u8>;
+
+/// Drive our port the way llama.cpp drives its quantizers: per row, with
+/// the shared per-tensor weight vector.
+fn quantize_tensor_per_row(
+    src: &[f32],
+    weights: &[f32],
+    per_row: RowQuantFn,
+    block_bytes: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(N_ROWS * block_bytes);
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        out.extend(per_row(row, QK_K, Some(weights)));
+    }
+    out
+}
+
+#[test]
+fn weighted_q4_k_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let golden = std::fs::read(golden_dir().join("weighted.q4_k.bin")).unwrap();
+    assert_eq!(golden.len(), N_ROWS * Q4_K_BLOCK_BYTES);
+
+    let ours =
+        quantize_tensor_per_row(&src, &weights, quantize_row_q4_k_weighted, Q4_K_BLOCK_BYTES);
+    assert_eq!(ours.len(), golden.len(), "encoded size");
+    assert_eq!(
+        ours, golden,
+        "weighted Q4_K bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_q2_k_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.q2_k.bin")).unwrap();
+    // The golden carries llama-quantize's 32-byte alignment padding after
+    // the real payload (the generator's reader extends the last tensor to
+    // EOF); the actual quantized payload is exactly N_ROWS blocks.
+    assert!(raw.len() >= N_ROWS * Q2_K_BLOCK_BYTES);
+    let golden = &raw[..N_ROWS * Q2_K_BLOCK_BYTES];
+
+    let ours =
+        quantize_tensor_per_row(&src, &weights, quantize_row_q2_k_weighted, Q2_K_BLOCK_BYTES);
+    assert_eq!(ours.len(), N_ROWS * Q2_K_BLOCK_BYTES);
+    assert_eq!(
+        ours, golden,
+        "weighted Q2_K bytes differ from llama-quantize"
+    );
+}
