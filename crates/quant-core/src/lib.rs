@@ -17,6 +17,7 @@ pub mod stream;
 pub mod bias_correction;
 pub mod discover;
 pub mod gguf_convert;
+pub mod gguf_quants;
 pub mod gguf_registry;
 pub mod imatrix;
 pub mod llama_policy;
