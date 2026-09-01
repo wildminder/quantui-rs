@@ -11,3 +11,6 @@ _backup
 /crates/quant-core/target/
 target/criterion/
 docs/
+# Debug-harness build artifacts (tools/*.exe, *.obj)
+tools/*.exe
+tools/*.obj
