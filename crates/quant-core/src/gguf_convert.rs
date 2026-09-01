@@ -28,7 +28,7 @@ use rlx_gguf::{quantize, GgmlType, GgufWriter, MetaValue};
 use crate::discover::{classify_input, resolve_union, InputKind};
 use crate::dtype::DType;
 use crate::gguf_registry::{self, GgufScheme};
-use crate::{llama_policy, st_io::reader::SafetensorsReader};
+use crate::{gguf_quants, llama_policy, st_io::reader::SafetensorsReader};
 
 /// Errors from GGUF conversion.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,8 @@ pub enum GgufError {
     St(#[from] crate::st_io::error::Error),
     #[error("gguf: {0}")]
     Gguf(String),
+    #[error("imatrix: {0}")]
+    Imatrix(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("config.json: {0}")]
@@ -62,6 +64,12 @@ pub struct GgufConvertConfig {
     pub arch: Option<String>,
     /// `general.name` metadata; else derived from the input base name.
     pub name: Option<String>,
+    /// Importance matrix for the weighted K-quant path (Phase 4.4).
+    /// When present and the method's scheme resolves to Q4_K/Q2_K for a
+    /// tensor, that tensor is quantized with the ported llama.cpp
+    /// weighted encoders (byte-parity tier); every other scheme keeps
+    /// using rlx-gguf as before.
+    pub imatrix: Option<crate::imatrix::Imatrix>,
 }
 
 /// Summary of a completed conversion.
@@ -214,6 +222,55 @@ pub fn convert_hf_to_gguf(
             name: name.clone(),
             dtype: info.dtype,
         })?;
+
+        // Phase 4.4: weighted path. When an imatrix is configured AND it
+        // carries this tensor AND the scheme is one of the ported weighted
+        // encoders (Q4_K / Q2_K — byte-parity tier vs llama-quantize),
+        // quantize row by row with the shared per-tensor weight vector,
+        // exactly as llama.cpp does (llama-quant.cpp:1260-1276 drives
+        // ggml_quantize_chunk per slab; ggml-quants.c:1626-1640 advances
+        // src per row while quant_weights stays at the entry base).
+        let weights = cfg
+            .imatrix
+            .as_ref()
+            .and_then(|im| im.weights_for(&gguf_name));
+        let weighted = matches!(
+            (scheme, weights),
+            (GgufScheme::Q4K, Some(_)) | (GgufScheme::Q2K, Some(_))
+        );
+        if weighted {
+            let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
+            let nrows = floats.len() / n_per_row.max(1);
+            // Size check mirrors llama-quant.cpp:1228: the entry must cover
+            // ne[0] (ne[2]=1 for our 2-D dense case).
+            let wv = weights.unwrap();
+            if n_per_row == 0 || wv.len() != n_per_row || floats.len() % n_per_row != 0 {
+                return Err(GgufError::Imatrix(format!(
+                    "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
+                    wv.len(),
+                    n_per_row
+                )));
+            }
+            let mut out = Vec::with_capacity(floats.len() / 2);
+            for r in 0..nrows {
+                let row = &floats[r * n_per_row..(r + 1) * n_per_row];
+                let bytes = match scheme {
+                    GgufScheme::Q4K => {
+                        gguf_quants::quantize_row_q4_k_weighted(row, n_per_row, Some(wv))
+                    }
+                    _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
+                };
+                out.extend(bytes);
+            }
+            quantized += 1;
+            let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
+            w.add_tensor_bytes(&gguf_name, shape, ggml, out)
+                .map_err(|e| GgufError::Gguf(e.to_string()))?;
+            if let Some(cb) = on_progress.as_mut() {
+                cb(done + 1, total);
+            }
+            continue;
+        }
 
         // Encode; fall back to F16 if the element count doesn't divide the
         // scheme's block size (keeps the output valid GGUF). Phase 2.3:

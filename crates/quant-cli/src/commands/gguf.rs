@@ -113,6 +113,7 @@ pub fn run(args: GgufArgs) -> ExitCode {
         method_id: args.method.clone(),
         arch: args.arch.clone(),
         name: args.name.clone(),
+        imatrix: None,
     };
 
     let mut sink: Box<dyn ProgressSink> = if args.no_progress {
