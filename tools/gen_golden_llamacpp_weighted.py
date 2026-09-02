@@ -317,6 +317,10 @@ def main():
             ("IQ2_S", "iq2_s*override"),
             ("IQ3_XXS", "iq3_xxs"),
             ("IQ3_S", "iq3_s"),
+            ("IQ1_S", "iq1_s"),
+            ("IQ1_M", "iq1_m"),
+            ("IQ4_NL", "iq4_nl"),
+            ("IQ4_XS", "iq4_xs"),
         ]:
             qout = td / "model-q.gguf"
             cmd = [

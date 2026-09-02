@@ -246,6 +246,10 @@ pub fn convert_hf_to_gguf(
                 | (GgufScheme::Iq2S, Some(_))
                 | (GgufScheme::Iq3Xxs, Some(_))
                 | (GgufScheme::Iq3S, Some(_))
+                | (GgufScheme::Iq1S, Some(_))
+                | (GgufScheme::Iq1M, Some(_))
+                | (GgufScheme::Iq4Nl, Some(_))
+                | (GgufScheme::Iq4Xs, Some(_))
         );
         if weighted {
             let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
@@ -299,6 +303,22 @@ pub fn convert_hf_to_gguf(
                     GgufScheme::Iq3S => {
                         crate::gguf_iq_quants::quantize_row_iq3_s_weighted(row, n_per_row, Some(wv))
                     }
+                    GgufScheme::Iq1S => {
+                        crate::gguf_iq_quants::quantize_row_iq1_s_weighted(row, n_per_row, wv)
+                    }
+                    GgufScheme::Iq1M => {
+                        crate::gguf_iq_quants::quantize_row_iq1_m_weighted(row, n_per_row, Some(wv))
+                    }
+                    GgufScheme::Iq4Nl => crate::gguf_iq_quants::quantize_row_iq4_nl_weighted(
+                        row,
+                        n_per_row,
+                        Some(wv),
+                    ),
+                    GgufScheme::Iq4Xs => crate::gguf_iq_quants::quantize_row_iq4_xs_weighted(
+                        row,
+                        n_per_row,
+                        Some(wv),
+                    ),
                     _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
                 };
                 out.extend(bytes);

@@ -34,6 +34,7 @@ use std::sync::OnceLock;
 
 pub(crate) use crate::gguf_iq_tables_data::{
     KGRID_1BIT_2048, KGRID_256, KGRID_2BIT_1024, KGRID_2BIT_256, KGRID_2BIT_512, KGRID_512,
+    KVALUES_IQ4NL,
 };
 
 /// Which packed lattice + lane geometry a quantizer family uses.

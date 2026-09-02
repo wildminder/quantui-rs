@@ -263,3 +263,90 @@ fn weighted_iq3_s_byte_exact_vs_llama_quantize() {
         "weighted IQ3_S bytes differ from llama-quantize"
     );
 }
+
+#[test]
+fn weighted_iq1_s_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq1_s.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ1_S_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq1_s_weighted(
+            row, QK_K, &weights,
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ1_S bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_iq1_m_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq1_m.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ1_M_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq1_m_weighted(
+            row,
+            QK_K,
+            Some(&weights),
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ1_M bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_iq4_nl_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq4_nl.bin")).unwrap();
+    // iq4_nl blocks are 32 elements (NOT QK_K) — 512/32 = 16 blocks.
+    let golden = &raw[..(N_ROWS * QK_K / 32) * quant_core::gguf_iq_quants::IQ4_NL_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq4_nl_weighted(
+            row,
+            QK_K,
+            Some(&weights),
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ4_NL bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_iq4_xs_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq4_xs.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ4_XS_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq4_xs_weighted(
+            row,
+            QK_K,
+            Some(&weights),
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ4_XS bytes differ from llama-quantize"
+    );
+}
