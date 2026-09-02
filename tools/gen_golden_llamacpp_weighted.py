@@ -308,6 +308,8 @@ def main():
             ("Q3_K", "q3_k"),
             ("Q5_K", "q5_k"),
             ("Q6_K", "q6_k"),
+            ("IQ2_XXS", "iq2_xxs"),
+            ("IQ2_XS", "iq2_xs"),
         ]:
             qout = td / f"model-{name}.gguf"
             cmd = [

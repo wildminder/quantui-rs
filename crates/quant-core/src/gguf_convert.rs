@@ -241,6 +241,8 @@ pub fn convert_hf_to_gguf(
                 | (GgufScheme::Q3K, Some(_))
                 | (GgufScheme::Q5K, Some(_))
                 | (GgufScheme::Q6K, Some(_))
+                | (GgufScheme::Iq2Xxs, Some(_))
+                | (GgufScheme::Iq2Xs, Some(_))
         );
         if weighted {
             let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
@@ -270,6 +272,15 @@ pub fn convert_hf_to_gguf(
                     }
                     GgufScheme::Q6K => {
                         gguf_quants::quantize_row_q6_k_weighted(row, n_per_row, Some(wv))
+                    }
+                    // IQ family: weights are REQUIRED upstream (NULL is
+                    // GGML_ASSERTed, ggml-quants.c:3302/:3480) — the driver
+                    // only routes here when the entry exists.
+                    GgufScheme::Iq2Xxs => {
+                        crate::gguf_iq_quants::quantize_row_iq2_xxs_weighted(row, n_per_row, wv)
+                    }
+                    GgufScheme::Iq2Xs => {
+                        crate::gguf_iq_quants::quantize_row_iq2_xs_weighted(row, n_per_row, wv)
                     }
                     _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
                 };

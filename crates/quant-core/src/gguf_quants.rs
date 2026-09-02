@@ -37,7 +37,7 @@ const GROUP_MAX_EPS: f32 = 1e-15f32;
 /// Port of `nearest_int` (:621-626). The magic-number trick is exact for
 /// |fval| <= 2^22; upstream asserts that range, we debug_assert it.
 #[inline]
-fn nearest_int(fval: f32) -> i32 {
+pub(crate) fn nearest_int(fval: f32) -> i32 {
     debug_assert!(fval.abs() <= 4194303.0);
     let val = fval + 12582912.0;
     let i = val.to_bits();
@@ -144,7 +144,13 @@ fn make_qkx3_quants(
 
 /// Port of `make_qp_quants` (:1076-1147) — the weighted super-block scale
 /// search with the ±4% nudge loop and 5 coordinate-descent passes.
-fn make_qp_quants(n: usize, nmax: i32, x: &[f32], l: &mut [u8], quant_weights: &[f32]) -> f32 {
+pub(crate) fn make_qp_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    l: &mut [u8],
+    quant_weights: &[f32],
+) -> f32 {
     let mut max = 0.0f32;
     for i in 0..n {
         max = max.max(x[i]);

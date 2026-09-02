@@ -152,3 +152,48 @@ fn weighted_q6_k_byte_exact_vs_llama_quantize() {
         "Q6_K",
     );
 }
+
+// ─── IQ family (Phase 4.3 IQ slice) ───────────────────────────────────
+// The IQ quantizers REQUIRE weights (upstream GGML_ASSERTs on NULL), so
+// their signature takes &[f32] directly — driven per row here, mirroring
+// quantize_iq2_xxs/xs (ggml-quants.c:3652-3677).
+
+#[test]
+fn weighted_iq2_xxs_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq2_xxs.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ2_XXS_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq2_xxs_weighted(
+            row, QK_K, &weights,
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ2_XXS bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_iq2_xs_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq2_xs.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ2_XS_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq2_xs_weighted(
+            row, QK_K, &weights,
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ2_XS bytes differ from llama-quantize"
+    );
+}

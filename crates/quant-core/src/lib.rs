@@ -16,7 +16,13 @@ pub mod stream;
 // Enabled early: Phase 1 (safetensors IO) scaffolding created in Phase 0 per spec.
 pub mod bias_correction;
 pub mod discover;
+// IQ-family lattice infrastructure (Unsloth plan Phase 4.3 IQ slice).
+// gguf_iq_grid is the runtime port (init/kmap/neighbors);
+// gguf_iq_tables_data is generated — see tools/extract_iq_tables.py.
 pub mod gguf_convert;
+mod gguf_iq_grid;
+pub mod gguf_iq_quants;
+mod gguf_iq_tables_data;
 pub mod gguf_quants;
 pub mod gguf_registry;
 pub mod imatrix;
