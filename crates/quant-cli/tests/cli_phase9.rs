@@ -379,3 +379,108 @@ fn wired_format_runs_via_cli() {
         "a wired format must produce an output file"
     );
 }
+
+// --------------------------------------------------------------------------- //
+// Phase 7.0: int8_convrot honesty guard (plan decision Q3)
+// --------------------------------------------------------------------------- //
+
+/// Selecting int8_convrot exits 2 with the specific not-implemented
+/// message, BEFORE any output file is created — never silently emits
+/// plain INT8 under a ConvRot name.
+#[test]
+fn int8_convrot_is_rejected_with_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("o.safetensors");
+    let out = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
+            out_path.to_str().unwrap(),
+            "--format",
+            "int8_convrot",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "int8_convrot must be a usage error until the kernel lands"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("int8_convrot"),
+        "stderr must name the format:/n{stderr}"
+    );
+    assert!(
+        stderr.contains("rotation kernel is not implemented"),
+        "stderr must state the specific cause:/n{stderr}"
+    );
+    assert!(
+        stderr.contains("Phase 7.1"),
+        "stderr must name the planned phase:/n{stderr}"
+    );
+    // Honesty guard: NOTHING may be emitted under the ConvRot name.
+    assert!(
+        !out_path.exists(),
+        "no output file may be created for a rejected format"
+    );
+}
+
+/// The guard fires before input classification: even a nonexistent input
+/// path with --format int8_convrot reports the ConvRot rejection, not an
+/// input error (the format check is the more specific diagnosis).
+#[test]
+fn int8_convrot_guard_precedes_input_classification() {
+    let out = bin()
+        .args([
+            "quantize",
+            "does_not_exist.safetensors",
+            "o.safetensors",
+            "--format",
+            "int8_convrot",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rotation kernel is not implemented"),
+        "format rejection must precede input classification:/n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unusable input"),
+        "input error must not mask the format rejection:/n{stderr}"
+    );
+}
+
+/// Counterpart: plain --format int8 is completely unaffected — full
+/// byte-parity with the golden output still holds after the guard lands.
+#[test]
+fn plain_int8_unaffected_by_convrot_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("o.safetensors");
+    let out = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
+            out_path.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "plain int8 must keep working: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(files_equal(
+        &out_path,
+        &golden("linear_basic_bf16/output.safetensors")
+    ));
+}

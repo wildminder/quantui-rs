@@ -36,8 +36,14 @@ pub enum OrigDtypeArg {
 }
 
 /// Target quantization format. `int8` is the shipped streaming path;
-/// `fp8_e4m3` / `mxfp8` / `nvfp4` are being wired into the streaming
+/// `fp8_e4m3` / `mxfp8` / `nvfp4` are wired into the streaming
 /// orchestrator (plan docs/plans/2026-08-28-all-formats-wiring-plan.md).
+///
+/// `int8_convrot` is SELECTABLE BUT ALWAYS REJECTED (plan Phase 7.0
+/// honesty guard, decision Q3): the Hadamard rotation kernel is not
+/// implemented yet, and silently emitting plain INT8 under a ConvRot
+/// name would produce a model that looks pre-quantized-rotated but
+/// isn't. Selecting it exits 2 with a message naming the phase.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatArg {
     Int8,
@@ -45,6 +51,8 @@ pub enum FormatArg {
     Fp8E4m3,
     Mxfp8,
     Nvfp4,
+    #[value(name = "int8_convrot")]
+    Int8Convrot,
 }
 
 impl FormatArg {
@@ -55,6 +63,7 @@ impl FormatArg {
             FormatArg::Fp8E4m3 => "fp8_e4m3",
             FormatArg::Mxfp8 => "mxfp8",
             FormatArg::Nvfp4 => "nvfp4",
+            FormatArg::Int8Convrot => "int8_convrot",
         }
     }
 
@@ -63,6 +72,12 @@ impl FormatArg {
     /// is a usage error (exit 2).
     pub fn has_fixed_scaling(&self) -> bool {
         matches!(self, FormatArg::Mxfp8 | FormatArg::Nvfp4)
+    }
+
+    /// Phase 7.0 guard: this format has no kernel yet and must be rejected
+    /// with the specific "not implemented" message before any work starts.
+    pub fn is_unimplemented(&self) -> bool {
+        matches!(self, FormatArg::Int8Convrot)
     }
 }
 

@@ -46,6 +46,8 @@ fn format_id(format: FormatArg, mode: ScalingModeArg) -> &'static str {
         FormatArg::Fp8E4m3 => "fp8_e4m3",
         FormatArg::Mxfp8 => "mxfp8",
         FormatArg::Nvfp4 => "nvfp4",
+        // Unreachable: run() rejects this format before build_config.
+        FormatArg::Int8Convrot => "int8_convrot",
     }
 }
 
@@ -82,6 +84,15 @@ fn build_config(args: &QuantizeArgs) -> QuantConfig {
         ),
         FormatArg::Mxfp8 => (Format::Mxfp8, "mxfp8", false, ScalingMode::Block, 32),
         FormatArg::Nvfp4 => (Format::Nvfp4, "nvfp4", false, ScalingMode::Block, 16),
+        // Unreachable: run() rejects this format before build_config.
+        // Kept as INT8-like values purely for exhaustiveness.
+        FormatArg::Int8Convrot => (
+            Format::Int8,
+            "int8",
+            true,
+            scaling_mode(args.scaling_mode.unwrap_or(ScalingModeArg::Block)),
+            args.block_size.unwrap_or(128),
+        ),
     };
     QuantConfig {
         format,
@@ -153,6 +164,25 @@ struct RunOutcome {
 }
 
 pub fn run(args: QuantizeArgs) -> ExitCode {
+    // ---- Phase 7.0 honesty guard (decision Q3) ---------------------------- //
+    // int8_convrot is selectable but ALWAYS rejected here, before any input
+    // classification or output creation: the Hadamard rotation kernel
+    // (Phase 7.1) is not implemented, and emitting plain INT8 under a
+    // ConvRot name would silently produce an un-rotated model that looks
+    // rotated. The core orchestrator carries the same guard for library
+    // callers (QuantConfig.convrot=true).
+    if args.format.is_unimplemented() {
+        eprintln!(
+            "error: --format {} is not supported yet: the rotation kernel is not implemented (planned Phase 7.1).",
+            args.format.as_str()
+        );
+        eprintln!(
+            "Refusing to silently emit plain INT8 under a ConvRot name — the output would not be what the name promises."
+        );
+        eprintln!("hint: plain --format int8 is unaffected and fully supported.");
+        return ExitCode::from(2);
+    }
+
     // ---- classify input ---------------------------------------------------- //
     let (kind, _base) = classify_input(&args.input);
     let Some(kind) = kind else {

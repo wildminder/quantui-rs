@@ -102,6 +102,11 @@ pub enum StreamError {
     /// Bias correction needs a float bias (f32/f16/bf16); got something else.
     #[error("bias `{name}` has unsupported dtype {dtype} for bias correction (need f32/f16/bf16)")]
     UnsupportedBiasDtype { name: String, dtype: DType },
+    /// ConvRot (`int8_convrot`) requested but the rotation kernel is not
+    /// implemented (plan Phase 7.0 interim honesty guard, decision Q3):
+    /// never silently emit plain INT8 under a ConvRot name.
+    #[error("int8_convrot is not supported yet: the Hadamard rotation kernel is not implemented (planned Phase 7.1). Plain --format int8 is unaffected; refusing to silently emit un-rotated INT8 under a ConvRot name.")]
+    ConvRotUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
@@ -458,6 +463,16 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     mut on_progress: Option<&mut ProgressFn>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamResult> {
+    // Phase 7.0 honesty guard: a config claiming convrot must be rejected
+    // before ANY output file is created. The rotation kernel (Phase 7.1)
+    // does not exist yet; silently emitting plain INT8 under a ConvRot
+    // name would produce a model that looks pre-quantized-rotated but
+    // isn't — silently wrong output is the one thing this CLI must never
+    // do (decision Q3, plan §3-G).
+    if config.convrot {
+        return Err(StreamError::ConvRotUnsupported);
+    }
+
     let names: Vec<String> = input.names().to_vec();
     // Reference: `total = len(names)` — the full tensor count, independent of
     // how many are already done from a resumed run.
@@ -1567,6 +1582,38 @@ mod tests {
         assert!(
             build_file_metadata(&tiny, &family_b_config(Format::Mxfp8)).is_none(),
             "all-skipped MXFP8 input must carry no metadata"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // Phase 7.0: ConvRot honesty guard (decision Q3)
+    // ------------------------------------------------------------------ //
+
+    /// A config with `convrot: true` must be rejected by the orchestrator
+    /// BEFORE the output file is created — a leftover empty file would look
+    /// like a started run. The error names the missing kernel and the phase.
+    #[test]
+    fn convrot_config_rejected_before_file_creation() {
+        let src = MemSource::new(); // empty source is enough: guard is first
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("never.safetensors");
+
+        let mut config = QuantConfig::default();
+        config.convrot = true;
+
+        let err = stream_quantize_source(&src, &out, &config, None, None).unwrap_err();
+        assert!(
+            matches!(err, StreamError::ConvRotUnsupported),
+            "convrot config must hit the dedicated error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("rotation kernel is not implemented"),
+            "error must name the cause: {err}"
+        );
+        assert!(
+            !out.exists(),
+            "guard must fire before the output file is created"
         );
     }
 }
