@@ -70,6 +70,39 @@ pub struct GgufConvertConfig {
     /// ported llama.cpp weighted encoders (byte-parity tier); every other
     /// scheme keeps using rlx-gguf as before.
     pub imatrix: Option<crate::imatrix::Imatrix>,
+    /// Per-tensor recipe overrides (Phase 6.2, `--tensor-type-file`).
+    /// When a rule matches the GGUF-side tensor name (search semantics,
+    /// first-match-wins, llama-quant.cpp:713-727), its scheme wins over the
+    /// method's own policy — including the composite `_M`/`_L` engines,
+    /// which are skipped entirely for that tensor (upstream `manual` path).
+    /// A matched recipe scheme still respects the F16 divisibility
+    /// fallback and the 1-D F32 convention.
+    pub recipe: Option<crate::gguf_recipe::TensorRecipe>,
+    /// `--token-embedding-type`: overrides the scheme for the
+    /// `token_embd.weight` / `per_layer_token_embd.weight` tensors
+    /// (llama-quant.cpp:687-702). `per_layer_token_embd` still lets an
+    /// explicit recipe rule name it (upstream `named` exception).
+    pub token_embedding_type: Option<String>,
+    /// `--output-tensor-type`: overrides the scheme for the
+    /// `output.weight` tensor (llama-quant.cpp:704-706).
+    pub output_tensor_type: Option<String>,
+}
+
+impl Default for GgufConvertConfig {
+    /// Defaults mirror the CLI's: method `q4_k_m`, everything else off.
+    /// Tests use `..Default::default()` so new optional fields (like
+    /// `recipe`) do not churn every construction site.
+    fn default() -> Self {
+        Self {
+            method_id: "q4_k_m".into(),
+            arch: None,
+            name: None,
+            imatrix: None,
+            recipe: None,
+            token_embedding_type: None,
+            output_tensor_type: None,
+        }
+    }
 }
 
 /// Summary of a completed conversion.
@@ -92,6 +125,12 @@ pub struct GgufConvertReport {
     /// degradation is not acceptable — the CLI prints one warning line per
     /// entry and tests assert the exact list).
     pub fallback_tensors: Vec<String>,
+    /// Effective per-tensor scheme assignment in conversion order
+    /// (Phase 6.3 `--emit-recipe`): `(gguf_name, scheme)` AFTER all
+    /// overrides (recipe, category overrides) but BEFORE the F16
+    /// divisibility fallback (the recipe vocabulary is method ids, not
+    /// F16-fallback states).
+    pub effective_schemes: Vec<(String, GgufScheme)>,
 }
 
 /// Convert a HF safetensors input (single file or sharded folder) to GGUF.
@@ -189,6 +228,7 @@ pub fn convert_hf_to_gguf(
     let mut fallback_f16 = 0usize;
     let mut kept_f32 = 0usize;
     let mut fallback_tensors: Vec<String> = Vec::new();
+    let mut effective_schemes: Vec<(String, GgufScheme)> = Vec::new();
     for (done, (name, shard_idx)) in names.iter().enumerate() {
         let reader = &readers[*shard_idx];
         let info = reader.header().get(name).expect("name came from header");
@@ -196,25 +236,59 @@ pub fn convert_hf_to_gguf(
         let ndim = info.shape.len();
 
         let gguf_name = hf_to_gguf_name(name).unwrap_or_else(|| name.clone());
-        // Phase 3.0: composite methods resolve through the llama.cpp
-        // policy engine (categories + counters + use_more_bits); simple
-        // methods keep the flat registry engine.
-        let scheme = match (&mut policy_state, engine) {
-            (Some(state), _) => {
-                let cat = llama_policy::tensor_get_category(&gguf_name);
-                let ctx = llama_policy::PolicyCtx {
-                    name: &gguf_name,
-                    ndim,
-                    category: cat,
-                    facts: model_facts,
-                    state,
-                };
-                let s = llama_policy::resolve(&engine, &ctx);
-                llama_policy::advance(state, cat);
-                s
+        // Phase 3.0 + 6.2: per-tensor type resolution — a faithful port of
+        // llama_tensor_get_type (llama-quant.cpp:683-739):
+        //   1. 1-D → F32 (never quantized — the shared convention);
+        //   2. --token-embedding-type / --output-tensor-type return EARLY
+        //      (:688-706): neither the recipe nor the method's engine runs
+        //      for those tensors. Exception: a recipe rule explicitly
+        //      naming per_layer_token_embd beats the embd override
+        //      (:688-699 `named` — it is a "large separate table");
+        //   3. the recipe's first matching rule = manual mode (:713-727):
+        //      it skips the engine INCLUDING its counter advancement —
+        //      upstream `manual = true` never calls
+        //      llama_tensor_get_type_impl, which owns the ++qs.i_* counter
+        //      increments (:570, :634, :730-731) — and the bare default
+        //      applies when no rule matches;
+        //   4. the method's own engine: the llama_policy engine for
+        //      composite methods (categories + counters + use_more_bits),
+        //      the flat registry rules otherwise.
+        // The manual/engine block only runs when the method's default type
+        // is quantized (:711) — f16/f32/bf16 methods ignore the recipe
+        // entirely, exactly like upstream. The category overrides at step
+        // 2 sit BEFORE that gate, so they apply even to f16 methods.
+        let cat = llama_policy::tensor_get_category(&gguf_name);
+        let scheme = if ndim < 2 {
+            GgufScheme::F32
+        } else if let Some(s) = category_override(cfg, &gguf_name, cat)? {
+            s
+        } else if !scheme_is_quantized(entry.policy.default) {
+            // Upstream skips the manual+engine block when the method's
+            // default type is not quantized (:711) — the recipe is inert.
+            entry.policy.default
+        } else if let Some(s) = cfg.recipe.as_ref().and_then(|r| r.scheme_for(&gguf_name)) {
+            // Manual mode — the engine and its counters are skipped.
+            s
+        } else {
+            match &mut policy_state {
+                Some(state) => {
+                    let ctx = llama_policy::PolicyCtx {
+                        name: &gguf_name,
+                        ndim,
+                        category: cat,
+                        facts: model_facts,
+                        state,
+                    };
+                    let s = llama_policy::resolve(&engine, &ctx);
+                    llama_policy::advance(state, cat);
+                    s
+                }
+                None => gguf_registry::scheme_for(entry, &gguf_name, ndim),
             }
-            (None, _) => gguf_registry::scheme_for(entry, &gguf_name, ndim),
         };
+        // Phase 6.3: record the effective scheme (pre-F16-fallback — the
+        // assignment the recipe vocabulary can express).
+        effective_schemes.push((gguf_name.clone(), scheme));
         let ggml = scheme_to_ggml(scheme);
 
         // Decode to f32 (GGUF encoders consume f32).
@@ -465,6 +539,7 @@ pub fn convert_hf_to_gguf(
         kept_f32,
         output_bytes,
         fallback_tensors,
+        effective_schemes,
     })
 }
 
@@ -552,6 +627,70 @@ fn decode_f32(dtype: DType, raw: &[u8]) -> Option<Vec<f32>> {
 }
 
 // ─── scheme → GgmlType ──────────────────────────────────────────────
+
+/// Port of the early-return category overrides in llama_tensor_get_type
+/// (llama-quant.cpp:688-706). Returns `Some(scheme)` when an override
+/// applies — the caller must return it WITHOUT consulting the recipe or
+/// the method's engine. The single exception (:688-699): a recipe rule
+/// explicitly naming `per_layer_token_embd.weight` beats the embd
+/// override (upstream comment: it is a "large separate table").
+fn category_override(
+    cfg: &GgufConvertConfig,
+    gguf_name: &str,
+    cat: llama_policy::TensorCategory,
+) -> Result<Option<GgufScheme>, GgufError> {
+    use llama_policy::TensorCategory;
+    if let Some(embd_id) = cfg.token_embedding_type.as_deref() {
+        if cat == TensorCategory::TokenEmbd {
+            let named_by_recipe = gguf_name == "per_layer_token_embd.weight"
+                && cfg
+                    .recipe
+                    .iter()
+                    .flat_map(|r| r.rules.iter().map(|ru| &ru.regex))
+                    .any(|re| re.is_match(gguf_name));
+            if !named_by_recipe {
+                return scheme_for_method_id(embd_id).map(Some);
+            }
+        }
+    }
+    if let Some(out_id) = cfg.output_tensor_type.as_deref() {
+        if cat == TensorCategory::Output {
+            return scheme_for_method_id(out_id).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Port of `ggml_is_quantized(default_type)` (llama-quant.cpp:711): the
+/// recipe and the method's engine only run when the method's default type
+/// is quantized — an f16/f32/bf16 method ignores per-tensor recipes
+/// entirely (upstream never enters the manual/impl block).
+fn scheme_is_quantized(s: GgufScheme) -> bool {
+    !matches!(s, GgufScheme::F32 | GgufScheme::F16 | GgufScheme::Bf16)
+}
+
+/// Phase 6.2: resolve a method-id override (`--token-embedding-type`,
+/// `--output-tensor-type`) to its scheme. The id must be a usable registry
+/// method; anything else is a hard usage error naming the id (the caller
+/// maps it to exit 2 via GgufError::UnknownMethod semantics — here we
+/// reuse the error type so the CLI's exit-code mapping picks it up).
+fn scheme_for_method_id(id: &str) -> Result<GgufScheme, GgufError> {
+    let entry = gguf_registry::get_method(id).ok_or_else(|| {
+        GgufError::UnknownMethod(id.to_string(), gguf_registry::usable_ids().join(", "))
+    })?;
+    if entry.method.dynamic_v2
+        || matches!(
+            entry.method.support,
+            gguf_registry::BackendSupport::NoEncoder(_)
+        )
+    {
+        return Err(GgufError::UnknownMethod(
+            id.to_string(),
+            gguf_registry::usable_ids().join(", "),
+        ));
+    }
+    Ok(entry.policy.default)
+}
 
 fn scheme_to_ggml(s: GgufScheme) -> GgmlType {
     match s {

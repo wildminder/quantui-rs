@@ -202,6 +202,29 @@ pub struct GgufArgs {
     #[arg(long, value_name = "PATH")]
     pub imatrix: Option<PathBuf>,
 
+    /// Per-tensor recipe file (Phase 6, the open `UD-*` equivalent):
+    /// `regex=qtype` lines, `#` comments, first-match-wins against the
+    /// GGUF tensor name, optional trailing bare `qtype` default.
+    /// Every `qtype` must be a usable method id.
+    #[arg(long, value_name = "PATH")]
+    pub tensor_type_file: Option<PathBuf>,
+
+    /// Override the quantization for the token-embedding tensor
+    /// (`token_embd.weight`), e.g. `q8_0` or `f16`.
+    #[arg(long, value_name = "METHOD")]
+    pub token_embedding_type: Option<String>,
+
+    /// Override the quantization for the output tensor (`output.weight`).
+    #[arg(long, value_name = "METHOD")]
+    pub output_tensor_type: Option<String>,
+
+    /// Dump the effective per-tensor scheme assignment as a recipe file
+    /// (Phase 6.3, inspection): one `name-exact=qtype` line per tensor,
+    /// in conversion order, plus a `# method <id>` header. Feeding the
+    /// dump back via `--tensor-type-file` reproduces the same assignment.
+    #[arg(long, value_name = "PATH")]
+    pub emit_recipe: Option<PathBuf>,
+
     /// Override the GGUF architecture string (else detected from config.json).
     #[arg(long)]
     pub arch: Option<String>,

@@ -770,6 +770,391 @@ fn imatrix_legacy_load_direct() {
     assert!(im.is_legacy);
 }
 
+// ─── Phase 6: --tensor-type-file recipes + overrides + --emit-recipe ──
+//
+// The open equivalent of Unsloth's proprietary UD-* dynamic recipes
+// (plan §3-F/Phase 6). llama-quant.cpp:713-727 semantics: first matching
+// regex wins (search), the method policy is skipped for matched tensors,
+// --token-embedding-type/--output-tensor-type override their categories.
+
+#[test]
+fn gguf_recipe_assigns_per_tensor_qtypes() {
+    // A recipe routing ffn_down to q6_k under q4_k_m must yield Q6K bytes
+    // for that tensor and the base Q4K elsewhere.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let recipe = tmp.path().join("recipe.txt");
+    std::fs::write(&recipe, "ffn_down\\.weight=q6_k\n").unwrap();
+
+    let out = tmp.path().join("m-recipe.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            recipe.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "recipe run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    // ffn_down got the recipe's Q6K…
+    let ffn_down = f.tensors.get("blk.0.ffn_down.weight").unwrap();
+    assert_eq!(ffn_down.dtype, rlx_gguf::GgmlType::Q6K, "recipe must win");
+    // …while attn_q keeps the method base Q4K.
+    let attn_q = f.tensors.get("blk.0.attn_q.weight").unwrap();
+    assert_eq!(attn_q.dtype, rlx_gguf::GgmlType::Q4K);
+}
+
+#[test]
+fn gguf_recipe_skips_composite_policy_engine() {
+    // For a composite method (q4_k_m routes through the llama_policy
+    // engine, which assigns Q6K to attn_v via use_more_bits), a recipe
+    // rule hitting the SAME tensor must win with the recipe's scheme —
+    // proving the manual path bypasses the engine (llama-quant.cpp:730).
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let recipe = tmp.path().join("recipe.txt");
+    // Route ffn_down to q5_k_s — WITHOUT the recipe the engine gives Q6K.
+    std::fs::write(&recipe, "ffn_down\\.weight=q5_k_s\n").unwrap();
+
+    let out = tmp.path().join("m-recipe-engine.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            recipe.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    let ffn_down = f.tensors.get("blk.0.ffn_down.weight").unwrap();
+    assert_eq!(
+        ffn_down.dtype,
+        rlx_gguf::GgmlType::Q5K,
+        "recipe must override the engine's Q6K"
+    );
+}
+
+#[test]
+fn gguf_recipe_bare_default_applies_to_unmatched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    // Only ffn_down has a rule; the bare default q8_0 covers everything
+    // else that the method would otherwise quantize.
+    let recipe = tmp.path().join("recipe.txt");
+    std::fs::write(&recipe, "ffn_down\\.weight=q6_k\nq8_0\n").unwrap();
+
+    let out = tmp.path().join("m-default.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            recipe.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    // ffn_down → rule's Q6K; attn_q → default's Q8_0 (not the method's Q4K).
+    assert_eq!(
+        f.tensors.get("blk.0.ffn_down.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q6K
+    );
+    assert_eq!(
+        f.tensors.get("blk.0.attn_q.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q8_0,
+        "bare default must cover unmatched tensors"
+    );
+}
+
+#[test]
+fn gguf_recipe_bad_qtype_exit_2_names_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let recipe = tmp.path().join("recipe.txt");
+    std::fs::write(&recipe, "attn_v\\.weight=bogus\n").unwrap();
+
+    let out = tmp.path().join("x.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            recipe.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("line 1") && stderr.contains("bogus"),
+        "must name line and qtype: {stderr}"
+    );
+    assert!(
+        stderr.contains("recipe"),
+        "must say which file is bad: {stderr}"
+    );
+}
+
+#[test]
+fn gguf_recipe_missing_file_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("x.gguf");
+    let bogus = tmp.path().join("no_recipe.txt");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            bogus.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn gguf_recipe_with_dynamic_method_still_exit_2() {
+    // A recipe cannot smuggle a UD-* method through: the method itself is
+    // rejected before the recipe is even loaded.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let recipe = tmp.path().join("recipe.txt");
+    std::fs::write(&recipe, "attn_v\\.weight=q6_k\n").unwrap();
+    let out = tmp.path().join("x.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_xl",
+            "--tensor-type-file",
+            recipe.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Dynamic 2.0"),
+        "UD-* stays rejected: {stderr}"
+    );
+}
+
+#[test]
+fn gguf_token_embedding_and_output_type_overrides() {
+    // --token-embedding-type / --output-tensor-type win over the method's
+    // embd_scheme and any recipe rule for their tensors.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let recipe = tmp.path().join("recipe.txt");
+    // A recipe that would ALSO hit token_embd (broad pattern) — the
+    // override must still win for token_embd, and the recipe must apply to
+    // per-layer embd (upstream `named` exception only covers
+    // per_layer_token_embd when the recipe names IT specifically).
+    std::fs::write(&recipe, "token_embd\\.weight=q6_k\n").unwrap();
+
+    let out = tmp.path().join("m-over.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--token-embedding-type",
+            "q8_0",
+            "--output-tensor-type",
+            "q6_k",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    assert_eq!(
+        f.tensors.get("token_embd.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q8_0,
+        "--token-embedding-type must win over the F16 embd convention"
+    );
+    assert_eq!(
+        f.tensors.get("output.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q6K,
+        "--output-tensor-type must win"
+    );
+
+    // The overrides must also beat the recipe for their own tensors.
+    let out2 = tmp.path().join("m-over-recipe.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out2.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--token-embedding-type",
+            "q8_0",
+            "--tensor-type-file",
+            recipe.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let f = rlx_gguf::GgufFile::from_path(&out2).unwrap();
+    assert_eq!(
+        f.tensors.get("token_embd.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q8_0,
+        "category override must beat the recipe for token_embd"
+    );
+}
+
+#[test]
+fn gguf_bad_category_override_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("x.gguf");
+    for flag in ["--token-embedding-type", "--output-tensor-type"] {
+        let output = bin()
+            .args([
+                "gguf",
+                model_dir.join("model.safetensors").to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--method",
+                "q4_k_m",
+                flag,
+                "bogus",
+                "--no-progress",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag} with bogus method must exit 2"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(flag),
+            "{flag}: error must name the flag: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn gguf_emit_recipe_round_trip() {
+    // --emit-recipe dumps the effective assignment; feeding the dump back
+    // through --tensor-type-file reproduces the same per-tensor dtypes.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    // Run 1: q4_k_m + emit.
+    let out1 = tmp.path().join("m-a.gguf");
+    let emitted = tmp.path().join("effective.txt");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out1.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--emit-recipe",
+            emitted.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(emitted.exists());
+    let text = std::fs::read_to_string(&emitted).unwrap();
+    assert!(
+        text.contains("^blk.0.attn_q.weight$="),
+        "dump must contain per-tensor lines: {text}"
+    );
+
+    // Run 2: same method, dump fed back via --tensor-type-file.
+    let out2 = tmp.path().join("m-b.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out2.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            emitted.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Every quantized tensor dtype must match run 1.
+    let f1 = rlx_gguf::GgufFile::from_path(&out1).unwrap();
+    let f2 = rlx_gguf::GgufFile::from_path(&out2).unwrap();
+    for (name, t1) in &f1.tensors {
+        let t2 = f2.tensors.get(name).expect("same tensor set");
+        assert_eq!(
+            t1.dtype, t2.dtype,
+            "{name}: round-tripped recipe changed the dtype"
+        );
+    }
+}
+
 // ─── Phase 1.2: q4_1 / q5_1 end-to-end parity lock ──────────────────
 //
 // Phase 1 of the 2026-08-31 Unsloth coverage plan reclassified q4_1/q5_1

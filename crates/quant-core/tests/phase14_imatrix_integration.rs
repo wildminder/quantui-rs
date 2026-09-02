@@ -123,9 +123,8 @@ fn run_weighted_conversion_case(
     let out = tmp.path().join("m-weighted.gguf");
     let cfg = GgufConvertConfig {
         method_id: method_id.into(),
-        arch: None,
-        name: None,
         imatrix: Some(build_imatrix(&weights)),
+        ..Default::default()
     };
     let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None)
         .expect("conversion succeeds");
@@ -236,9 +235,7 @@ fn conversion_without_imatrix_differs() {
     let out = tmp.path().join("m-q4_k_s.gguf");
     let cfg = GgufConvertConfig {
         method_id: "q4_k_s".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None).unwrap();
 

@@ -140,9 +140,7 @@ fn convert_q4_k_m_single_file() {
 
     let cfg = GgufConvertConfig {
         method_id: "q4_k_m".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None)
         .expect("conversion succeeds");
@@ -219,9 +217,7 @@ fn convert_f16_is_lossless_for_floats() {
 
     let cfg = GgufConvertConfig {
         method_id: "f16".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let report =
         convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None).unwrap();
@@ -245,9 +241,7 @@ fn rejects_dynamic_and_unknown_methods() {
 
     let dyn_cfg = GgufConvertConfig {
         method_id: "q4_k_xl".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let err = convert_hf_to_gguf(&input, &out, &dyn_cfg, None).unwrap_err();
     assert!(matches!(
@@ -257,9 +251,7 @@ fn rejects_dynamic_and_unknown_methods() {
 
     let bad_cfg = GgufConvertConfig {
         method_id: "nope".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let err = convert_hf_to_gguf(&input, &out, &bad_cfg, None).unwrap_err();
     assert!(matches!(
@@ -277,9 +269,7 @@ fn progress_callback_fires_per_tensor() {
 
     let cfg = GgufConvertConfig {
         method_id: "q8_0".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let mut calls: Vec<(usize, usize)> = Vec::new();
     let mut cb = |done: usize, total: usize| calls.push((done, total));
@@ -390,9 +380,7 @@ fn convert_sharded_folder() {
     let out = tmp.path().join("shardedmodel-q8_0.gguf");
     let cfg = GgufConvertConfig {
         method_id: "q8_0".into(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let report = convert_hf_to_gguf(&dir, &out, &cfg, None).expect("sharded conversion succeeds");
 

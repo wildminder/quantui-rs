@@ -152,9 +152,7 @@ fn run_conversion(method: &str, dir: &Path) -> (GgufConvertReport, PathBuf) {
     let out = dir.parent().unwrap().join(format!("sweep-{}.gguf", method));
     let cfg = GgufConvertConfig {
         method_id: method.to_string(),
-        arch: None,
-        name: None,
-        imatrix: None,
+        ..Default::default()
     };
     let report = convert_hf_to_gguf(dir.join("model.safetensors").as_path(), &out, &cfg, None)
         .unwrap_or_else(|e| panic!("{method}: conversion failed: {e}"));
