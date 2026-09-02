@@ -243,6 +243,9 @@ pub fn convert_hf_to_gguf(
                 | (GgufScheme::Q6K, Some(_))
                 | (GgufScheme::Iq2Xxs, Some(_))
                 | (GgufScheme::Iq2Xs, Some(_))
+                | (GgufScheme::Iq2S, Some(_))
+                | (GgufScheme::Iq3Xxs, Some(_))
+                | (GgufScheme::Iq3S, Some(_))
         );
         if weighted {
             let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
@@ -281,6 +284,20 @@ pub fn convert_hf_to_gguf(
                     }
                     GgufScheme::Iq2Xs => {
                         crate::gguf_iq_quants::quantize_row_iq2_xs_weighted(row, n_per_row, wv)
+                    }
+                    // iq2_s/iq3_xxs/iq3_s accept Option (their *_ref
+                    // paths pass NULL upstream); the driver always has
+                    // weights here.
+                    GgufScheme::Iq2S => {
+                        crate::gguf_iq_quants::quantize_row_iq2_s_weighted(row, n_per_row, Some(wv))
+                    }
+                    GgufScheme::Iq3Xxs => crate::gguf_iq_quants::quantize_row_iq3_xxs_weighted(
+                        row,
+                        n_per_row,
+                        Some(wv),
+                    ),
+                    GgufScheme::Iq3S => {
+                        crate::gguf_iq_quants::quantize_row_iq3_s_weighted(row, n_per_row, Some(wv))
                     }
                     _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
                 };

@@ -14,5 +14,8 @@
   "q6_k_bytes": 448,
   "iq2_xxs_bytes": 160,
   "iq2_xs_bytes": 160,
+  "iq2_s_bytes": 192,
+  "iq3_xxs_bytes": 224,
+  "iq3_s_bytes": 224,
   "llama_quantize": "<LOCAL-BUILD>\\bin\\llama-quantize.exe"
 }

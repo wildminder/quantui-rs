@@ -310,21 +310,34 @@ def main():
             ("Q6_K", "q6_k"),
             ("IQ2_XXS", "iq2_xxs"),
             ("IQ2_XS", "iq2_xs"),
+            # llama-quantize's --pure ftype table maps "IQ2_S" to
+            # GGML_TYPE_IQ2_XS (llama-quant.cpp:859 — the raw IQ2_S bytes
+            # are only reachable via IQ2_M's per-tensor policy, :860).
+            # To golden the true IQ2_S encoder we pin the tensor explicitly.
+            ("IQ2_S", "iq2_s*override"),
+            ("IQ3_XXS", "iq3_xxs"),
+            ("IQ3_S", "iq3_s"),
         ]:
-            qout = td / f"model-{name}.gguf"
+            qout = td / "model-q.gguf"
             cmd = [
                 str(tool),
                 "--imatrix", str(imx),
                 "--include-weights", "blk.0.attn_q.weight",
                 "--pure",
-                str(model), str(qout), ftype,
             ]
+            base_ftype = ftype
+            if name.endswith("*override"):
+                # Base type can be anything that quantizes the rest; the
+                # --tensor-type override pins our tensor's encoder.
+                base_ftype = "Q4_K"
+                cmd += ["--tensor-type", "attn_q=IQ2_S"]
+            cmd += [str(model), str(qout), base_ftype]
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"[{name}] quantize FAILED:\n{r.stdout}\n{r.stderr}")
                 sys.exit(1)
             payload = read_gguf_tensor(qout, "blk.0.attn_q.weight")
-            results[name] = payload
+            results[name.replace("*override", "")] = payload
             print(f"[{name}] payload: {len(payload)} bytes")
 
         # Save goldens + the shared inputs. The imatrix entry carries ONE

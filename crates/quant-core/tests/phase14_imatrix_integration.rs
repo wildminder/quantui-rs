@@ -183,6 +183,25 @@ fn conversion_with_imatrix_matches_llama_quantize_bytes_iq2_xs() {
 }
 
 #[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes_iq2_s() {
+    run_weighted_conversion_case("iq2_s", "weighted.iq2_s.bin", rlx_gguf::GgmlType::IQ2S);
+}
+
+#[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes_iq3_xxs() {
+    run_weighted_conversion_case(
+        "iq3_xxs",
+        "weighted.iq3_xxs.bin",
+        rlx_gguf::GgmlType::IQ3XXS,
+    );
+}
+
+#[test]
+fn conversion_with_imatrix_matches_llama_quantize_bytes_iq3_s() {
+    run_weighted_conversion_case("iq3_s", "weighted.iq3_s.bin", rlx_gguf::GgmlType::IQ3S);
+}
+
+#[test]
 fn conversion_without_imatrix_differs() {
     // The negative control: rlx-gguf's unweighted Q4K is a different
     // (documented simpler) search — so the bytes must NOT match the

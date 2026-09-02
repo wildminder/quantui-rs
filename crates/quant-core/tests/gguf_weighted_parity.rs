@@ -197,3 +197,69 @@ fn weighted_iq2_xs_byte_exact_vs_llama_quantize() {
         "weighted IQ2_XS bytes differ from llama-quantize"
     );
 }
+
+#[test]
+fn weighted_iq2_s_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq2_s.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ2_S_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq2_s_weighted(
+            row,
+            QK_K,
+            Some(&weights),
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ2_S bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_iq3_xxs_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq3_xxs.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ3_XXS_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq3_xxs_weighted(
+            row,
+            QK_K,
+            Some(&weights),
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ3_XXS bytes differ from llama-quantize"
+    );
+}
+
+#[test]
+fn weighted_iq3_s_byte_exact_vs_llama_quantize() {
+    let src = load_f32("src.f32.bin", N_ROWS * QK_K);
+    let weights = load_f32("weights.f32.bin", QK_K);
+    let raw = std::fs::read(golden_dir().join("weighted.iq3_s.bin")).unwrap();
+    let golden = &raw[..N_ROWS * quant_core::gguf_iq_quants::IQ3_S_BLOCK_BYTES];
+
+    let mut ours = Vec::new();
+    for r in 0..N_ROWS {
+        let row = &src[r * QK_K..(r + 1) * QK_K];
+        ours.extend(quant_core::gguf_iq_quants::quantize_row_iq3_s_weighted(
+            row,
+            QK_K,
+            Some(&weights),
+        ));
+    }
+    assert_eq!(
+        ours, golden,
+        "weighted IQ3_S bytes differ from llama-quantize"
+    );
+}
