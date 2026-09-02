@@ -71,7 +71,7 @@ pub fn run(args: GgufArgs) -> ExitCode {
     // Validate the method early so a typo fails with exit 2 (usage), not 1.
     // Phase 2.1: every rejection names the specific cause and suggests only
     // methods that can actually run (usable_ids).
-    match gguf_registry::get_method(&args.method) {
+    let entry = match gguf_registry::get_method(&args.method) {
         None => {
             eprintln!(
                 "error: unknown GGUF method '{}'. Supported: {}",
@@ -101,8 +101,40 @@ pub fn run(args: GgufArgs) -> ExitCode {
             eprintln!("Supported: {}", gguf_registry::usable_ids().join(", "));
             return ExitCode::from(2);
         }
-        Some(_) => {}
-    }
+        Some(e) => e,
+    };
+
+    // Phase 4.2: Unsloth-style imatrix gate (save.py:2162 — every iq* id is
+    // in IMATRIX_QUANTS). An iq* method without --imatrix would produce
+    // garbage (llama-quantize refuses the same way: "this quantization
+    // requires an imatrix!", llama-quant.cpp:1084-1090), so reject it up
+    // front with exit 2 naming the method and the flag.
+    let imatrix = if entry.method.requires_imatrix {
+        let Some(path) = &args.imatrix else {
+            eprintln!(
+                "error: GGUF method '{}' requires an importance matrix (--imatrix <PATH>).",
+                args.method
+            );
+            eprintln!("Without it the quantized weights would be garbage; llama-quantize refuses the same conversion.");
+            eprintln!("hint: pass --imatrix <imatrix_file> (GGUF or legacy binary format).");
+            return ExitCode::from(2);
+        };
+        match load_imatrix(path) {
+            Ok(im) => Some(im),
+            Err(code) => return code,
+        }
+    } else if let Some(path) = &args.imatrix {
+        // Not required for this method, but the user pointed at a file —
+        // load it anyway (llama-quantize accepts --imatrix with any ftype;
+        // K-quants simply consume the weights per tensor). A bad file is
+        // still a hard error: the user asked for it explicitly.
+        match load_imatrix(path) {
+            Ok(im) => Some(im),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
 
     let output = args
         .output
@@ -113,7 +145,7 @@ pub fn run(args: GgufArgs) -> ExitCode {
         method_id: args.method.clone(),
         arch: args.arch.clone(),
         name: args.name.clone(),
-        imatrix: None,
+        imatrix,
     };
 
     let mut sink: Box<dyn ProgressSink> = if args.no_progress {
@@ -170,6 +202,32 @@ pub fn run(args: GgufArgs) -> ExitCode {
             };
             eprintln!("error: {e}");
             ExitCode::from(code)
+        }
+    }
+}
+
+/// Load an imatrix file, or fail with exit 2 and the loader's specific
+/// cause. Phase 4.2 contract: a bad --imatrix is a usage error (the user
+/// handed us an unusable file), never a mid-conversion runtime crash.
+fn load_imatrix(path: &std::path::Path) -> Result<quant_core::imatrix::Imatrix, ExitCode> {
+    match quant_core::imatrix::Imatrix::load(path) {
+        Ok(im) => {
+            eprintln!(
+                "imatrix: loaded {} importance matrix entries from {} ({} chunks, dataset{})",
+                im.len(),
+                path.display(),
+                im.chunk_count,
+                im.datasets
+                    .first()
+                    .map(|d| format!(" '{d}'"))
+                    .unwrap_or_default()
+            );
+            Ok(im)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!("hint: the file must be a GGUF imatrix or a legacy binary imatrix.");
+            Err(ExitCode::from(2))
         }
     }
 }

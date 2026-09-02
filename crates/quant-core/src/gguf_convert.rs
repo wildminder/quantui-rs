@@ -223,17 +223,90 @@ pub fn convert_hf_to_gguf(
             dtype: info.dtype,
         })?;
 
-        // Phase 4.4: weighted path. When an imatrix is configured AND it
-        // carries this tensor AND the scheme is one of the ported weighted
-        // encoders (Q4_K / Q2_K / Q3_K / Q5_K / Q6_K — byte-parity tier vs
-        // llama-quantize), quantize row by row with the shared per-tensor
-        // weight vector, exactly as llama.cpp does (llama-quant.cpp:1260-1276
-        // drives ggml_quantize_chunk per slab; ggml-quants.c:1626-1640
-        // advances src per row while quant_weights stays at the entry base).
-        let weights = cfg
+        // Phase 4.4 entry semantics (llama-quant.cpp:1222-1251, :803-822):
+        // - no imatrix configured → legacy behaviour: everything goes
+        //   through the unweighted encoders (rlx for IQ*; the Option-None
+        //   `av_x + |x|` path for K-quants) — byte-identical to the
+        //   pre-Phase-4 output, and what the method-matrix sweep locks.
+        // - imatrix configured but no entry for this tensor:
+        //     * IQ-scheme tensor → HARD ERROR (very-low-bit garbage;
+        //       llama-quant.cpp:1245-1251 bails out the same way);
+        //     * Q2_K under q2_k_s → HARD ERROR (:818);
+        //     * any other K-quant → warn + proceed unweighted (:1226
+        //       logs "did not find weights" at INFO);
+        //     * token_embd / output are exempt from the hard errors (:804)
+        //       and a SIZE-mismatched token_embd entry is dropped with a
+        //       note (:1238 — "tok_embd should be ignored in this case").
+        let exempt = matches!(
+            gguf_name.as_str(),
+            "token_embd.weight" | "per_layer_token_embd.weight" | "output.weight"
+        );
+        let is_iq_scheme = matches!(
+            scheme,
+            GgufScheme::Iq1S
+                | GgufScheme::Iq1M
+                | GgufScheme::Iq2Xxs
+                | GgufScheme::Iq2Xs
+                | GgufScheme::Iq2S
+                | GgufScheme::Iq3Xxs
+                | GgufScheme::Iq3S
+                | GgufScheme::Iq4Nl
+                | GgufScheme::Iq4Xs
+        );
+        let mut weights = cfg
             .imatrix
             .as_ref()
             .and_then(|im| im.weights_for(&gguf_name));
+        if cfg.imatrix.is_some() {
+            let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
+            if let Some(wv) = weights {
+                if n_per_row == 0 || wv.len() != n_per_row {
+                    if matches!(
+                        gguf_name.as_str(),
+                        "token_embd.weight" | "per_layer_token_embd.weight"
+                    ) {
+                        eprintln!(
+                            "note: imatrix size {} != n_per_row {} for tensor '{gguf_name}' — \
+                             quantizing it without weights (llama-quantize ignores tok_embd mismatches)",
+                            wv.len(),
+                            n_per_row
+                        );
+                        weights = None;
+                    } else {
+                        return Err(GgufError::Imatrix(format!(
+                            "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
+                            wv.len(),
+                            n_per_row
+                        )));
+                    }
+                }
+            }
+            if weights.is_none() {
+                // llama-quant.cpp:803-822 hard-requires an entry for IQ
+                // schemes (and Q2_K under the Q2_K_S ftype — but our
+                // registry has no q2_k_s method, Unsloth ships q2_k /
+                // q2_k_l, so that branch cannot occur here). token_embd /
+                // output are always exempt (:804-806).
+                let requires = is_iq_scheme && !exempt;
+                if requires {
+                    return Err(GgufError::Imatrix(format!(
+                        "Missing importance matrix for tensor '{gguf_name}' in a very low-bit \
+                         quantization (method '{}'); the result would be garbage, so bailing out",
+                        cfg.method_id
+                    )));
+                }
+                // Upstream logs "did not find weights" (llama-quant.cpp:1226)
+                // for every tensor lacking an entry. We note 2-D tensors
+                // only — 1-D norms/biases never carry imatrix entries, and a
+                // note per norm would be pure noise.
+                if ndim >= 2 {
+                    eprintln!(
+                        "note: did not find weights for '{gguf_name}' — quantizing it without \
+                         an importance matrix (llama-quantize logs the same)"
+                    );
+                }
+            }
+        }
         let weighted = matches!(
             (scheme, weights),
             (GgufScheme::Q4K, Some(_))

@@ -180,6 +180,13 @@ pub struct GgufArgs {
     #[arg(long, short = 'm', default_value = "q4_k_m")]
     pub method: String,
 
+    /// Importance matrix file (GGUF or legacy binary) used by the weighted
+    /// quantizers. REQUIRED for every `iq*` method — without it those
+    /// methods exit 2 (the result would be garbage; same contract as
+    /// llama-quantize and Unsloth's `imatrix_file=`).
+    #[arg(long, value_name = "PATH")]
+    pub imatrix: Option<PathBuf>,
+
     /// Override the GGUF architecture string (else detected from config.json).
     #[arg(long)]
     pub arch: Option<String>,

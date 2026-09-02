@@ -409,6 +409,367 @@ fn gguf_bad_input_path_exit_2() {
     assert_eq!(status.code(), Some(2));
 }
 
+// ─── Phase 4.2: --imatrix flag + iq* gate (Unsloth save.py:2162) ──────
+//
+// Every iq* method is in official Unsloth IMATRIX_QUANTS: without an
+// importance matrix the quantized weights would be garbage, so the CLI
+// rejects the combination with exit 2 (same contract as llama-quantize's
+// "this quantization requires an imatrix!", llama-quant.cpp:1084-1090).
+
+use quant_core::imatrix::Imatrix;
+
+/// All eleven iq* method ids — must all be gated.
+const IQ_METHODS_ALL: [&str; 11] = [
+    "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq4_nl", "iq4_xs",
+    "iq2_m", "iq3_m",
+];
+
+fn write_legacy_imatrix(dir: &Path, name: &str, weights: &[f32]) -> std::path::PathBuf {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1i32.to_le_bytes()); // n_entries
+    out.extend_from_slice(&(name.len() as i32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&1i32.to_le_bytes()); // ncall = 1 → sums/1 = weights
+    out.extend_from_slice(&(weights.len() as i32).to_le_bytes());
+    for v in weights {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let p = dir.join("imatrix.dat");
+    std::fs::write(&p, out).unwrap();
+    p
+}
+
+#[test]
+fn gguf_iq_method_without_imatrix_flag_exit_2() {
+    // Every iq* id, no --imatrix → exit 2, message names method + flag.
+    // Reuses one fixture dir; the method check happens before any I/O.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("x.gguf");
+    for method in IQ_METHODS_ALL {
+        let output = bin()
+            .args([
+                "gguf",
+                model_dir.join("model.safetensors").to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--method",
+                method,
+                "--no-progress",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{method}: iq* without --imatrix must exit 2"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(method),
+            "{method}: message must name the method: {stderr}"
+        );
+        assert!(
+            stderr.contains("--imatrix"),
+            "{method}: message must name the flag: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{method}: no output may be written on rejection"
+        );
+    }
+}
+
+#[test]
+fn gguf_iq_method_with_missing_imatrix_file_exit_2() {
+    // --imatrix pointing at a non-existent file → exit 2 with the loader's
+    // message naming the path.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("x.gguf");
+    let bogus = tmp.path().join("no_such_imatrix.dat");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "iq2_xxs",
+            "--imatrix",
+            bogus.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no_such_imatrix.dat"),
+        "must name the path: {stderr}"
+    );
+}
+
+#[test]
+fn gguf_iq_method_with_malformed_imatrix_exit_2() {
+    // A file that is neither GGUF nor legacy → exit 2 with a specific cause.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("x.gguf");
+    let junk = tmp.path().join("junk.dat");
+    std::fs::write(&junk, b"definitely not an imatrix").unwrap();
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "iq2_xxs",
+            "--imatrix",
+            junk.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a GGUF and not a valid legacy"),
+        "must carry the loader's specific cause: {stderr}"
+    );
+}
+
+#[test]
+fn gguf_iq_method_with_imatrix_proceeds() {
+    // With a valid imatrix covering every quantized tensor, iq2_xxs runs
+    // to completion (exit 0) and produces byte-identical attn_q bytes to
+    // the golden llama-quantize --imatrix output for the same source.
+    // The tiny model's tensors: h=32, v=64 — attn_q is 32×32, so the
+    // weight vector needs 32 entries... but the tiny model's shapes are
+    // too small for IQ2XXS's QK_K=256 blocks. Use the phase14 layout
+    // instead (256-col attn_q) and its committed golden.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    // Read the shared golden source + weights (same files the phase14
+    // core-level tests consume).
+    let mut gd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    gd.pop();
+    gd.pop();
+    let gd = gd.join("tests/golden/llamacpp");
+    let read_f32 = |name: &str, n: usize| {
+        let raw = std::fs::read(gd.join(name)).unwrap();
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .take(n)
+            .collect::<Vec<f32>>()
+    };
+    let src = read_f32("src.f32.bin", 512);
+    let weights = read_f32("weights.f32.bin", 256);
+
+    let w_bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tensors = vec![Tensor {
+        name: "model.layers.0.self_attn.q_proj.weight",
+        dtype: "F32",
+        shape: vec![2, 256],
+        bytes: w_bytes,
+    }];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 256,
+            "num_hidden_layers": 1,
+            "vocab_size": 64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let imatrix = write_legacy_imatrix(tmp.path(), "blk.0.attn_q.weight", &weights);
+
+    let out = tmp.path().join("m-iq2_xxs.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "iq2_xxs",
+            "--imatrix",
+            imatrix.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "iq2_xxs with a valid imatrix must proceed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("loaded 1 importance matrix entries"),
+        "must log the load: {stderr}"
+    );
+
+    // Byte-exact vs the llama-quantize golden (same contract as the
+    // phase14 core test, now through the CLI flag).
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    let t = f.tensors.get("blk.0.attn_q.weight").unwrap();
+    assert_eq!(t.dtype, rlx_gguf::GgmlType::IQ2XXS);
+    let got = f.tensor_bytes(t).unwrap();
+    let golden = std::fs::read(gd.join("weighted.iq2_xxs.bin")).unwrap();
+    assert_eq!(
+        got,
+        &golden[..got.len()],
+        "CLI path must reproduce llama-quantize bytes"
+    );
+}
+
+#[test]
+fn gguf_iq_tensor_missing_imatrix_entry_hard_error() {
+    // imatrix loaded but has NO entry for the IQ tensor being quantized →
+    // the conversion must hard-fail (llama-quant.cpp:1245-1251), not
+    // silently produce garbage. Exit 1 (runtime failure mid-conversion).
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("x.gguf");
+
+    // An imatrix with an entry for a DIFFERENT tensor name.
+    let imatrix = write_legacy_imatrix(tmp.path(), "blk.5.attn_q.weight", &[1.0f32; 32]);
+
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "iq4_nl",
+            "--imatrix",
+            imatrix.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing entry on an iq* tensor must hard-fail (not garbage)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Missing importance matrix for tensor"),
+        "must name the missing tensor: {stderr}"
+    );
+}
+
+#[test]
+fn gguf_k_method_with_imatrix_is_optional_and_consumed() {
+    // K-quant methods accept --imatrix as OPTIONAL (no gate): a file
+    // covering attn_q makes q4_k_s take the weighted path and produce
+    // the llama-quantize golden bytes for that tensor; other 2-D
+    // tensors (embed/down/lm_head) get the "did not find weights" note
+    // and stay unweighted — exactly llama-quantize's behaviour.
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    let mut gd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    gd.pop();
+    gd.pop();
+    let gd = gd.join("tests/golden/llamacpp");
+    let read_f32 = |name: &str, n: usize| {
+        let raw = std::fs::read(gd.join(name)).unwrap();
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .take(n)
+            .collect::<Vec<f32>>()
+    };
+    let src = read_f32("src.f32.bin", 512);
+    let weights = read_f32("weights.f32.bin", 256);
+
+    let w_bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tensors = vec![Tensor {
+        name: "model.layers.0.self_attn.q_proj.weight",
+        dtype: "F32",
+        shape: vec![2, 256],
+        bytes: w_bytes,
+    }];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 256,
+            "num_hidden_layers": 1,
+            "vocab_size": 64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let imatrix = write_legacy_imatrix(tmp.path(), "blk.0.attn_q.weight", &weights);
+
+    let out = tmp.path().join("m-q4_k_s.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_s",
+            "--imatrix",
+            imatrix.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "K-quant with imatrix must proceed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    let t = f.tensors.get("blk.0.attn_q.weight").unwrap();
+    assert_eq!(t.dtype, rlx_gguf::GgmlType::Q4K);
+    let got = f.tensor_bytes(t).unwrap();
+    let golden = std::fs::read(gd.join("weighted.q4_k.bin")).unwrap();
+    assert_eq!(
+        got,
+        &golden[..got.len()],
+        "q4_k_s with imatrix must reproduce llama-quantize weighted bytes"
+    );
+}
+
+// Keep the Imatrix import used (loader exercised indirectly through the
+// CLI in tests above; this anchors the direct load path too).
+#[test]
+fn imatrix_legacy_load_direct() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = write_legacy_imatrix(tmp.path(), "blk.0.attn_q.weight", &[0.5f32, 2.0]);
+    let im = Imatrix::load(&p).unwrap();
+    assert_eq!(im.len(), 1);
+    assert_eq!(im.weights_for("blk.0.attn_q.weight").unwrap(), &[0.5, 2.0]);
+    assert!(im.is_legacy);
+}
+
 // ─── Phase 1.2: q4_1 / q5_1 end-to-end parity lock ──────────────────
 //
 // Phase 1 of the 2026-08-31 Unsloth coverage plan reclassified q4_1/q5_1
