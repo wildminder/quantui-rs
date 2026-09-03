@@ -14,3 +14,6 @@ docs/
 # Debug-harness build artifacts (tools/*.exe, *.obj)
 tools/*.exe
 tools/*.obj
+# Phase 8.3 e2e sweep working dir: fixture + outputs are deterministically
+# regenerable via tools/gen_sweep_fixture.py — never commit the artifacts.
+tools/sweep_e2e/

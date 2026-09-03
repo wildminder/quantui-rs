@@ -6,13 +6,16 @@ hard contract: **outputs are byte-exact against the Python/torch reference** on
 all supported paths.
 
 It quantizes Hugging Face `safetensors` models (single file or sharded folder)
-to ComfyUI-compatible **INT8, FP8 E4M3, MXFP8 and NVFP4** outputs, converts HF
-models to GGUF, validates quantized files, and inspects safetensors headers —
-with resumable streaming, progress bars, and graceful Ctrl-C stops.
+to ComfyUI-compatible **INT8 (plain or Hadamard-rotated), FP8 E4M3, MXFP8 and
+NVFP4** outputs, converts HF models to GGUF (34 usable quantization methods,
+including all K-quants and IQ\* via `--imatrix`), validates quantized files,
+and inspects safetensors headers — with resumable streaming, progress bars,
+and graceful Ctrl-C stops.
 
 ## Highlights
 
-- **Four target formats**: `--format int8` (default), `fp8_e4m3`, `mxfp8`,
+- **Five target formats**: `--format int8` (default), `int8_convrot`
+  (row-wise INT8 + group-wise Hadamard rotation), `fp8_e4m3`, `mxfp8`,
   `nvfp4` — all reachable from the CLI, all verified against Python/torch
   goldens.
 - **Byte-exact parity** with the Python reference: streaming quantization
@@ -25,8 +28,11 @@ with resumable streaming, progress bars, and graceful Ctrl-C stops.
 - **Sharded HF models**: reads `model.safetensors.index.json` folders, supports
   `--output-mode sharded` (one output per input shard) or `single` (merge).
 - **GGUF conversion**: native HF → GGUF with llama.cpp-compatible naming,
-  per-method tensor policies (`q4_k_m`, `q8_0`, …), and byte-identical legacy
-  quant encoders (verified against gguf-py).
+  per-method tensor policies — 34 usable methods including every K-quant,
+  IQ\* (via `--imatrix`), ternary and 1/2-bit scheme, all byte-identical to
+  the corresponding reference encoders; plus per-tensor recipe overrides
+  (`--tensor-type-file`, the open equivalent of Unsloth's proprietary
+  `UD-*` presets).
 - **Zero runtime dependencies**: one static binary, no Python, no torch.
 
 ## Building
@@ -182,6 +188,34 @@ this pinning is what makes streaming runs reproducible and byte-identical to
 the reference. Don't change the seed unless you intentionally want a different
 (but still valid) correction.
 
+## `int8_convrot`: INT8 with Hadamard rotation
+
+```sh
+quantui-rs quantize mymodel.safetensors --format int8_convrot
+```
+
+A preset, not a free-form combination: **INT8 row-wise** quantization with a
+group-wise Hadamard rotation (`convrot_group_size=256`, the reference default)
+applied to each 2-D weight before quantization, followed by rotation-aware
+bias correction (`Y_ref = X_rot @ W_rotᵀ` vs `Y_qnt = X_rot @ W_dqᵀ`). The
+CLI forces row mode — the reference only rotates in row mode, so accepting
+`--scaling-mode block` here would silently produce an unrotated layer.
+
+Per tensor, exactly like the reference:
+
+- `in_features % 256 == 0` → rotated; the `.comfy_quant` blob carries
+  `{"convrot": true, "convrot_groupsize": 256, "per_row": true}`.
+- Not divisible (or 1-D/4-D shapes) → plain row-wise INT8, blob keeps
+  `per_row: true` and drops only the `convrot` keys.
+- Skip heuristics apply (`--heur`, default on): layers whose dims are < 128
+  or not divisible by 128 are cast to bf16, unquantized.
+
+Byte-exact vs `convert_to_quant`'s batch path — 8 golden cases at group sizes
+256 and 64 lock the rotation gate, both bias-correction paths, the blob
+strings, and per-tensor payload bytes. Verified per-tensor (the ctq batch
+driver writes tensors in its own processing order with sorted keys, so
+whole-file equality does not apply).
+
 ## Beyond INT8: FP8 E4M3 / MXFP8 / NVFP4
 
 ```sh
@@ -254,10 +288,12 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
   [OUTPUT]                .safetensors file (single/merged) or directory
                           (sharded); omitted = auto-named
 
-      --format <FORMAT>   int8 | fp8_e4m3 | mxfp8 | nvfp4  [default: int8]
+      --format <FORMAT>   int8 | int8_convrot | fp8_e4m3 | mxfp8 |
+                          nvfp4                      [default: int8]
   -m, --scaling-mode <M>  tensor | row | block            [default: block]
                           (INT8/FP8 only; MXFP8/NVFP4 are fixed-block —
-                           passing it with those exits 2)
+                           passing it with those exits 2;
+                           int8_convrot forces row, ignoring the flag)
   -b, --block-size <BS>   64 | 128 | 256                  [default: 128]
                           (INT8/FP8 only; MXFP8=32, NVFP4=16 are fixed —
                            passing it with those exits 2)
@@ -276,14 +312,13 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
 ```sh
 quantui-rs gguf mymodel.safetensors                 # q4_k_m (default)
 quantui-rs gguf ./my-hf-model -m q8_0 out.gguf      # sharded folder input
-quantui-rs gguf mymodel.safetensors --arch qwen2 --name "My Model"
+quantui-rs gguf mymodel.safetensors -m iq4_xs --imatrix imatrix.dat
+quantui-rs gguf mymodel.safetensors --tensor-type-file recipe.txt
 quantui-rs gguf --list-methods                      # show all methods
 ```
 
-- **Methods**: all standard llama.cpp methods are supported natively —
-  `f16`, `q8_0`, `q6_k`, `q5_k_m`, `q5_k_s`, `q5_0`, `q4_k_m`, `q4_k_s`,
-  `q4_0`, `q3_k_m`, `q3_k_l`, `q3_k_s`, `q3_k_xs`, `q2_k`, `iq4_nl`,
-  `iq3_xxs`, `iq2_xxs`, `iq2_xs`. Output is auto-named `<base>-<method>.gguf`.
+- **Methods**: 34 usable — every non-`UD-*` method in official Unsloth's
+  list (see the matrix below). Output is auto-named `<base>-<method>.gguf`.
 - **Per-tensor policy**: composite methods apply llama-quantize rules
   (e.g. `q4_k_m` uses Q6_K for key/output tensors, Q4_K elsewhere; 1-D
   tensors → F32, embeddings → F16 where the method prescribes it).
@@ -293,9 +328,38 @@ quantui-rs gguf --list-methods                      # show all methods
 - **Tensor naming** follows llama.cpp conventions for the dense
   llama/qwen/mistral/gemma family (`model.layers.0.self_attn.q_proj.weight` →
   `blk.0.attn_q.weight`), with HF→GGUF dimension reversal.
-- **Rejected**: Unsloth Dynamic 2.0 variants (`q5_1`, `q4_1`, `q4_nl`,
-  `q4_k_xl`, `q3_k_xl`, `q2_k_xl`) — they require proprietary per-layer
-  bit-width heuristics (exit code 2 with an explanation).
+- **Per-tensor recipes** (`--tensor-type-file`): `regex=qtype` lines,
+  first-match-wins against the GGUF tensor name, optional trailing bare
+  `qtype` as default. `--token-embedding-type` / `--output-tensor-type`
+  override those two categories. `--emit-recipe <path>` dumps the effective
+  per-tensor assignment; feeding the dump back reproduces it exactly.
+
+### Method capability matrix
+
+All 38 methods in the registry (Unsloth's list plus llama.cpp-only
+`q1_0`/`q2_0`), with their capability class and parity tier:
+
+| Method | Class | Parity |
+|---|---|---|
+| `f16`, `bf16`, `f32` | usable, no imatrix | byte-exact vs gguf-py writer (`f16`/`bf16`); `f32` is a lossless passthrough |
+| `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1` | usable, no imatrix | byte-exact vs gguf-py writer (49/49 golden cases) |
+| `q2_k`, `q2_k_l`, `q3_k_*` (`m/l/s/xs`), `q4_k_*` (`m/s`), `q5_k_*` (`m/s`), `q6_k` | usable, no imatrix | byte-exact vs llama-quantize (weighted, `--imatrix` goldens); no-imatrix path locked by a `None ≡ uniform-1.0` equivalence test + the structural sweep |
+| `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`, `iq2_s`, `iq2_m`, `iq3_xxs`, `iq3_s`, `iq3_m`, `iq4_nl`, `iq4_xs` | usable, **requires `--imatrix`** | byte-exact vs llama-quantize (weighted, `--imatrix` goldens) |
+| `tq1_0`, `tq2_0` | usable, no imatrix | structural (encode + bounded round-trip) |
+| `q1_0`, `q2_0` | usable, no imatrix | structural (encode + bounded round-trip) |
+| `q4_nl`, `q4_k_xl`, `q3_k_xl`, `q2_k_xl` | **rejected** (exit 2) | Unsloth Dynamic 2.0 — proprietary per-layer bit-width heuristic |
+
+**The imatrix caveat**: every `iq*` method requires an importance matrix
+(`--imatrix <PATH>`). Without it, quantization produces garbage — the same
+conversion llama-quantize refuses. The matrix is consumed per-tensor by the
+weighted quantizers; `K-quants` also consume one when supplied (optional
+for them). Files load in GGUF or llama-quantize's legacy binary format.
+
+**The `UD-*` boundary**: Unsloth's Dynamic 2.0 presets (`UD-Q4_K_XL` etc.)
+are a proprietary per-layer bit-width heuristic. They are rejected with exit
+2 and an explanation. `--tensor-type-file` is the open equivalent: any
+per-tensor recipe expressible as a first-match-wins regex list reproduces
+what a `UD-*` preset does, with your own choices explicit and inspectable.
 
 ## `validate` — check a quantized output
 
@@ -361,16 +425,29 @@ table plus detected comfy_quant formats per layer.
   reference streamer) and the ctq formats (alphabetical, since ctq builds its
   key list from `safetensors.safe_open.keys()`, which is always sorted) —
   locked in both directions by `tests/golden/sharded_unsorted`.
-- GGUF legacy encoders F16/BF16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1 — byte-identical to
+- GGUF legacy encoders F16/BF16/F32/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1 — byte-identical to
   gguf-py (49/49 golden cases).
+- GGUF weighted K-quant and IQ\* row quantizers (Q4_K/Q2_K/Q3_K/Q5_K/Q6_K,
+  iq1_s/m, iq2_xxs/xs/s/m, iq3_xxs/s/m, iq4_nl/xs) — byte-identical to the
+  real `llama-quantize --imatrix` on shared fixtures, at both the unit and
+  the full-driver e2e tier (14/14 each).
+- INT8 row scaling reproduces torch's exact float semantics — including
+  `127.0/row_max` computed as `127.0 * reciprocal(row_max)` (torch's
+  `div_true_kernel` double-rounds scalar/tensor division) — locked by the
+  `int8_convrot` goldens, including both ConvRot bias-correction paths.
 
 **Documented boundaries (out of scope for v1):**
 
-- GGUF K-quants/IQ\* produce valid files but are **not** byte-identical to
-  llama.cpp (simpler min/max search than upstream `make_qx_quants`).
+- GGUF ternary (`tq1_0`/`tq2_0`) and 1/2-bit (`q1_0`/`q2_0`) encoders are
+  structurally verified (encode + bounded round-trip) but have no external
+  byte-parity reference (not in gguf-py; llama.cpp only).
+- GGUF K-quant byte-parity goldens are generated **with** an imatrix; the
+  no-imatrix path is locked by a `None ≡ uniform-1.0` equivalence test
+  (llama.cpp's `if (!quant_weights)` branch), not by an external golden.
 - Learned-rounding optimizers (AdamW/RAdam/Prodigy) remain Python-only.
-- Unsloth Dynamic 2.0 per-layer mixing is proprietary and not replicated.
-- ConvRot int8 and W4A4/W4A8 layouts are deferred to v2.
+- Unsloth Dynamic 2.0 per-layer mixing is proprietary and not replicated
+  (`--tensor-type-file` is the open equivalent).
+- W4A4/W4A8 layouts are deferred to v2.
 
 ## Performance
 
@@ -403,7 +480,7 @@ docs/plans/            design plan + execution log
 ## Development
 
 ```sh
-cargo test --workspace                 # 304 tests incl. golden byte-parity
+cargo test --workspace                 # 452 tests incl. golden byte-parity
 cargo clippy --workspace --all-targets # clean with -D warnings
 cargo fmt --check
 cargo bench -p quant-core              # throughput benchmarks (needs fixture)
