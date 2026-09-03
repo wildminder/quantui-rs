@@ -100,6 +100,30 @@ pub fn encode_standard(format: &str, orig_dtype: &str, group_size: Option<u32>) 
     s.into_bytes()
 }
 
+/// ConvRot INT8 row-wise blob (plan Phase 7.1).
+///
+/// Still family A — same `create_comfy_quant_tensor` insertion order
+/// (`format`, `orig_dtype`, [`group_size`], [`full_precision_matrix_mult`],
+/// `convrot`, `convrot_groupsize`, `per_row` — `utils/comfy_quant.py:24-60`),
+/// with the ConvRot tail keys present. ConvRot is INT8 row-wise ONLY, so:
+///
+/// * `format` is `int8_tensorwise` (`fp8_conversion.py:580-582`: both `tensor`
+///   and `row` map to it), which is NOT in `BLOCK_BASED_FORMATS` → no
+///   `group_size` key even though ConvRot has a group size of its own;
+/// * `full_precision_matrix_mult` is never set by the streaming path → omitted;
+/// * `convrot=true` + `convrot_groupsize=<gs>` (`fp8_conversion.py:594` passes
+///   the group size only when `convrot_applied`);
+/// * `per_row=true` because `converter.scaling_mode == "row"` (`:594`).
+///
+/// Exact emitted string (json.dumps default separators):
+/// `{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "convrot": true, "convrot_groupsize": 256, "per_row": true}`
+pub fn encode_comfy_quant_int8_convrot(orig_dtype: &str, convrot_groupsize: u32) -> Vec<u8> {
+    format!(
+        r#"{{"format": "{INT8_TENSORWISE}", "orig_dtype": "{orig_dtype}", "convrot": true, "convrot_groupsize": {convrot_groupsize}, "per_row": true}}"#
+    )
+    .into_bytes()
+}
+
 /// Family-B blob (MXFP8 / NVFP4): direct-dict key order
 /// `format, group_size, orig_dtype, orig_shape`.
 pub fn encode_block_format(
@@ -434,6 +458,35 @@ mod tests {
         assert_eq!(
             String::from_utf8(b).unwrap(),
             r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16"}"#
+        );
+    }
+
+    /// Phase 7.1: the ConvRot blob is family A with the ConvRot tail keys, in
+    /// `create_comfy_quant_tensor` order — `format`, `orig_dtype`, `convrot`,
+    /// `convrot_groupsize`, `per_row` (no `group_size`: `int8_tensorwise` is
+    /// not block-based, so the ConvRot group size lives in its own key).
+    #[test]
+    fn family_a_int8_convrot_exact_bytes() {
+        let b = encode_comfy_quant_int8_convrot("torch.bfloat16", 256);
+        assert_eq!(
+            String::from_utf8(b).unwrap(),
+            r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "convrot": true, "convrot_groupsize": 256, "per_row": true}"#
+        );
+        // float16 policy + a different group size keep the same key order.
+        assert_eq!(
+            String::from_utf8(encode_comfy_quant_int8_convrot("torch.float16", 64)).unwrap(),
+            r#"{"format": "int8_tensorwise", "orig_dtype": "torch.float16", "convrot": true, "convrot_groupsize": 64, "per_row": true}"#
+        );
+    }
+
+    /// The ConvRot blob must not collide with the plain row-wise INT8 blob:
+    /// the plain path emits no `convrot`/`per_row` keys at all (its goldens
+    /// are already locked without them).
+    #[test]
+    fn convrot_blob_differs_from_plain_int8_rowwise() {
+        assert_ne!(
+            encode_comfy_quant_int8_convrot("torch.bfloat16", 256),
+            encode_standard(INT8_TENSORWISE, "torch.bfloat16", None)
         );
     }
 

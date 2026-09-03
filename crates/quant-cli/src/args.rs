@@ -39,11 +39,13 @@ pub enum OrigDtypeArg {
 /// `fp8_e4m3` / `mxfp8` / `nvfp4` are wired into the streaming
 /// orchestrator (plan docs/plans/2026-08-28-all-formats-wiring-plan.md).
 ///
-/// `int8_convrot` is SELECTABLE BUT ALWAYS REJECTED (plan Phase 7.0
-/// honesty guard, decision Q3): the Hadamard rotation kernel is not
-/// implemented yet, and silently emitting plain INT8 under a ConvRot
-/// name would produce a model that looks pre-quantized-rotated but
-/// isn't. Selecting it exits 2 with a message naming the phase.
+/// `int8_convrot` (plan Phase 7.1) is INT8 **row-wise** with a group-wise
+/// Hadamard rotation applied to the weight before quantization, at a FIXED
+/// group size of 256. `--scaling-mode` / `--block-size` do not apply: the
+/// reference only rotates in row mode (`learned_rounding.py:869`), so the
+/// preset forces it instead of silently producing an unrotated layer.
+/// Layers whose `in_features` is not divisible by 256 stay plain row-wise
+/// INT8 (the reference warns and leaves them unrotated).
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatArg {
     Int8,
@@ -72,12 +74,6 @@ impl FormatArg {
     /// is a usage error (exit 2).
     pub fn has_fixed_scaling(&self) -> bool {
         matches!(self, FormatArg::Mxfp8 | FormatArg::Nvfp4)
-    }
-
-    /// Phase 7.0 guard: this format has no kernel yet and must be rejected
-    /// with the specific "not implemented" message before any work starts.
-    pub fn is_unimplemented(&self) -> bool {
-        matches!(self, FormatArg::Int8Convrot)
     }
 }
 

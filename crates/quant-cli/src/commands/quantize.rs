@@ -46,7 +46,6 @@ fn format_id(format: FormatArg, mode: ScalingModeArg) -> &'static str {
         FormatArg::Fp8E4m3 => "fp8_e4m3",
         FormatArg::Mxfp8 => "mxfp8",
         FormatArg::Nvfp4 => "nvfp4",
-        // Unreachable: run() rejects this format before build_config.
         FormatArg::Int8Convrot => "int8_convrot",
     }
 }
@@ -84,16 +83,22 @@ fn build_config(args: &QuantizeArgs) -> QuantConfig {
         ),
         FormatArg::Mxfp8 => (Format::Mxfp8, "mxfp8", false, ScalingMode::Block, 32),
         FormatArg::Nvfp4 => (Format::Nvfp4, "nvfp4", false, ScalingMode::Block, 16),
-        // Unreachable: run() rejects this format before build_config.
-        // Kept as INT8-like values purely for exhaustiveness.
-        FormatArg::Int8Convrot => (
-            Format::Int8,
-            "int8",
-            true,
-            scaling_mode(args.scaling_mode.unwrap_or(ScalingModeArg::Block)),
-            args.block_size.unwrap_or(128),
-        ),
+        // Phase 7.1: int8_convrot is a PRESET, not a free-form combination —
+        // it is INT8 row-wise with a group-wise Hadamard rotation at a fixed
+        // group size of 256. Row mode is FORCED (--scaling-mode is ignored,
+        // unlike plain int8): the reference applies the rotation only when
+        // `self.convrot and self.scaling_mode == "row"`
+        // (learned_rounding.py:869), so honoring e.g. `--scaling-mode block`
+        // would silently emit a plain, unrotated layer under a ConvRot name.
+        // block_size is unused in row mode; 128 keeps the value canonical.
+        FormatArg::Int8Convrot => (Format::Int8, "int8", true, ScalingMode::Row, 128),
     };
+    // Phase 7.1: ConvRot is a property of the `int8_convrot` preset (there is
+    // no `--convrot` flag — the preset IS the flag). The group size is fixed
+    // at 256, the reference default (`convrot_group_size=256`,
+    // learned_rounding.py:868) and the only size the quantui UI offers for
+    // this path.
+    let convrot = matches!(args.format, FormatArg::Int8Convrot);
     QuantConfig {
         format,
         target_format: target_format.into(),
@@ -101,7 +106,7 @@ fn build_config(args: &QuantizeArgs) -> QuantConfig {
         scaling_mode,
         block_size,
         no_learned_rounding: args.simple,
-        convrot: false,
+        convrot,
         convrot_group_size: 256,
         orig_dtype: orig_dtype(args.orig_dtype).into(),
         skip_inefficient,
@@ -164,25 +169,6 @@ struct RunOutcome {
 }
 
 pub fn run(args: QuantizeArgs) -> ExitCode {
-    // ---- Phase 7.0 honesty guard (decision Q3) ---------------------------- //
-    // int8_convrot is selectable but ALWAYS rejected here, before any input
-    // classification or output creation: the Hadamard rotation kernel
-    // (Phase 7.1) is not implemented, and emitting plain INT8 under a
-    // ConvRot name would silently produce an un-rotated model that looks
-    // rotated. The core orchestrator carries the same guard for library
-    // callers (QuantConfig.convrot=true).
-    if args.format.is_unimplemented() {
-        eprintln!(
-            "error: --format {} is not supported yet: the rotation kernel is not implemented (planned Phase 7.1).",
-            args.format.as_str()
-        );
-        eprintln!(
-            "Refusing to silently emit plain INT8 under a ConvRot name — the output would not be what the name promises."
-        );
-        eprintln!("hint: plain --format int8 is unaffected and fully supported.");
-        return ExitCode::from(2);
-    }
-
     // ---- classify input ---------------------------------------------------- //
     let (kind, _base) = classify_input(&args.input);
     let Some(kind) = kind else {

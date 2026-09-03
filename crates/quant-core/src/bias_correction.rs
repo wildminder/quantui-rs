@@ -171,7 +171,10 @@ pub fn plain_col_sum(col: &[f32]) -> f32 {
 ///
 /// p[k] = cascade over elements {i*4 + k}, i in [0, size/4); tail elements
 /// added ascending into p0; result = p0; p0 += p1; p0 += p2; p0 += p3.
-fn ilp_col_sum(col: &[f32]) -> f32 {
+///
+/// Public for `convrot.rs` — the ConvRot bias correction runs the same
+/// cascade `sum(dim=0)` over its (S, m) diff matrix.
+pub fn ilp_col_sum(col: &[f32]) -> f32 {
     let size = col.len();
     let size_ilp = size / 4;
     let mut ps = [0.0f32; 4];

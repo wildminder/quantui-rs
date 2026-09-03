@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Map;
 
 use crate::bias_correction::{correct_bias, CalibCache};
-use crate::comfy_schema::{encode_block_format, encode_comfy_quant, ComfyFormat};
+use crate::comfy_schema::{
+    encode_block_format, encode_comfy_quant, encode_comfy_quant_int8_convrot, ComfyFormat,
+};
 use crate::discover::{ShardedModel, INDEX_NAME};
 use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
 use crate::manifest::{Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
@@ -102,11 +104,29 @@ pub enum StreamError {
     /// Bias correction needs a float bias (f32/f16/bf16); got something else.
     #[error("bias `{name}` has unsupported dtype {dtype} for bias correction (need f32/f16/bf16)")]
     UnsupportedBiasDtype { name: String, dtype: DType },
-    /// ConvRot (`int8_convrot`) requested but the rotation kernel is not
-    /// implemented (plan Phase 7.0 interim honesty guard, decision Q3):
-    /// never silently emit plain INT8 under a ConvRot name.
-    #[error("int8_convrot is not supported yet: the Hadamard rotation kernel is not implemented (planned Phase 7.1). Plain --format int8 is unaffected; refusing to silently emit un-rotated INT8 under a ConvRot name.")]
-    ConvRotUnsupported,
+    /// ConvRot requested with a format/scaling-mode combination the reference
+    /// never rotates (learned_rounding.py:869: the rotation is gated on
+    /// `self.convrot and self.scaling_mode == "row"`). Any other combination
+    /// would silently emit a plain, unrotated layer under a ConvRot name —
+    /// the one thing this CLI must never do (plan §3-G, decision Q3).
+    #[error(
+        "ConvRot requires --format int8 with --scaling-mode row (got format {format}, \
+         scaling mode {scaling_mode}): the reference applies the Hadamard rotation only \
+         in INT8 row-wise mode"
+    )]
+    ConvRotRequiresInt8Row {
+        format: &'static str,
+        scaling_mode: &'static str,
+    },
+    /// ConvRot group size is not on the power-of-4 ladder (4/16/64/256/1024),
+    /// so no regular-Hadamard rotation exists for it.
+    #[error(
+        "ConvRot group size {0} is invalid: must be a power of 4 (4, 16, 64, 256, 1024) \
+         (the scipy Sylvester fallback for other powers of two is not ported)"
+    )]
+    ConvRotBadGroupSize(u32),
+    #[error(transparent)]
+    ConvRot(#[from] crate::convrot::ConvRotError),
 }
 
 pub type Result<T> = std::result::Result<T, StreamError>;
@@ -463,14 +483,29 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     mut on_progress: Option<&mut ProgressFn>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamResult> {
-    // Phase 7.0 honesty guard: a config claiming convrot must be rejected
-    // before ANY output file is created. The rotation kernel (Phase 7.1)
-    // does not exist yet; silently emitting plain INT8 under a ConvRot
-    // name would produce a model that looks pre-quantized-rotated but
-    // isn't — silently wrong output is the one thing this CLI must never
-    // do (decision Q3, plan §3-G).
+    // Phase 7.1 ConvRot validation, before ANY output file is created
+    // (plan §3-G, decision Q3): silently emitting plain INT8 under a ConvRot
+    // name would produce a model that looks pre-quantized-rotated but isn't.
+    // Two things can be wrong with a ConvRot request:
+    //   1. it is not INT8 row-wise — the reference gates the rotation on
+    //      `self.convrot and self.scaling_mode == "row"`
+    //      (learned_rounding.py:869), so every other combination is a
+    //      misconfiguration, not a rotation;
+    //   2. the group size is off the power-of-4 ladder, so `build_hadamard`
+    //      has no regular Hadamard to return (the reference's scipy
+    //      Sylvester fallback for other powers of two is not ported).
     if config.convrot {
-        return Err(StreamError::ConvRotUnsupported);
+        if config.format != Format::Int8 || config.scaling_mode != ScalingMode::Row {
+            return Err(StreamError::ConvRotRequiresInt8Row {
+                format: config.format.as_str(),
+                scaling_mode: config.scaling_mode.as_str(),
+            });
+        }
+        // The matrix itself is discarded here — validity is all that matters
+        // up front; each rotated tensor rebuilds it (256×256, negligible next
+        // to the rotation GEMM).
+        crate::convrot::build_hadamard(config.convrot_group_size)
+            .map_err(|_| StreamError::ConvRotBadGroupSize(config.convrot_group_size))?;
     }
 
     let names: Vec<String> = input.names().to_vec();
@@ -960,42 +995,97 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
     let w_f32: Vec<f32> = decode_to_f32(info.dtype, raw);
 
     // ---- format routing (plan Phase C.2) ---------------------------------- //
-    // Each branch produces the per-format output specs (`WeightOutputs`) plus
-    // the dequantized weight `w_dq` (f32, original m×n, padding cropped) used
-    // for sibling-bias correction (plan §3.5 / Phase C.4). Emission dtypes,
-    // shapes, and blob families follow the §3.3 byte contract (golden headers).
+    // Each branch produces the per-format output specs (`WeightOutputs`), the
+    // dequantized weight `w_dq` (f32, original m×n, padding cropped) used for
+    // sibling-bias correction (plan §3.5 / Phase C.4), and — ConvRot only —
+    // the ROTATED weight `w_rot` that selects the ConvRot bias path.
+    // Emission dtypes, shapes, and blob families follow the §3.3 byte
+    // contract (golden headers).
     let orig = resolve_orig_dtype_str(&config.orig_dtype);
-    let (outputs, w_dq): (WeightOutputs, Vec<f32>) = match config.format {
+    let (outputs, w_dq, w_rot): (WeightOutputs, Vec<f32>, Option<Vec<f32>>) = match config.format {
         Format::Int8 => {
             let mode = match config.scaling_mode {
                 ScalingMode::Tensor => crate::quant::ScalingMode::Tensor,
                 ScalingMode::Row => crate::quant::ScalingMode::Row,
                 ScalingMode::Block => crate::quant::ScalingMode::Block,
             };
-            let r = quantize_int8_weight(&w_f32, m, n, mode, config.block_size as usize);
 
-            // <name> int8 payload.
-            let q_bytes: Vec<u8> = r.qdata.iter().flat_map(|v| v.to_le_bytes()).collect();
+            // ---- Phase 7.1: ConvRot (learned_rounding.py:864-884) --------- //
+            // The rotation is decided PER TENSOR: `convrot` is set AND the
+            // group size divides in_features (`N = W.shape[1]`). A tensor the
+            // group size does not divide stays PLAIN row-wise INT8 — the
+            // reference warns and leaves `convrot_applied=False`, so its blob
+            // carries no convrot key either (byte-parity, not a style choice).
+            // Validation already guaranteed `convrot ⇒ INT8 + row`, so the
+            // plain fall-through below is exactly the pre-7.1 behaviour.
+            let gs = config.convrot_group_size as usize;
+            let rotated = config.convrot && n % gs == 0;
+            if config.convrot && !rotated {
+                eprintln!(
+                    "warning: skipping ConvRot for {name}: in_features {n} not divisible by group size {gs}"
+                );
+            }
 
-            // <base>.weight_scale F32 with scalar squeeze for 1-element scales
-            // (normalize_tensorwise_scales parity: [1]/[1,1] → shape []).
-            let scale_shape: Vec<u64> = if r.scale.len() == 1 {
-                vec![]
+            let (qdata, scale, scale_shape, blob, w_dq, w_rot) = if rotated {
+                // One call: rotate → row-wise INT8 quantize → rotated dequant.
+                // It hands back `w_rot` too, so we never rotate twice.
+                let r =
+                    crate::convrot::convrot_int8_weight(&w_f32, m, n, config.convrot_group_size)?;
+                // <base>.weight_scale F32, [m,1] for row mode (scalar squeeze
+                // for a single row — normalize_tensorwise_scales parity).
+                let scale_shape: Vec<u64> = if r.scale.len() == 1 {
+                    vec![]
+                } else {
+                    r.scale_shape
+                };
+                // Family A with the ConvRot tail keys; `input_scale` is
+                // emitted for block-wise INT8 only (fp8_conversion.py:597).
+                let blob = encode_comfy_quant_int8_convrot(&orig, config.convrot_group_size);
+                (
+                    r.qdata,
+                    r.scale,
+                    scale_shape,
+                    blob,
+                    r.w_dq_rot,
+                    Some(r.w_rot),
+                )
             } else {
-                r.scale_shape.clone()
+                let r = quantize_int8_weight(&w_f32, m, n, mode, config.block_size as usize);
+                // <base>.weight_scale F32 with scalar squeeze for 1-element
+                // scales (normalize_tensorwise_scales parity: [1]/[1,1] → []).
+                let scale_shape: Vec<u64> = if r.scale.len() == 1 {
+                    vec![]
+                } else {
+                    r.scale_shape.clone()
+                };
+                // <base>.comfy_quant blob via the comfy_schema encoder
+                // (Phase 3.5): family-A key order format, orig_dtype,
+                // group_size (block only).
+                let comfy_fmt = match config.scaling_mode {
+                    ScalingMode::Block => ComfyFormat::Int8Blockwise,
+                    _ => ComfyFormat::Int8Tensorwise,
+                };
+                // NOTE (Phase 7.1, KNOWN DIVERGENCE — see
+                // `tools/probe_convrot_blob_per_row.py`): the reference emits
+                // `"per_row": true` for EVERY int8 row-wise layer, rotated or
+                // not — `fp8_conversion.py:583-584` keys it off the SCALING
+                // MODE, not off ConvRot. So a ConvRot run whose in_features is
+                // not divisible by 256 really produces
+                // `{"format": "int8_tensorwise", "orig_dtype": "...", "per_row": true}`
+                // (no `convrot` key). The Phase 7.1 work order explicitly froze
+                // the non-ConvRot row-wise blob, so we keep emitting it without
+                // `per_row`; Phase 7.2 (golden generation + byte parity) owns
+                // that fix.
+                let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
+                let w_dq =
+                    dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
+                (r.qdata, r.scale, scale_shape, blob, w_dq, None)
             };
-            let scale_bytes: Vec<u8> = r.scale.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-            // <base>.comfy_quant blob via the comfy_schema encoder (Phase 3.5):
-            // family-A key order format, orig_dtype, group_size (block only).
-            let comfy_fmt = match config.scaling_mode {
-                ScalingMode::Block => ComfyFormat::Int8Blockwise,
-                _ => ComfyFormat::Int8Tensorwise,
-            };
-            let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
             let input_scale = matches!(config.scaling_mode, ScalingMode::Block);
+            let q_bytes: Vec<u8> = qdata.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let scale_bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-            let w_dq = dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
             (
                 WeightOutputs {
                     q_bytes,
@@ -1009,6 +1099,7 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     input_scale,
                 },
                 w_dq,
+                w_rot,
             )
         }
 
@@ -1055,6 +1146,7 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     input_scale: false,
                 },
                 w_dq,
+                None,
             )
         }
 
@@ -1086,6 +1178,7 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     input_scale: false,
                 },
                 w_dq,
+                None,
             )
         }
 
@@ -1123,6 +1216,7 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     input_scale: false,
                 },
                 w_dq,
+                None,
             )
         }
     };
@@ -1166,10 +1260,40 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     })
                 }
             };
-            let corrected = match correct_bias(x, &w_f32, &w_dq, &bias, m, n, cancel) {
-                Some(c) => c,
-                // Ctrl-C during the bias-correction GEMM: abort promptly.
-                None => return Ok(false),
+            // Phase 7.1: the ConvRot path takes PRECEDENCE over the generic
+            // one — fp8_conversion.py:676-686 is an `if / elif`, so a
+            // ConvRot-corrected bias is `b + adj` and never the generic
+            // `b - mean(X @ err.T)`. `Some(w_rot)` means this tensor really
+            // was rotated (in_features divisible by the group size).
+            let corrected = match w_rot {
+                Some(w_rot) => {
+                    let s_count = x.len() / n; // CALIB_SAMPLES = 3072
+                    let h = crate::convrot::build_hadamard(config.convrot_group_size)
+                        .expect("convrot group size validated at config time");
+                    // X_rot = rotate_activation(X, H, gs) —
+                    // tensor_utils.py:181-183; both GEMMs then run on the
+                    // ROTATED operands (learned_rounding.py:932-934).
+                    let x_rot = crate::convrot::rotate_activation(
+                        x,
+                        &h,
+                        s_count,
+                        n,
+                        config.convrot_group_size,
+                    )
+                    .expect("in_features divisibility checked when rotating the weight");
+                    match crate::convrot::correct_bias_convrot(
+                        &x_rot, &w_rot, &w_dq, &bias, m, n, s_count, cancel,
+                    ) {
+                        Some(c) => c,
+                        // Ctrl-C during the bias-correction GEMM: abort.
+                        None => return Ok(false),
+                    }
+                }
+                None => match correct_bias(x, &w_f32, &w_dq, &bias, m, n, cancel) {
+                    Some(c) => c,
+                    // Ctrl-C during the bias-correction GEMM: abort promptly.
+                    None => return Ok(false),
+                },
             };
             // Cast back to the bias's original dtype (reference parity).
             let bytes: Vec<u8> = match bias_info.dtype {
@@ -1586,34 +1710,324 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ //
-    // Phase 7.0: ConvRot honesty guard (decision Q3)
+    // Phase 7.1: ConvRot wiring (decision Q3)
     // ------------------------------------------------------------------ //
 
-    /// A config with `convrot: true` must be rejected by the orchestrator
-    /// BEFORE the output file is created — a leftover empty file would look
-    /// like a started run. The error names the missing kernel and the phase.
+    /// A ConvRot config is validated BEFORE the output file is created, so a
+    /// rejected run never leaves an empty file that looks like a started one.
+    fn convrot_config() -> QuantConfig {
+        QuantConfig {
+            convrot: true,
+            scaling_mode: ScalingMode::Row,
+            ..QuantConfig::default()
+        }
+    }
+
+    /// Read one tensor's raw bytes out of the produced file.
+    fn tensor_bytes_of(path: &Path, name: &str) -> Vec<u8> {
+        let reader = crate::st_io::reader::SafetensorsReader::open(path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        reader
+            .tensor_bytes(name)
+            .unwrap_or_else(|_| panic!("missing tensor {name}"))
+            .to_vec()
+    }
+
+    /// Build a bf16 weight matrix of shape `[m, n]` with deterministic,
+    /// non-degenerate values.
+    fn bf16_weight(m: usize, n: usize) -> Vec<u8> {
+        (0..m * n)
+            .flat_map(|i| {
+                let v = ((i as f32) * 0.017).sin() + ((i % 7) as f32) * 0.003;
+                crate::dtype::f32_to_bf16_bits(v).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// ConvRot is INT8 row-wise only (learned_rounding.py:869: the rotation is
+    /// gated on `self.convrot and self.scaling_mode == "row"`). Any other
+    /// combination is rejected before the output file exists.
     #[test]
-    fn convrot_config_rejected_before_file_creation() {
-        let src = MemSource::new(); // empty source is enough: guard is first
+    fn convrot_requires_int8_row_before_file_creation() {
+        let src = MemSource::new(); // empty source: validation is first
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("never.safetensors");
 
-        let mut config = QuantConfig::default();
-        config.convrot = true;
+        // (a) FP8 (fixed block scaling) + convrot.
+        let mut fp8 = convrot_config();
+        fp8.format = Format::Fp8E4m3;
+        fp8.target_format = "fp8".into();
+        fp8.int8 = false;
+        let err = stream_quantize_source(&src, &out, &fp8, None, None).unwrap_err();
+        assert!(
+            matches!(err, StreamError::ConvRotRequiresInt8Row { .. }),
+            "FP8 + convrot must be rejected, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("fp8"), "error must name the format: {msg}");
+        assert!(
+            msg.contains("row"),
+            "error must name the required scaling mode: {msg}"
+        );
 
-        let err = stream_quantize_source(&src, &out, &config, None, None).unwrap_err();
+        // (b) INT8 block-wise + convrot.
+        let block = QuantConfig {
+            scaling_mode: ScalingMode::Block,
+            ..convrot_config()
+        };
+        let err = stream_quantize_source(&src, &out, &block, None, None).unwrap_err();
         assert!(
-            matches!(err, StreamError::ConvRotUnsupported),
-            "convrot config must hit the dedicated error, got: {err}"
+            matches!(err, StreamError::ConvRotRequiresInt8Row { .. }),
+            "INT8 block + convrot must be rejected, got: {err}"
         );
+
+        // (c) INT8 tensor-wise + convrot.
+        let tensor = QuantConfig {
+            scaling_mode: ScalingMode::Tensor,
+            ..convrot_config()
+        };
+        let err = stream_quantize_source(&src, &out, &tensor, None, None).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("rotation kernel is not implemented"),
-            "error must name the cause: {err}"
+            matches!(err, StreamError::ConvRotRequiresInt8Row { .. }),
+            "INT8 tensor + convrot must be rejected, got: {err}"
         );
+
+        // No output file may exist for a rejected config.
         assert!(
             !out.exists(),
-            "guard must fire before the output file is created"
+            "validation must fire before the output file is created"
+        );
+    }
+
+    /// A group size off the power-of-4 ladder (100, 512, 8) is rejected up
+    /// front — `build_hadamard` has no regular Hadamard for it and the
+    /// reference's scipy Sylvester fallback is not ported.
+    #[test]
+    fn convrot_rejects_bad_group_size_before_file_creation() {
+        let src = MemSource::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("never.safetensors");
+
+        for gs in [100u32, 512, 8, 2, 0] {
+            let config = QuantConfig {
+                convrot_group_size: gs,
+                ..convrot_config()
+            };
+            let err = stream_quantize_source(&src, &out, &config, None, None).unwrap_err();
+            assert!(
+                matches!(err, StreamError::ConvRotBadGroupSize(g) if g == gs),
+                "group size {gs} must be rejected with ConvRotBadGroupSize, got: {err}"
+            );
+        }
+        assert!(
+            !out.exists(),
+            "validation must fire before the output file is created"
+        );
+
+        // The whole ladder is accepted (validation-wise): 4/16/64/256/1024.
+        for gs in [4u32, 16, 64, 256, 1024] {
+            let config = QuantConfig {
+                convrot_group_size: gs,
+                ..convrot_config()
+            };
+            // Empty source → no ConvRotBadGroupSize; the run simply completes.
+            stream_quantize_source(&src, &out, &config, None, None).unwrap();
+        }
+    }
+
+    /// Per-tensor rotation decision: `in_features` divisible by the group size
+    /// gets the ConvRot blob (`convrot`, `convrot_groupsize`, `per_row`); a
+    /// tensor it does not divide stays PLAIN row-wise INT8 — the reference
+    /// warns and leaves `convrot_applied=False`, so no convrot key at all.
+    #[test]
+    fn convrot_blob_per_tensor_divisibility() {
+        let mut src = MemSource::new();
+        // rot.weight [128, 256]: passes the heuristic (m,n >= 128, %128==0)
+        // and 256 % 256 == 0 → rotated.
+        src.add(
+            "rot.weight",
+            DType::Bf16,
+            vec![128, 256],
+            bf16_weight(128, 256),
+        );
+        // plain.weight [128, 128]: passes the heuristic, but 128 % 256
+        // != 0 → stays plain row-wise INT8 (no convrot key).
+        src.add(
+            "plain.weight",
+            DType::Bf16,
+            vec![128, 128],
+            bf16_weight(128, 128),
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.safetensors");
+        let config = convrot_config();
+        stream_quantize_source(&src, &out, &config, None, None).unwrap();
+
+        let rot = String::from_utf8(tensor_bytes_of(&out, "rot.comfy_quant")).unwrap();
+        assert_eq!(
+            rot,
+            r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "convrot": true, "convrot_groupsize": 256, "per_row": true}"#,
+            "a rotated layer must carry the ConvRot keys"
+        );
+        for key in [
+            r#""convrot": true"#,
+            r#""convrot_groupsize": 256"#,
+            r#""per_row": true"#,
+        ] {
+            assert!(rot.contains(key), "rot blob must contain {key}: {rot}");
+        }
+
+        let plain = String::from_utf8(tensor_bytes_of(&out, "plain.comfy_quant")).unwrap();
+        assert_eq!(
+            plain, r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16"}"#,
+            "a non-divisible layer must stay plain (no convrot key at all)"
+        );
+
+        // Row-wise INT8: [m,1] weight_scale, no input_scale (block only).
+        let hdr: HashMap<String, Vec<u64>> = read_header(&out)
+            .into_iter()
+            .map(|(n, _d, s)| (n, s))
+            .collect();
+        assert_eq!(hdr["rot.weight_scale"], vec![128, 1]);
+        assert!(!hdr.contains_key("rot.input_scale"));
+        assert_eq!(hdr["rot.weight"], vec![128, 256]);
+    }
+
+    /// A ConvRot blob must still parse as `int8_tensorwise` (family A) so the
+    /// `info` / `validate` passes keep working on rotated outputs — the
+    /// reference tolerates the extra keys too.
+    #[test]
+    fn convrot_blob_parses_as_int8_tensorwise() {
+        let blob = encode_comfy_quant_int8_convrot("torch.bfloat16", 256);
+        let cfg = crate::comfy_schema::parse_blob(&blob).expect("convrot blob must parse");
+        assert_eq!(cfg.format, ComfyFormat::Int8Tensorwise);
+        assert_eq!(cfg.orig_dtype, "torch.bfloat16");
+        assert_eq!(cfg.group_size, None, "convrot group size is its own key");
+    }
+
+    /// End-to-end ConvRot bias correction through the orchestrator: the
+    /// corrected bias must be `b + mean_s(Y_ref - Y_qnt)` with
+    /// `Y_ref = X_rot @ W_rot.T` and `Y_qnt = X_rot @ W_dq.T` — TWO GEMMs on
+    /// the ROTATED operands that ADD (learned_rounding.py:930-939), never the
+    /// generic `b - mean(X @ err.T)`. Verified against an independent f64
+    /// recomputation of that formula, which pins the sign, the operand choice
+    /// and the sample mean (kchunk128 vs naive f64 differs by ~1e-6 relative).
+    #[test]
+    fn convrot_bias_correction_uses_rotated_operands() {
+        let (m, n, gs) = (8usize, 64usize, 64u32);
+        let mut src = MemSource::new();
+        src.add(
+            "blk.weight",
+            DType::Bf16,
+            vec![m as u64, n as u64],
+            bf16_weight(m, n),
+        );
+        let bias: Vec<f32> = (0..m).map(|i| (i as f32) * 0.05 - 0.2).collect();
+        src.add(
+            "blk.bias",
+            DType::F32,
+            vec![m as u64],
+            bias.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.safetensors");
+        // block_size is unused in row mode; it only feeds the heur-OFF
+        // divisibility check, so set it to m to keep the fixture tiny.
+        let config = QuantConfig {
+            convrot: true,
+            convrot_group_size: gs,
+            scaling_mode: ScalingMode::Row,
+            block_size: m as u32,
+            skip_inefficient: false,
+            ..QuantConfig::default()
+        };
+        stream_quantize_source(&src, &out, &config, None, None).unwrap();
+
+        let got_raw = tensor_bytes_of(&out, "blk.bias");
+        let got: Vec<f32> = got_raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got.len(), m);
+
+        // ---- independent recomputation of b + mean(Y_ref - Y_qnt) ---- //
+        let w = decode_to_f32(DType::Bf16, &bf16_weight(m, n));
+        let h = crate::convrot::build_hadamard(gs).unwrap();
+        let w_rot = crate::convrot::rotate_weight(&w, &h, m, n, gs).unwrap();
+        let q = quantize_int8_weight(&w_rot, m, n, crate::quant::ScalingMode::Row, 128);
+        let w_dq = dequantize_int8(
+            &q.qdata,
+            &q.scale,
+            m,
+            n,
+            crate::quant::ScalingMode::Row,
+            128,
+        );
+        let calib = CalibCache::build(
+            src.names().iter().map(|nm| {
+                let nf = src.info(nm).and_then(|i| {
+                    // NOTE: `.then(|| ...)` (lazy) — `then_some(i.shape[1])`
+                    // would index shape[1] on the 1-D bias too, panicking.
+                    (nm.ends_with(".weight") && i.shape.len() == 2).then(|| i.shape[1] as usize)
+                });
+                (nm.clone(), nf)
+            }),
+            config.format.calib_order(),
+            config.calib_seed as u64,
+        );
+        let x = calib.get(n).expect("calibration entry for in_features");
+        let s_count = x.len() / n;
+        assert_eq!(s_count, crate::bias_correction::CALIB_SAMPLES);
+        let x_rot = crate::convrot::rotate_activation(x, &h, s_count, n, gs).unwrap();
+
+        for i in 0..m {
+            let mut acc = 0.0f64;
+            for s in 0..s_count {
+                let mut y_ref = 0.0f64;
+                let mut y_qnt = 0.0f64;
+                for k in 0..n {
+                    let xv = x_rot[s * n + k] as f64;
+                    y_ref += xv * (w_rot[i * n + k] as f64);
+                    y_qnt += xv * (w_dq[i * n + k] as f64);
+                }
+                acc += y_ref - y_qnt;
+            }
+            let want = bias[i] as f64 + acc / s_count as f64;
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (got[i] as f64 - want).abs() <= tol,
+                "bias[{i}]: got {} want {want} (the ConvRot path must ADD mean(Y_ref - Y_qnt))",
+                got[i]
+            );
+        }
+        // Sanity: the correction is a real adjustment, not a no-op, and it is
+        // NOT the generic path's subtraction of the same magnitude.
+        let generic_sign_ok = (0..m).any(|i| (got[i] - bias[i]).abs() > 0.0);
+        assert!(
+            generic_sign_ok,
+            "the ConvRot correction must actually move the bias: {got:?} vs {bias:?}"
+        );
+    }
+
+    /// Determinism: two runs with the same seed (and the default seed is
+    /// pinned) produce byte-identical outputs, ConvRot included.
+    #[test]
+    fn convrot_determinism_same_seed_byte_identical() {
+        let mut src = MemSource::new();
+        src.add("rot.weight", DType::Bf16, vec![4, 256], bf16_weight(4, 256));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.safetensors");
+        let b = tmp.path().join("b.safetensors");
+        let config = convrot_config();
+        stream_quantize_source(&src, &a, &config, None, None).unwrap();
+        stream_quantize_source(&src, &b, &config, None, None).unwrap();
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "two ConvRot runs with the same seed must be byte-identical"
         );
     }
 }

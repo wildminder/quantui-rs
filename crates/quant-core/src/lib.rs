@@ -6,6 +6,7 @@
 //! stubbed or gated behind a phase marker any more.
 
 pub mod comfy_schema;
+pub mod convrot;
 pub mod dtype;
 pub mod manifest;
 pub mod quant;

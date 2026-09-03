@@ -104,6 +104,21 @@ FORMATS: dict[str, dict] = {
     "nvfp4": dict(
         nvfp4=True, comfy_quant=True, simple=True, heur=True,
     ),
+    # Phase 7.2 (ConvRot): quantui's int8_convrot = ctq batch
+    # `--int8 --scaling_mode row --convrot`. Two group sizes: gs=256
+    # rotates only in-divisible-by-256 inputs (odd_shapes double_block,
+    # zero_blocks); gs=64 also rotates linear_basic_bf16 (in=128/64) and
+    # odd_shapes odd.weight (130 — NOT divisible by 64 → stays plain,
+    # pinning the divisibility gate). conv_net head.weight (128×128, F16)
+    # rotates at gs=64 but not 256.
+    "int8_convrot": dict(
+        int8=True, scaling_mode="row", convrot=True, convrot_group_size=256,
+        comfy_quant=True, simple=True, heur=True,
+    ),
+    "int8_convrot_gs64": dict(
+        int8=True, scaling_mode="row", convrot=True, convrot_group_size=64,
+        comfy_quant=True, simple=True, heur=True,
+    ),
 }
 
 
