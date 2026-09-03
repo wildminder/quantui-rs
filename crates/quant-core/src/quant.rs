@@ -89,8 +89,22 @@ pub fn quantize_int8_weight(
         ScalingMode::Row => {
             // TensorWiseINT8Layout auto path L908-916: row_max keepdim,
             // quant_scale = 127/row_max.clamp_min(1e-12), dequant = 1/quant_scale.
-            // NOTE: computed via reciprocal of quant_scale (not rowmax/127) — this is
-            // what the reference does and float division order matters for parity.
+            //
+            // FLOAT SEMANTICS (Phase 7.2, probe tools/probe_convrot_scale_diff.py
+            // + tools/tmp/ulp_test3.rs): BOTH divisions are torch
+            // `cpu-scalar / tensor` ops, which torch does NOT compute as IEEE
+            // division — div_true_kernel takes the fast path
+            // `scalar * reciprocal(tensor)` (two roundings):
+            //   quant_scale = 127.0 * (1.0 / clamped_row_max)
+            //   dequant     = 1.0  * (1.0 / quant_scale)
+            // On row 3 of the conv_net fixture (row_max = 0.11627197265625):
+            // IEEE `127.0/max` = 0x44888889 but torch emits 0x44888888 —
+            // 1 ULP off correct rounding — and the golden dequant scale
+            // 0x3a700001 follows. Plain IEEE division diverged on 29/128
+            // rows (and cascaded into qdata ties: 3/16384). The FP8 module
+            // documents the same quirk (`quant_fp8.rs` header); the INT8
+            // row path never hit it before because no golden locked row
+            // mode until the ConvRot fixtures.
             let mut scale = Vec::with_capacity(m);
             let mut qdata = Vec::with_capacity(m * n);
             let rows: Vec<&[f32]> = w.chunks_exact(n).collect();
@@ -98,8 +112,12 @@ pub fn quantize_int8_weight(
                 .par_iter()
                 .map(|row| {
                     let row_max = row.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                    let quant_scale = 127.0 / row_max.max(1e-12);
-                    (1.0 / quant_scale, quantize_scaled(row, quant_scale))
+                    let clamped = row_max.max(1e-12);
+                    // torch: 127.0 / clamped  →  127.0 * reciprocal(clamped)
+                    let quant_scale = 127.0f32 * (1.0f32 / clamped);
+                    // torch: 1.0 / quant_scale  →  1.0 * reciprocal(quant_scale)
+                    let dequant_scale = 1.0f32 / quant_scale;
+                    (dequant_scale, quantize_scaled(row, quant_scale))
                 })
                 .collect();
             for (s, q) in out {

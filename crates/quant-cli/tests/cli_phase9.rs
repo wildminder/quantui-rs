@@ -562,9 +562,12 @@ fn int8_convrot_rotates_divisible_layers() {
         !plain.contains("convrot"),
         "a non-divisible layer must not claim ConvRot:\n{plain}"
     );
+    // Phase 7.2: `per_row` is keyed off the scaling mode in both references
+    // (fp8_conversion.py:583-584, tensor_quant.py:254-255) — a ConvRot-skipped
+    // row-wise layer keeps per_row and drops only the convrot keys.
     assert_eq!(
-        plain, r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16"}"#,
-        "a non-divisible layer stays plain row-wise INT8"
+        plain, r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "per_row": true}"#,
+        "a non-divisible layer stays plain row-wise INT8 (per_row, no convrot keys)"
     );
 }
 

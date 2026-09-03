@@ -124,6 +124,27 @@ pub fn encode_comfy_quant_int8_convrot(orig_dtype: &str, convrot_groupsize: u32)
     .into_bytes()
 }
 
+/// Plain INT8 row-wise blob (Phase 7.2 resolution of the 7.1 divergence).
+///
+/// BOTH references key `per_row` off the SCALING MODE, not off ConvRot —
+/// every INT8 row-wise layer carries it, rotated or not:
+/// * batch driver `fp8_conversion.py:583-594`: `per_row = True` when
+///   `converter.scaling_mode == "row"`, passed to `create_comfy_quant_tensor`;
+/// * streaming reference `docs/ref/quantui/quantui/tensor_quant.py:252-255`:
+///   `per_row = scaling == "row"`, passed unconditionally.
+///
+/// A ConvRot run whose tensor is NOT rotated (in_features not divisible by
+/// the group size) lands here too: the batch driver recomputes
+/// `convrot_applied` per tensor (`:476-492`) and omits the `convrot` keys,
+/// but keeps `per_row` (probe evidence: `tools/probe_convrot_blob_per_row.py`).
+///
+/// Exact emitted string (json.dumps default separators):
+/// `{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "per_row": true}`
+pub fn encode_comfy_quant_int8_rowwise(orig_dtype: &str) -> Vec<u8> {
+    format!(r#"{{"format": "{INT8_TENSORWISE}", "orig_dtype": "{orig_dtype}", "per_row": true}}"#)
+        .into_bytes()
+}
+
 /// Family-B blob (MXFP8 / NVFP4): direct-dict key order
 /// `format, group_size, orig_dtype, orig_shape`.
 pub fn encode_block_format(
@@ -232,6 +253,13 @@ pub struct ComfyQuantConfig {
     pub group_size: Option<u32>,
     /// Pre-padding input shape (family B only).
     pub orig_shape: Option<Vec<u64>>,
+    /// `per_row: true` — INT8 row-wise marker (Phase 7.2). Both references
+    /// key it off the scaling mode (`fp8_conversion.py:583-584`,
+    /// `tensor_quant.py:254-255`), so every `int8_tensorwise` row-mode
+    /// layer carries it — ConvRot-skipped layers included. Tensor-mode
+    /// blobs omit it. Affects the expected `weight_scale` shape: row mode
+    /// is `[m,1]`, tensor mode is a squeezed scalar.
+    pub per_row: bool,
 }
 
 impl ComfyFormat {
@@ -351,11 +379,21 @@ fn parse_value(value: &serde_json::Value) -> Result<ComfyQuantConfig, ComfyQuant
         }
     };
 
+    // "per_row" — optional boolean (INT8 row-wise marker, Phase 7.2).
+    let per_row = match obj.get("per_row") {
+        None => false,
+        Some(v) => v.as_bool().ok_or(ComfyQuantError::BadFieldType {
+            field: "per_row",
+            expected: "boolean",
+        })?,
+    };
+
     Ok(ComfyQuantConfig {
         format,
         orig_dtype,
         group_size,
         orig_shape,
+        per_row,
     })
 }
 
@@ -458,6 +496,31 @@ mod tests {
         assert_eq!(
             String::from_utf8(b).unwrap(),
             r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16"}"#
+        );
+    }
+
+    /// Phase 7.2: plain INT8 row-wise carries `per_row: true` in BOTH
+    /// references (`fp8_conversion.py:583-584`, `tensor_quant.py:254-255`)
+    /// — keyed off the scaling mode, not off ConvRot.
+    #[test]
+    fn family_a_int8_rowwise_per_row_exact_bytes() {
+        assert_eq!(
+            String::from_utf8(encode_comfy_quant_int8_rowwise("torch.bfloat16")).unwrap(),
+            r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "per_row": true}"#
+        );
+        assert_eq!(
+            String::from_utf8(encode_comfy_quant_int8_rowwise("torch.float16")).unwrap(),
+            r#"{"format": "int8_tensorwise", "orig_dtype": "torch.float16", "per_row": true}"#
+        );
+        // Distinct from the convrot blob (convrot keys present) and from
+        // the tensor-mode blob (no per_row).
+        assert_ne!(
+            encode_comfy_quant_int8_rowwise("torch.bfloat16"),
+            encode_comfy_quant_int8_convrot("torch.bfloat16", 256)
+        );
+        assert_ne!(
+            encode_comfy_quant_int8_rowwise("torch.bfloat16"),
+            encode_standard(INT8_TENSORWISE, "torch.bfloat16", None)
         );
     }
 
@@ -726,6 +789,7 @@ mod tests {
             orig_dtype: "torch.bfloat16".to_string(),
             group_size: Some(16),
             orig_shape: Some(vec![128, 64]),
+            per_row: false,
         };
         let names = [
             "blocks.0.weight",
@@ -744,6 +808,7 @@ mod tests {
             orig_dtype: "torch.bfloat16".to_string(),
             group_size: Some(16),
             orig_shape: Some(vec![128, 64]),
+            per_row: false,
         };
         let names = [
             "blocks.0.weight",
@@ -768,6 +833,7 @@ mod tests {
             orig_dtype: "torch.bfloat16".to_string(),
             group_size: Some(128),
             orig_shape: None,
+            per_row: false,
         };
         let names = ["blocks.0.weight_scale"];
         let issues = validate_layer_layout("blocks.0", &cfg, &names);

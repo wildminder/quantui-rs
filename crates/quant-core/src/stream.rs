@@ -39,11 +39,14 @@ use serde_json::Map;
 
 use crate::bias_correction::{correct_bias, CalibCache};
 use crate::comfy_schema::{
-    encode_block_format, encode_comfy_quant, encode_comfy_quant_int8_convrot, ComfyFormat,
+    encode_block_format, encode_comfy_quant, encode_comfy_quant_int8_convrot,
+    encode_comfy_quant_int8_rowwise, ComfyFormat,
 };
 use crate::discover::{ShardedModel, INDEX_NAME};
 use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
-use crate::manifest::{Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION};
+use crate::manifest::{
+    CalibOrder, Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION,
+};
 use crate::quant::{dequantize_int8, quantize_int8_weight, should_skip_shape};
 use crate::quant_fp8::{dequantize_fp8, quantize_fp8_weight, Fp8ScalingMode};
 use crate::quant_mxfp8::{dequantize_mxfp8, quantize_mxfp8_weight};
@@ -589,6 +592,14 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     //
     // The DRAW ORDER is format-dependent (plan §3.4): INT8/FP8 draw in file
     // order over all 2D weights; MXFP8/NVFP4 draw over sorted(weights-only).
+    //
+    // Phase 7.2 exception: a CONVROT config draws SORTED. Its parity
+    // contract is the ctq BATCH driver (`convert_to_fp8_scaled`) — the
+    // streaming reference never implemented convrot — which iterates
+    // `all_keys = loader.keys()`; in standard (non-low-memory) mode that is
+    // `safe_open(...).keys()`, i.e. sorted alphabetical
+    // (fp8_conversion.py:154, 301-324). On fixtures written alphabetically
+    // (save_file output) both orders coincide, but sorted IS the contract.
     let calib = CalibCache::build(
         names.iter().map(|n| {
             let info = input.info(n);
@@ -600,7 +611,11 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
             };
             (n.clone(), nf)
         }),
-        config.format.calib_order(),
+        if config.convrot {
+            CalibOrder::SortedWeightsOnly
+        } else {
+            config.format.calib_order()
+        },
         config.calib_seed as u64,
     );
 
@@ -1061,22 +1076,32 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                 // <base>.comfy_quant blob via the comfy_schema encoder
                 // (Phase 3.5): family-A key order format, orig_dtype,
                 // group_size (block only).
-                let comfy_fmt = match config.scaling_mode {
-                    ScalingMode::Block => ComfyFormat::Int8Blockwise,
-                    _ => ComfyFormat::Int8Tensorwise,
+                //
+                // Phase 7.2 (divergence RESOLVED — see
+                // `tools/probe_convrot_blob_per_row.py`): BOTH references key
+                // `per_row` off the SCALING MODE, not off ConvRot
+                // (`fp8_conversion.py:583-584` in the batch driver;
+                // `tensor_quant.py:254-255` in the streaming reference), so
+                // every INT8 row-wise layer carries `"per_row": true`,
+                // rotated or not — a ConvRot-skipped tensor included (the
+                // batch driver recomputes `convrot_applied` per tensor and
+                // drops only the `convrot` keys, `:476-492`). No golden ever
+                // locked the old key-free row blob (all INT8 goldens are
+                // block mode), so the row path now emits the per_row blob.
+                // Tensor mode stays key-free (no per_row in either
+                // reference); block mode keeps `group_size`.
+                let blob = match config.scaling_mode {
+                    ScalingMode::Row => encode_comfy_quant_int8_rowwise(&orig),
+                    ScalingMode::Block => encode_comfy_quant(
+                        ComfyFormat::Int8Blockwise,
+                        &orig,
+                        Some(config.block_size),
+                        None,
+                    ),
+                    ScalingMode::Tensor => {
+                        encode_comfy_quant(ComfyFormat::Int8Tensorwise, &orig, None, None)
+                    }
                 };
-                // NOTE (Phase 7.1, KNOWN DIVERGENCE — see
-                // `tools/probe_convrot_blob_per_row.py`): the reference emits
-                // `"per_row": true` for EVERY int8 row-wise layer, rotated or
-                // not — `fp8_conversion.py:583-584` keys it off the SCALING
-                // MODE, not off ConvRot. So a ConvRot run whose in_features is
-                // not divisible by 256 really produces
-                // `{"format": "int8_tensorwise", "orig_dtype": "...", "per_row": true}`
-                // (no `convrot` key). The Phase 7.1 work order explicitly froze
-                // the non-ConvRot row-wise blob, so we keep emitting it without
-                // `per_row`; Phase 7.2 (golden generation + byte parity) owns
-                // that fix.
-                let blob = encode_comfy_quant(comfy_fmt, &orig, Some(config.block_size), None);
                 let w_dq =
                     dequantize_int8(&r.qdata, &r.scale, m, n, mode, config.block_size as usize);
                 (r.qdata, r.scale, scale_shape, blob, w_dq, None)
@@ -1879,9 +1904,15 @@ mod tests {
         }
 
         let plain = String::from_utf8(tensor_bytes_of(&out, "plain.comfy_quant")).unwrap();
+        // Phase 7.2: `per_row` is keyed off the scaling MODE in both
+        // references (fp8_conversion.py:583-584, tensor_quant.py:254-255),
+        // so a ConvRot-skipped row-wise layer keeps `per_row` but drops
+        // only the `convrot` keys (fp8_conversion.py:476-492 recomputes
+        // convrot_applied per tensor).
         assert_eq!(
-            plain, r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16"}"#,
-            "a non-divisible layer must stay plain (no convrot key at all)"
+            plain,
+            r#"{"format": "int8_tensorwise", "orig_dtype": "torch.bfloat16", "per_row": true}"#,
+            "a non-divisible layer must stay plain row-wise (per_row, no convrot keys)"
         );
 
         // Row-wise INT8: [m,1] weight_scale, no input_scale (block only).

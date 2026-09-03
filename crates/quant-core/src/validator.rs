@@ -218,11 +218,17 @@ fn expected_scale_shape(
     fmt: ComfyFormat,
     weight_shape: &[u64],
     group_size: Option<u32>,
+    per_row: bool,
 ) -> Option<Vec<u64>> {
     let m = *weight_shape.first()?;
     let n = weight_shape.get(1).copied()?;
     Some(match fmt {
-        // Single scale for the whole tensor → squeezed to scalar.
+        // Single scale for the whole tensor → squeezed scalar. INT8 row
+        // mode (`per_row: true`, Phase 7.2) is the exception: one scale
+        // per output row, `[m,1]` — squeezed only for a single row
+        // (normalize_tensorwise_scales parity; the row goldens carry
+        // unsqueezed [m,1] for m > 1).
+        ComfyFormat::Int8Tensorwise if per_row => squeeze(vec![m, 1]),
         ComfyFormat::Int8Tensorwise | ComfyFormat::Fp8Tensor => vec![],
         // One scale per output row.
         ComfyFormat::Fp8Rowwise => squeeze(vec![m]),
@@ -384,7 +390,7 @@ pub fn validate_comfy_quant(path: impl AsRef<Path>, numeric: bool) -> Validation
 
         // Scale shape check.
         if let Some(s_info) = s_info {
-            match expected_scale_shape(fmt, &w_info.shape, cfg.group_size) {
+            match expected_scale_shape(fmt, &w_info.shape, cfg.group_size, cfg.per_row) {
                 Some(exp) => {
                     if s_info.shape != exp {
                         report.add_error(format!(
@@ -815,48 +821,48 @@ mod tests {
     fn scale_shape_formulas() {
         // int8/fp8 blockwise: [ceil(m/g), ceil(n/g)] with squeeze.
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Int8Blockwise, &[256, 128], Some(128)),
+            expected_scale_shape(ComfyFormat::Int8Blockwise, &[256, 128], Some(128), false),
             Some(vec![2, 1])
         );
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Fp8Blockwise, &[128, 128], Some(128)),
+            expected_scale_shape(ComfyFormat::Fp8Blockwise, &[128, 128], Some(128), false),
             Some(vec![])
         );
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Fp8Blockwise, &[384, 256], Some(128)),
+            expected_scale_shape(ComfyFormat::Fp8Blockwise, &[384, 256], Some(128), false),
             Some(vec![3, 2])
         );
         // tensorwise → scalar.
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Fp8Tensor, &[256, 128], None),
+            expected_scale_shape(ComfyFormat::Fp8Tensor, &[256, 128], None, false),
             Some(vec![])
         );
         // rowwise → [m].
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Fp8Rowwise, &[256, 128], None),
+            expected_scale_shape(ComfyFormat::Fp8Rowwise, &[256, 128], None, false),
             Some(vec![256])
         );
         // mxfp8 to_blocked from on-disk weight shape.
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Mxfp8, &[256, 128], Some(32)),
+            expected_scale_shape(ComfyFormat::Mxfp8, &[256, 128], Some(32), false),
             Some(vec![256, 4])
         );
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Mxfp8, &[384, 256], Some(32)),
+            expected_scale_shape(ComfyFormat::Mxfp8, &[384, 256], Some(32), false),
             Some(vec![384, 8])
         );
         // nvfp4 to_blocked from packed weight shape.
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Nvfp4, &[256, 64], Some(16)),
+            expected_scale_shape(ComfyFormat::Nvfp4, &[256, 64], Some(16), false),
             Some(vec![256, 8])
         );
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Nvfp4, &[384, 128], Some(16)),
+            expected_scale_shape(ComfyFormat::Nvfp4, &[384, 128], Some(16), false),
             Some(vec![384, 16])
         );
         // blockwise with missing group size → None.
         assert_eq!(
-            expected_scale_shape(ComfyFormat::Int8Blockwise, &[256, 128], None),
+            expected_scale_shape(ComfyFormat::Int8Blockwise, &[256, 128], None, false),
             None
         );
     }
