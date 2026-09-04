@@ -175,8 +175,11 @@ pub struct InfoArgs {
 // gguf
 // --------------------------------------------------------------------------- //
 
+/// Conversion inputs/outputs: everything that defines HOW the GGUF is
+/// produced. Split from [`GgufVerificationArgs`] so each group stays small
+/// (`Commands::Gguf` was boxed for clippy::large_enum_variant once already).
 #[derive(Args, Debug)]
-pub struct GgufArgs {
+pub struct GgufConversionArgs {
     /// Input: a single `.safetensors` file OR a sharded HF model folder
     /// (containing `model.safetensors.index.json`). Optional only with
     /// `--list-methods`.
@@ -213,7 +216,12 @@ pub struct GgufArgs {
     /// Override the quantization for the output tensor (`output.weight`).
     #[arg(long, value_name = "METHOD")]
     pub output_tensor_type: Option<String>,
+}
 
+/// Post-conversion verification / extraction: everything that reads or
+/// compares GGUF files rather than producing one.
+#[derive(Args, Debug)]
+pub struct GgufVerificationArgs {
     /// Dump the effective per-tensor scheme assignment as a recipe file
     /// (Phase 6.3, inspection): one `name-exact=qtype` line per tensor,
     /// in conversion order, plus a `# method <id>` header. Feeding the
@@ -247,6 +255,15 @@ pub struct GgufArgs {
     /// Override the `general.name` metadata (else derived from the input).
     #[arg(long)]
     pub name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct GgufArgs {
+    #[command(flatten)]
+    pub conversion: GgufConversionArgs,
+
+    #[command(flatten)]
+    pub verification: GgufVerificationArgs,
 
     /// List all supported GGUF methods and exit.
     #[arg(long)]

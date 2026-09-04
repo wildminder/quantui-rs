@@ -12,8 +12,28 @@ use quant_core::discover::classify_input;
 use quant_core::gguf_convert::{convert_hf_to_gguf, GgufConvertConfig, GgufError};
 use quant_core::gguf_registry;
 
-use crate::args::GgufArgs;
+use crate::args::{GgufArgs, GgufConversionArgs, GgufVerificationArgs};
 use crate::progress::{BarSink, NullSink, ProgressSink};
+
+/// Flat view of the destructured [GgufArgs] groups: one field per flag with
+/// the original names, so the body of [run] keeps its `args.field` shape
+/// unchanged after the IMP-002 regrouping.
+struct FlatGgufArgs {
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    method: String,
+    imatrix: Option<PathBuf>,
+    tensor_type_file: Option<PathBuf>,
+    token_embedding_type: Option<String>,
+    output_tensor_type: Option<String>,
+    emit_recipe: Option<PathBuf>,
+    verify_against: Option<PathBuf>,
+    recipe_from: Option<PathBuf>,
+    arch: Option<String>,
+    name: Option<String>,
+    list_methods: bool,
+    no_progress: bool,
+}
 
 /// Print the method table (mirrors the reference `list_line` format:
 /// `id           bpw  [DYNAMIC 2.0] description`), plus the Unsloth-plan
@@ -57,6 +77,50 @@ fn auto_output(input: &std::path::Path, method: &str) -> PathBuf {
 }
 
 pub fn run(args: GgufArgs) -> ExitCode {
+    // IMP-002: destructure the two arg groups once, then rebuild a flat
+    // view so every existing `args.field` path below stays unchanged.
+    let GgufArgs {
+        conversion:
+            GgufConversionArgs {
+                input,
+                output,
+                method,
+                imatrix,
+                tensor_type_file,
+                token_embedding_type,
+                output_tensor_type,
+            },
+        verification:
+            GgufVerificationArgs {
+                emit_recipe,
+                verify_against,
+                recipe_from,
+                arch,
+                name,
+            },
+        list_methods,
+        no_progress,
+    } = args;
+    // Flat view over the destructured groups — the rest of this function
+    // keeps using `args.method`-style paths (now local shadow bindings in
+    // an `args`-shaped struct).
+    let args = FlatGgufArgs {
+        input,
+        output,
+        method,
+        imatrix,
+        tensor_type_file,
+        token_embedding_type,
+        output_tensor_type,
+        emit_recipe,
+        verify_against,
+        recipe_from,
+        arch,
+        name,
+        list_methods,
+        no_progress,
+    };
+
     if args.list_methods {
         print_methods();
         return ExitCode::SUCCESS;
@@ -376,7 +440,7 @@ pub fn run(args: GgufArgs) -> ExitCode {
                 report.output_bytes as f64 / (1024.0 * 1024.0),
                 started.elapsed().as_secs_f64()
             );
-            record_recent(&args, &report.output, started.elapsed());
+            record_recent(&args.method, &report.output, started.elapsed());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -449,13 +513,13 @@ fn load_imatrix(path: &std::path::Path) -> Result<quant_core::imatrix::Imatrix, 
 }
 
 /// Best-effort recents persistence (same store as `quantize`). Never fails.
-fn record_recent(args: &GgufArgs, output: &std::path::Path, duration: std::time::Duration) {
+fn record_recent(method: &str, output: &std::path::Path, duration: std::time::Duration) {
     use crate::profiles::{add_recent, load_store, save_store, RunRecord};
 
     let record = RunRecord {
         ts: super::quantize::now_iso8601(),
         family: "gguf".into(),
-        method: args.method.clone(),
+        method: method.to_string(),
         output: output.to_string_lossy().into_owned(),
         status: "success".into(),
         exit_code: 0,

@@ -121,6 +121,73 @@ fn gguf_list_methods_exit_0() {
     assert!(s.contains("[DYNAMIC 2.0]"));
 }
 
+/// [IMP-002] The arg regrouping must not change the CLI surface: every
+/// documented flag still has exactly one OPTION-HEADER line in `--help`
+/// (a line whose first token is the flag spec — flags may also appear in
+/// prose, e.g. "Use `--list-methods`"), and both positionals keep their
+/// roles. This is the regression net for the `#[command(flatten)]` split
+/// of GgufArgs.
+#[test]
+fn gguf_help_lists_all_flags_exactly_once() {
+    let out = bin().args(["gguf", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+
+    // An option-header line is one whose trimmed content STARTS with the
+    // flag — after an optional short-alias prefix "-x, ". Prose never
+    // starts a line with a flag in clap's layout, so this distinguishes
+    // flag definitions from prose mentions.
+    let starts_with_flag = |flag: &str| {
+        s.lines()
+            .filter(|l| {
+                let mut t = l.trim_start();
+                if t.len() >= 4
+                    && t.as_bytes()[0] == b'-'
+                    && t.as_bytes()[1] != b'-'
+                    && &t[2..4] == ", "
+                {
+                    t = &t[4..]; // skip "-m, " style alias
+                }
+                t.starts_with(flag)
+                    && (t.len() == flag.len()
+                        || t[flag.len()..].starts_with(' ')
+                        || t[flag.len()..].starts_with('<'))
+            })
+            .count()
+    };
+
+    let flags = [
+        "--method",
+        "--imatrix",
+        "--tensor-type-file",
+        "--token-embedding-type",
+        "--output-tensor-type",
+        "--emit-recipe",
+        "--verify-against",
+        "--recipe-from",
+        "--arch",
+        "--name",
+        "--list-methods",
+        "--no-progress",
+    ];
+    for f in flags {
+        assert_eq!(
+            starts_with_flag(f),
+            1,
+            "flag {f} must have exactly one option-header line in --help:\n{s}"
+        );
+    }
+    // -m still aliases --method.
+    assert!(
+        s.lines()
+            .any(|l| l.trim_start().starts_with("-m, --method")),
+        "-m alias lost:\n{s}"
+    );
+    // Positionals: INPUT (optional) and OUTPUT (optional).
+    assert!(s.contains("[INPUT]"), "INPUT positional missing:\n{s}");
+    assert!(s.contains("[OUTPUT]"), "OUTPUT positional missing:\n{s}");
+}
+
 // ─── Phase 0.3 / 2: capability markers + honest fallback ────────────
 
 #[test]
