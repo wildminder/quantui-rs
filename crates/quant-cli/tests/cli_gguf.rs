@@ -799,6 +799,126 @@ fn gguf_recipe_from_bad_reference_exit_2() {
     );
 }
 
+// ─── [IMP-003] gguf --audit ─────────────────────────────────────────
+
+/// Audit a self-produced clean output: exit 0 with the OK verdict.
+#[test]
+fn gguf_audit_clean_exit_0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let gguf = tmp.path().join("m-q8_0.gguf");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            gguf.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "conversion must succeed first");
+
+    let out = bin()
+        .args(["gguf", "--audit", gguf.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "clean audit must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("audit:"), "{stdout}");
+    assert!(stdout.contains("dtype histogram:"), "{stdout}");
+    assert!(
+        stdout.contains("spec-conformance: OK (0 violations)"),
+        "{stdout}"
+    );
+}
+
+/// Audit a hand-crafted spec-violating GGUF: exit 3 with violation details.
+#[test]
+fn gguf_audit_violation_exit_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.gguf");
+    // Same hand-crafted bytes as the core test: Q8_0, ne = [7, 1, 4].
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&1u64.to_le_bytes()); // n_tensors
+    b.extend_from_slice(&0u64.to_le_bytes()); // n_kv
+    let tname = b"blk.0.attn_q.weight";
+    b.extend_from_slice(&(tname.len() as u64).to_le_bytes());
+    b.extend_from_slice(tname);
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&7i64.to_le_bytes()); // ne[0] = 7 <- violation
+    b.extend_from_slice(&1i64.to_le_bytes());
+    b.extend_from_slice(&4i64.to_le_bytes());
+    b.extend_from_slice(&8u32.to_le_bytes()); // Q8_0
+    b.extend_from_slice(&0u64.to_le_bytes());
+    while b.len() % 32 != 0 {
+        b.push(0);
+    }
+    b.extend(std::iter::repeat_n(0u8, 7 * 34));
+    std::fs::write(&bad, &b).unwrap();
+
+    let out = bin()
+        .args(["gguf", "--audit", bad.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "violations must exit 3");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 VIOLATIONS"), "{stdout}");
+    assert!(stdout.contains("blk.0.attn_q.weight"), "{stdout}");
+    assert!(stdout.contains("ne0=7"), "{stdout}");
+    assert!(stdout.contains("blck=32"), "{stdout}");
+}
+
+/// Audit on garbage is exit 1 with a clean error.
+#[test]
+fn gguf_audit_junk_exit_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let junk = tmp.path().join("junk.gguf");
+    std::fs::write(&junk, b"not a gguf").unwrap();
+
+    let out = bin()
+        .args(["gguf", "--audit", junk.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "junk audit must exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("audit failed"), "{stderr}");
+}
+
+/// --audit with INPUT (or OUTPUT) is a usage conflict: exit 2.
+#[test]
+fn gguf_audit_conflict_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let junk = tmp.path().join("junk.gguf");
+    std::fs::write(&junk, b"not a gguf").unwrap();
+
+    // INPUT positional conflicts with --audit.
+    let out = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            "--audit",
+            junk.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "INPUT + --audit must exit 2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--audit"), "{stderr}");
+    assert!(stderr.contains("no INPUT"), "{stderr}");
+}
+
 /// Generic nested-prefix name mapping, end-to-end: a wrapped multimodal
 /// checkpoint (`model.language_model.*` = VibeVoice / LFM2-VL layout, plus a
 /// vision tower that stays outside the wrapper) must land the wrapped dense

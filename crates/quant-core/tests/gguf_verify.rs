@@ -210,28 +210,7 @@ fn spec_violation_scan_flags_non_divisible_row() {
     let bad = tmp.path().join("bad.gguf");
     let clean = tmp.path().join("clean.gguf");
 
-    // Bad: Q8_0, dims ne = [7, 1, 4] → ne[0] = 7, 7 % 32 != 0. Flat count
-    // 224 is divisible (7 blocks x 32), payload 7 x 34 bytes.
-    let mut b = Vec::new();
-    b.extend_from_slice(b"GGUF");
-    b.extend_from_slice(&3u32.to_le_bytes()); // version
-    b.extend_from_slice(&1u64.to_le_bytes()); // n_tensors
-    b.extend_from_slice(&0u64.to_le_bytes()); // n_kv
-    let tname = b"blk.0.attn_q.weight";
-    b.extend_from_slice(&(tname.len() as u64).to_le_bytes());
-    b.extend_from_slice(tname);
-    b.extend_from_slice(&3u32.to_le_bytes()); // n_dims
-    b.extend_from_slice(&7i64.to_le_bytes()); // ne[0] = 7  <- the violation
-    b.extend_from_slice(&1i64.to_le_bytes());
-    b.extend_from_slice(&4i64.to_le_bytes());
-    b.extend_from_slice(&8u32.to_le_bytes()); // Q8_0
-    b.extend_from_slice(&0u64.to_le_bytes()); // offset
-    while b.len() % 32 != 0 {
-        b.push(0);
-    }
-    b.extend(std::iter::repeat_n(0u8, 7 * 34));
-    std::fs::write(&bad, &b).unwrap();
-
+    write_raw_violating_q8(&bad, "blk.0.attn_q.weight");
     write_q8_gguf(&clean, "blk.0.attn_q.weight", &[q8_block(0.01, [1; 32])]);
 
     let r = quant_core::gguf_verify::verify_against(&bad, &clean).unwrap();
@@ -244,4 +223,76 @@ fn spec_violation_scan_flags_non_divisible_row() {
     // The clean counterpart: no violations.
     let r2 = quant_core::gguf_verify::verify_against(&clean, &clean).unwrap();
     assert!(r2.spec_violations.is_empty());
+}
+
+/// Hand-crafted spec-violating GGUF: one Q8_0 tensor, dims ne = [7, 1, 4]
+/// → ne[0] = 7 (7 % 32 != 0), flat count 224 divisible (7 blocks x 32),
+/// payload 7 x 34 bytes. Used by the violation-scan and audit tests.
+fn write_raw_violating_q8(path: &std::path::Path, name: &str) {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    b.extend_from_slice(&3u32.to_le_bytes()); // version
+    b.extend_from_slice(&1u64.to_le_bytes()); // n_tensors
+    b.extend_from_slice(&0u64.to_le_bytes()); // n_kv
+    let tname = name.as_bytes();
+    b.extend_from_slice(&(tname.len() as u64).to_le_bytes());
+    b.extend_from_slice(tname);
+    b.extend_from_slice(&3u32.to_le_bytes()); // n_dims
+    b.extend_from_slice(&7i64.to_le_bytes()); // ne[0] = 7  <- the violation
+    b.extend_from_slice(&1i64.to_le_bytes());
+    b.extend_from_slice(&4i64.to_le_bytes());
+    b.extend_from_slice(&8u32.to_le_bytes()); // Q8_0
+    b.extend_from_slice(&0u64.to_le_bytes()); // offset
+    while b.len() % 32 != 0 {
+        b.push(0);
+    }
+    b.extend(std::iter::repeat_n(0u8, 7 * 34));
+    std::fs::write(path, &b).unwrap();
+}
+
+// ─── [IMP-003] audit_gguf ───────────────────────────────────────────
+
+/// Audit on a clean file: dtype census correct, zero violations.
+#[test]
+fn audit_clean_file_reports_histogram() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.gguf");
+    write_q8_gguf(&a, "blk.0.attn_q.weight", &[q8_block(0.01, [1; 32])]);
+
+    let a = quant_core::gguf_verify::audit_gguf(&a).unwrap();
+    assert_eq!(a.tensor_count, 1);
+    assert_eq!(a.dtype_histogram.get("Q8_0"), Some(&1));
+    assert!(a.violations.is_empty(), "{a:?}");
+}
+
+/// Audit on the hand-crafted violating file: exactly one violation with
+/// full detail (name, type, ne0, blck).
+#[test]
+fn audit_reports_violation_details() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.gguf");
+    write_raw_violating_q8(&bad, "blk.0.attn_q.weight");
+
+    let a = quant_core::gguf_verify::audit_gguf(&bad).unwrap();
+    assert_eq!(a.tensor_count, 1);
+    assert_eq!(a.violations.len(), 1, "{a:?}");
+    let v = &a.violations[0];
+    assert_eq!(v.name, "blk.0.attn_q.weight");
+    assert_eq!(v.dtype, "Q8_0");
+    assert_eq!(v.ne0, 7);
+    assert_eq!(v.blck, 32);
+    assert_eq!(a.dtype_histogram.get("Q8_0"), Some(&1));
+}
+
+/// Audit on garbage input is a clean Err, never a panic.
+#[test]
+fn audit_unparseable_file_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let junk = tmp.path().join("junk.gguf");
+    std::fs::write(&junk, b"definitely not gguf").unwrap();
+
+    let r = quant_core::gguf_verify::audit_gguf(&junk);
+    assert!(r.is_err(), "junk must be an Err: {r:?}");
+    let e = r.unwrap_err();
+    assert!(e.contains("parsing"), "error names the file: {e}");
 }

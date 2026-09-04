@@ -31,6 +31,7 @@ struct FlatGgufArgs {
     recipe_from: Option<PathBuf>,
     arch: Option<String>,
     name: Option<String>,
+    audit: Option<PathBuf>,
     list_methods: bool,
     no_progress: bool,
 }
@@ -79,6 +80,11 @@ fn auto_output(input: &std::path::Path, method: &str) -> PathBuf {
 pub fn run(args: GgufArgs) -> ExitCode {
     // IMP-002: destructure the two arg groups once, then rebuild a flat
     // view so every existing `args.field` path below stays unchanged.
+    // Note on `--method` + `--audit`: `--method` carries a clap
+    // default_value, so it cannot conflict-declare against `--audit`
+    // (defaults don't conflict). A user passing `--audit x.gguf --method
+    // q8_0` is harmless — the method is simply ignored — so only
+    // INPUT/OUTPUT are hard conflicts (checked in the audit branch).
     let GgufArgs {
         conversion:
             GgufConversionArgs {
@@ -97,6 +103,7 @@ pub fn run(args: GgufArgs) -> ExitCode {
                 recipe_from,
                 arch,
                 name,
+                audit,
             },
         list_methods,
         no_progress,
@@ -117,6 +124,7 @@ pub fn run(args: GgufArgs) -> ExitCode {
         recipe_from,
         arch,
         name,
+        audit,
         list_methods,
         no_progress,
     };
@@ -124,6 +132,57 @@ pub fn run(args: GgufArgs) -> ExitCode {
     if args.list_methods {
         print_methods();
         return ExitCode::SUCCESS;
+    }
+
+    // [IMP-003] --audit: standalone spec-conformance + dtype census of any
+    // GGUF file. Skips conversion entirely — INPUT/OUTPUT are meaningless
+    // here and rejected (exit 2); `--method` is simply ignored (it has a
+    // clap default, so it cannot be a hard conflict). Exit 0 clean /
+    // 3 violations / 1 unparseable.
+    if let Some(audit_path) = &args.audit {
+        if args.input.is_some() || args.output.is_some() {
+            eprintln!("error: --audit audits an existing GGUF file and takes no INPUT or OUTPUT");
+            eprintln!("usage: quantui-rs gguf --audit <file.gguf>");
+            return ExitCode::from(2);
+        }
+        return match quant_core::gguf_verify::audit_gguf(audit_path) {
+            Ok(a) => {
+                println!(
+                    "audit: {} ({} tensors)",
+                    audit_path.display(),
+                    a.tensor_count
+                );
+                let hist: Vec<String> = a
+                    .dtype_histogram
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                println!("  dtype histogram: {}", hist.join(", "));
+                if a.violations.is_empty() {
+                    println!("  spec-conformance: OK (0 violations)");
+                    ExitCode::SUCCESS
+                } else {
+                    println!(
+                        "  spec-conformance: {} VIOLATIONS (quantized tensor with ne[0] % blck_size != 0, gguf.cpp:724):",
+                        a.violations.len()
+                    );
+                    for v in a.violations.iter().take(25) {
+                        println!(
+                            "      {}  {}  ne0={}  blck={}",
+                            v.name, v.dtype, v.ne0, v.blck
+                        );
+                    }
+                    if a.violations.len() > 25 {
+                        println!("      ... and {} more", a.violations.len() - 25);
+                    }
+                    ExitCode::from(3)
+                }
+            }
+            Err(e) => {
+                eprintln!("error: audit failed: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     let Some(input) = &args.input else {

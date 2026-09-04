@@ -106,8 +106,28 @@ fn our_name_to_gguf(name: &str) -> String {
 /// rejects, :1409 asserts). F32/F16/BF16 have block size 1 and always pass.
 /// rlx-gguf parses GGUF dims in file order, so `shape[0]` IS ne[0].
 fn scan_spec_violations(f: &GgufFile) -> Vec<String> {
+    scan_spec_violations_detailed(f)
+        .into_iter()
+        .map(|v| v.name)
+        .collect()
+}
+
+/// One spec violation with enough detail to act on (used by `--audit`).
+#[derive(Debug, Clone)]
+pub struct SpecViolation {
+    pub name: String,
+    /// Short display name of the GGML type (e.g. `"Q8_0"`).
+    pub dtype: &'static str,
+    /// Row width (GGUF ne[0], the FIRST parsed dim — file order).
+    pub ne0: usize,
+    /// The type's block size that ne0 must divide.
+    pub blck: usize,
+}
+
+/// Detailed spec scan: same rule as [`scan_spec_violations`], but each
+/// violation carries the tensor's type/ne0/blck for the audit report.
+fn scan_spec_violations_detailed(f: &GgufFile) -> Vec<SpecViolation> {
     let mut out = Vec::new();
-    // Deterministic order for the report.
     let mut names: Vec<&rlx_gguf::GgufTensor> = f.tensors.values().collect();
     names.sort_by(|a, b| a.name.cmp(&b.name));
     for t in names {
@@ -115,11 +135,45 @@ fn scan_spec_violations(f: &GgufFile) -> Vec<String> {
         if blck > 1 {
             let ne0 = t.shape.first().copied().unwrap_or(0);
             if ne0 % blck != 0 {
-                out.push(t.name.clone());
+                out.push(SpecViolation {
+                    name: t.name.clone(),
+                    dtype: type_name(t.dtype),
+                    ne0,
+                    blck,
+                });
             }
         }
     }
     out
+}
+
+/// Result of auditing one GGUF file (`--audit`, IMP-003): a dtype census
+/// plus the spec-conformance violations.
+#[derive(Debug, Clone, Default)]
+pub struct GgufAudit {
+    pub tensor_count: usize,
+    /// Type display name → tensor count (sorted by name when printed).
+    pub dtype_histogram: BTreeMap<String, usize>,
+    pub violations: Vec<SpecViolation>,
+}
+
+/// Audit any GGUF file — no reference needed: parse it, census the tensor
+/// dtypes, and scan for spec violations (gguf.cpp:724 per-row rule). This
+/// is the productized "check a downloaded/converted GGUF" workflow.
+pub fn audit_gguf(path: &Path) -> Result<GgufAudit, String> {
+    let f = GgufFile::from_path(path).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    let mut audit = GgufAudit {
+        tensor_count: f.tensors.len(),
+        ..Default::default()
+    };
+    for t in f.tensors.values() {
+        *audit
+            .dtype_histogram
+            .entry(type_name(t.dtype).to_string())
+            .or_insert(0) += 1;
+    }
+    audit.violations = scan_spec_violations_detailed(&f);
+    Ok(audit)
 }
 
 /// Compare OUR converted GGUF against a reference GGUF (e.g. produced by

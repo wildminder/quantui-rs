@@ -255,6 +255,12 @@ pub struct GgufVerificationArgs {
     /// Override the `general.name` metadata (else derived from the input).
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Audit an existing GGUF file instead of converting: dtype census +
+    /// spec-conformance scan (gguf.cpp:724 per-row rule). Takes no
+    /// INPUT/OUTPUT/--method. Exit 0 clean, 3 violations, 1 unparseable.
+    #[arg(long, value_name = "FILE_GGUF", conflicts_with_all = ["tensor_type_file", "imatrix"])]
+    pub audit: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

@@ -252,11 +252,35 @@ quantui-rs gguf [OPTIONS] [INPUT] [OUTPUT]
       --emit-recipe <PATH>       Dump the effective per-tensor assignment
       --verify-against <REF.GGUF>  Oracle equivalence report after conversion
       --recipe-from <REF.GGUF>   Extract + apply a reference's dtype assignment
+      --audit <FILE.GGUF>        Audit an existing GGUF (no conversion):
+                                 dtype census + spec-conformance scan;
+                                 exit 0 clean / 3 violations / 1 unparseable
       --arch <ARCH>              Override the GGUF arch string
                                  (else detected from config.json)
       --name <NAME>              Override general.name metadata
       --list-methods             List all methods and exit
       --no-progress              Plain, CI-friendly output
+```
+
+### Auditing an existing GGUF (`--audit`)
+
+Check any GGUF — a downloaded unsloth file, a llama-quantize output, or your
+own — without converting anything:
+
+```sh
+quantui-rs gguf --audit model-Q8_0.gguf
+# audit: model-Q8_0.gguf (266 tensors)
+#   dtype histogram: F16=2, F32=99, Q8_0=165
+#   spec-conformance: OK (0 violations)
+```
+
+The audit runs the same per-row spec check the converter enforces
+(`ne[0] % block_size == 0` for every quantized tensor — the `gguf.cpp:724`
+rule that makes files loadable by llama.cpp) and prints a dtype census.
+Exit code `3` flags a spec-violating file, so it scripts cleanly as a gate:
+
+```sh
+quantui-rs gguf --audit "$f" || echo "$f is spec-violating"
 ```
 
 ### What the converter does
