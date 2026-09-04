@@ -957,19 +957,41 @@ fn scheme_type_name(s: GgufScheme) -> &'static str {
 /// dense llama/qwen/mistral/gemma family. Returns `None` for names with no
 /// known mapping (callers pass them through unchanged).
 ///
+/// Generic nested-prefix handling: multimodal / wrapped checkpoints
+/// (VibeVoice, LFM2-VL, ...) nest the language model one level below the
+/// top-level `model.` module (`model.language_model.layers.3.…`,
+/// `model.model.layers.3.…`). The wrapper is stripped and the inner name is
+/// fed through the same dense mapper below, so wrapped dense cores still
+/// land on `blk.*`. Arch-specific cores that are not in the dense table
+/// (LFM2's `conv.*` / `feed_forward.w1`, vision towers, conv heads) return
+/// `None` and keep their ORIGINAL full name — nothing is ever guessed.
+///
 /// Port of the naming used by llama.cpp `convert_hf_to_gguf.py` for the
 /// architectures the reference Unsloth GGUF path supports.
 pub fn hf_to_gguf_name(name: &str) -> Option<String> {
-    // Top-level (non-layer) tensors.
+    // Strip the nested language-model wrapper before any matching, so both
+    // the dense form and the wrapped form share one mapping path.
+    let name = name
+        .strip_prefix("model.language_model.")
+        .or_else(|| name.strip_prefix("model.model."))
+        .unwrap_or(name);
+
+    // Top-level (non-layer) tensors — both the dense `model.*` form and the
+    // bare form left after the prefix strip above.
     match name {
-        "model.embed_tokens.weight" => return Some("token_embd.weight".into()),
+        "model.embed_tokens.weight" | "embed_tokens.weight" => {
+            return Some("token_embd.weight".into())
+        }
         "lm_head.weight" => return Some("output.weight".into()),
-        "model.norm.weight" => return Some("output_norm.weight".into()),
+        "model.norm.weight" | "norm.weight" => return Some("output_norm.weight".into()),
         _ => {}
     }
 
-    // Layer tensors: model.layers.{i}.<rest>
-    let rest = name.strip_prefix("model.layers.")?;
+    // Layer tensors: `model.layers.{i}.<rest>` (dense) or `layers.{i}.<rest>`
+    // (after nested-prefix stripping).
+    let rest = name
+        .strip_prefix("model.layers.")
+        .or_else(|| name.strip_prefix("layers."))?;
     let (idx_str, tail) = rest.split_once('.')?;
     let idx: u32 = idx_str.parse().ok()?;
     let blk = format!("blk.{idx}");
@@ -1064,6 +1086,10 @@ fn arch_from_classname(cls: &str) -> String {
         "BloomForCausalLM" => "bloom".into(),
         "FalconForCausalLM" => "falcon".into(),
         "StableLmForCausalLM" => "stablelm".into(),
+        // LFM2 family (LiquidAI): llama.cpp registers `lfm2`
+        // (llama-arch.cpp:126). The VL class wraps the same language model.
+        "LFM2ForCausalLM" | "Lfm2ForCausalLM" => "lfm2".into(),
+        "LFM2VLForConditionalGeneration" | "Lfm2VLForConditionalGeneration" => "lfm2".into(),
         other => {
             // Fallback: lowercase the leading word before "For".
             let stem = other.split("For").next().unwrap_or(other);
@@ -1096,6 +1122,7 @@ fn load_arch_info(dir: &Path) -> Option<ArchInfo> {
                 "gemma" | "gemma2" => "gemma".to_string(),
                 "phi" | "phi3" => "phi".to_string(),
                 "gpt2" => "gpt2".to_string(),
+                "lfm2" => "lfm2".to_string(),
                 _ => arch_from_classname(cls),
             }
         })
@@ -1164,11 +1191,113 @@ mod tests {
     }
 
     #[test]
+    fn name_mapping_nested_language_model_prefix() {
+        // VibeVoice / LFM2-VL wrap the dense LM one level down. The wrapper
+        // is stripped and the inner dense name maps exactly like the bare
+        // form — same results, one generic rule.
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.embed_tokens.weight").as_deref(),
+            Some("token_embd.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.norm.weight").as_deref(),
+            Some("output_norm.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.3.self_attn.q_proj.weight").as_deref(),
+            Some("blk.3.attn_q.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.mlp.down_proj.weight").as_deref(),
+            Some("blk.0.ffn_down.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.11.input_layernorm.weight").as_deref(),
+            Some("blk.11.attn_norm.weight")
+        );
+        // lm_head sits ABOVE the wrapper in real checkpoints and must keep
+        // mapping (it is untouched by the strip).
+        assert_eq!(
+            hf_to_gguf_name("lm_head.weight").as_deref(),
+            Some("output.weight")
+        );
+        // Rotary inside the wrapper is still skipped.
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.self_attn.rotary_emb.inv_freq"),
+            None
+        );
+        // The generic `model.model.` wrapper (other multimodal families).
+        assert_eq!(
+            hf_to_gguf_name("model.model.layers.1.self_attn.o_proj.weight").as_deref(),
+            Some("blk.1.attn_output.weight")
+        );
+    }
+
+    #[test]
+    fn name_mapping_arch_specific_cores_pass_through() {
+        // LFM2 layer cores are NOT in the dense table — they must keep their
+        // ORIGINAL full name (including the wrapper), never be guessed.
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.conv.conv.weight"),
+            None
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.feed_forward.w1.weight"),
+            None
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.operator_norm.weight"),
+            None
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.ffn_norm.weight"),
+            None
+        );
+        // Vision tower / projector / conv heads pass through untouched.
+        assert_eq!(
+            hf_to_gguf_name(
+                "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight"
+            ),
+            None
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.multi_modal_projector.linear_1.weight"),
+            None
+        );
+        // VibeVoice conv/tokenizer heads: pass-through (regression guard —
+        // this was the pre-task behavior and must stay).
+        assert_eq!(
+            hf_to_gguf_name("model.acoustic_tokenizer.encoder.block.0.conv.weight"),
+            None
+        );
+        assert_eq!(hf_to_gguf_name("model.semantic_connector.fc1.weight"), None);
+        // A dense `model.layers.*` name must NOT be eaten by the prefix
+        // strip: `model.layers.5.…` does not start with either wrapper.
+        assert_eq!(
+            hf_to_gguf_name("model.layers.5.self_attn.v_proj.weight").as_deref(),
+            Some("blk.5.attn_v.weight")
+        );
+    }
+
+    #[test]
     fn arch_classname_mapping() {
         assert_eq!(arch_from_classname("LlamaForCausalLM"), "llama");
         assert_eq!(arch_from_classname("Qwen2ForCausalLM"), "qwen2");
         assert_eq!(arch_from_classname("GemmaForCausalLM"), "gemma");
         assert_eq!(arch_from_classname("SomethingForCausalLM"), "something");
+        // LFM2 family → `lfm2` (llama.cpp LLM_ARCH_LFM2, llama-arch.cpp:126).
+        assert_eq!(arch_from_classname("LFM2ForCausalLM"), "lfm2");
+        assert_eq!(arch_from_classname("Lfm2ForCausalLM"), "lfm2");
+        assert_eq!(
+            arch_from_classname("LFM2VLForConditionalGeneration"),
+            "lfm2"
+        );
+        assert_eq!(
+            arch_from_classname("Lfm2VLForConditionalGeneration"),
+            "lfm2"
+        );
+        // lfm2moe stays on the generic lowercase-stem fallback for now.
+        assert_eq!(arch_from_classname("Lfm2MoeForCausalLM"), "lfm2moe");
     }
 
     #[test]

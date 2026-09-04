@@ -473,6 +473,125 @@ fn gguf_convert_single_file_exit_0() {
     assert!(f.tensors.contains_key("output.weight"));
 }
 
+/// Generic nested-prefix name mapping, end-to-end: a wrapped multimodal
+/// checkpoint (`model.language_model.*` = VibeVoice / LFM2-VL layout, plus a
+/// vision tower that stays outside the wrapper) must land the wrapped dense
+/// cores on `blk.*` / `token_embd` / `output_norm`, keep the arch-specific
+/// pass-through tensors under their ORIGINAL full names, and record the
+/// `lfm2` architecture in the metadata.
+#[test]
+fn gguf_nested_prefix_wrapped_lms_map_to_blk_and_lfm2_arch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let h = 256usize;
+    let v = 256usize;
+    let mk2d = |name: &'static str, rows: usize, cols: usize, seed: u64| Tensor {
+        name,
+        dtype: "BF16",
+        shape: vec![rows as u64, cols as u64],
+        bytes: bf16_bytes(&synth(rows * cols, seed)),
+    };
+    let mk1d = |name: &'static str, n: usize, seed: u64| Tensor {
+        name,
+        dtype: "BF16",
+        shape: vec![n as u64],
+        bytes: bf16_bytes(&synth(n, seed)),
+    };
+    let tensors = vec![
+        // Wrapped dense LM core — must land on blk.*/token_embd/output_norm.
+        mk2d("model.language_model.embed_tokens.weight", v, h, 1),
+        mk2d(
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            h,
+            h,
+            2,
+        ),
+        mk1d("model.language_model.norm.weight", h, 11),
+        // LFM2 arch-specific core INSIDE the wrapper — no dense mapping,
+        // must keep its original full name.
+        mk2d(
+            "model.language_model.layers.0.feed_forward.w1.weight",
+            h,
+            h,
+            3,
+        ),
+        // Vision tower OUTSIDE the wrapper — pass-through.
+        mk2d("model.vision_tower.vision_model.patch_proj.weight", h, h, 4),
+    ];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&serde_json::json!({
+            "architectures": ["LFM2VLForConditionalGeneration"],
+            "model_type": "lfm2",
+            "hidden_size": h,
+            "num_hidden_layers": 1,
+            "vocab_size": v
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("wrapped-q8_0.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "wrapped-prefix conversion must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
+    // Arch metadata is the registered llama.cpp `lfm2` string.
+    assert_eq!(
+        f.metadata
+            .get("general.architecture")
+            .and_then(|m| match m {
+                rlx_gguf::MetaValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .as_deref(),
+        Some("lfm2"),
+        "arch must be lfm2, metadata: {:?}",
+        f.metadata
+    );
+
+    // Wrapped dense cores mapped through the wrapper strip.
+    assert!(f.tensors.contains_key("token_embd.weight"));
+    assert!(f.tensors.contains_key("blk.0.attn_q.weight"));
+    assert!(f.tensors.contains_key("output_norm.weight"));
+    // Arch-specific + outside-wrapper tensors keep their original names.
+    assert!(f
+        .tensors
+        .contains_key("model.language_model.layers.0.feed_forward.w1.weight"));
+    assert!(f
+        .tensors
+        .contains_key("model.vision_tower.vision_model.patch_proj.weight"));
+    // And nothing leaked under a mangled name.
+    assert!(!f.tensors.contains_key("blk.0.feed_forward.w1.weight"));
+    assert_eq!(
+        f.tensors.len(),
+        5,
+        "no tensor may be dropped or renamed away"
+    );
+}
+
 #[test]
 fn gguf_auto_naming() {
     let tmp = tempfile::tempdir().unwrap();
