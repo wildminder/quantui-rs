@@ -687,6 +687,13 @@ fn gguf_recipe_from_reference_reproduces_assignment() {
     let dump_text = std::fs::read_to_string(&dump).unwrap();
     assert!(dump_text.contains("^blk.0.attn_q.weight$=q8_0"));
     assert!(dump_text.contains("^blk.0.ffn_down.weight$=f16"));
+
+    // [NTH-006] The dump's FIRST line is the format-version marker, and
+    // the versioned dump still feeds back through --tensor-type-file.
+    assert!(
+        dump_text.starts_with("# quantui-rs recipe format v1\n"),
+        "emit-recipe dump must start with the version header, got: {dump_text}"
+    );
 }
 
 /// Task #8 exit-2 path: --recipe-from on an unparseable file.

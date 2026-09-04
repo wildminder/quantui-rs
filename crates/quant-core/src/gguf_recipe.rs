@@ -246,6 +246,12 @@ pub enum RecipeFromError {
     },
 }
 
+/// Recipe file format version emitted by `--emit-recipe` and
+/// `--recipe-from` dumps. Parsers ignore comment lines, so older versionless
+/// files stay loadable — this only marks NEW outputs so a future format
+/// change can be detected by reading the first line instead of guessing.
+pub const RECIPE_FORMAT_VERSION: &str = "v1";
+
 /// Extract the per-tensor dtype assignment from an existing GGUF
 /// (unsloth, llama-quantize, or our own output) as a [`TensorRecipe`].
 ///
@@ -271,8 +277,9 @@ pub fn recipe_from_gguf(path: &std::path::Path) -> Result<TensorRecipe, RecipeFr
     let mut names: Vec<&rlx_gguf::GgufTensor> = f.tensors.values().collect();
     names.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut text = String::from(
-        "# recipe extracted from reference GGUF (--recipe-from)\n\
+    let mut text = format!(
+        "# quantui-rs recipe format {RECIPE_FORMAT_VERSION}\n\
+         # recipe extracted from reference GGUF (--recipe-from)\n\
          # one ^name$=qtype rule per tensor, sorted by name\n",
     );
     for t in names {

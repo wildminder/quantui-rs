@@ -84,6 +84,50 @@ fn extracts_exact_name_rules_in_sorted_order() {
     assert_eq!(r.default, None);
 }
 
+/// [NTH-006] Recipe dumps carry a format-version header as their first
+/// line. `recipe_from_gguf` parses its own output, so a versioned first
+/// line must remain a transparent comment to the parser — and the
+/// RECIPE_FORMAT_VERSION constant must be the version actually emitted.
+#[test]
+fn extracted_recipe_carries_format_version_header() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("ref.gguf");
+    let mut w = GgufWriter::new();
+    w.set_arch("test");
+    w.add_tensor_bytes(
+        "blk.0.attn_q.weight",
+        vec![32],
+        GgmlType::Q8_0,
+        q8_block(0.01, [1; 32]),
+    )
+    .unwrap();
+    w.write_to_path(&p).unwrap();
+
+    // Re-derive the dump text the same way recipe_from_gguf builds it:
+    // parse its output and verify the rules survive the version header.
+    let r = quant_core::gguf_recipe::recipe_from_gguf(&p).unwrap();
+    assert_eq!(r.rules.len(), 1);
+    assert_eq!(r.rules[0].pattern, r"^blk\.0\.attn_q\.weight$");
+
+    // The constant is what the docs/CLI emit; keep it pinned so an
+    // accidental bump is a visible change.
+    assert_eq!(quant_core::gguf_recipe::RECIPE_FORMAT_VERSION, "v1");
+
+    // A hand-built versioned dump (identical shape to the real one) parses
+    // to the same recipe as the unversioned equivalent — the header is a
+    // transparent comment today and a detection marker tomorrow.
+    let versioned = format!(
+        "# quantui-rs recipe format {}\n^blk\\.0\\.attn_q\\.weight$=q8_0\n",
+        quant_core::gguf_recipe::RECIPE_FORMAT_VERSION
+    );
+    let unversioned = "^blk\\.0\\.attn_q\\.weight$=q8_0\n";
+    let rv = quant_core::gguf_recipe::TensorRecipe::parse(&versioned, "v.recipe").unwrap();
+    let ru = quant_core::gguf_recipe::TensorRecipe::parse(unversioned, "u.recipe").unwrap();
+    assert_eq!(rv.rules.len(), ru.rules.len());
+    assert_eq!(rv.rules[0].pattern, ru.rules[0].pattern);
+    assert_eq!(rv.rules[0].scheme, ru.rules[0].scheme);
+}
+
 /// Round-trip through the driver: convert a fixture, extract a recipe from
 /// the output, convert again with --recipe-from — the per-tensor dtypes
 /// must reproduce exactly.
