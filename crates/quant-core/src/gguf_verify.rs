@@ -23,7 +23,7 @@ use std::path::Path;
 
 use rlx_gguf::{GgmlType, GgufFile};
 
-use crate::gguf_convert::hf_to_gguf_name;
+use crate::gguf_names::hf_to_gguf_name;
 
 /// Classification of one differing tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

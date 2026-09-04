@@ -24,6 +24,7 @@ pub mod gguf_convert;
 mod gguf_iq_grid;
 pub mod gguf_iq_quants;
 mod gguf_iq_tables_data;
+pub mod gguf_names;
 pub mod gguf_quants;
 pub mod gguf_recipe;
 pub mod gguf_registry;
