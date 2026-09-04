@@ -143,6 +143,31 @@ pub struct GgufConvertReport {
     pub effective_schemes: Vec<(String, GgufScheme)>,
 }
 
+/// Result of encoding ONE tensor (IMP-004 step 1, the extraction of the
+/// conversion loop body): the payload plus everything the caller needs to
+/// update the report, print warnings, and feed the writer. `warnings`
+/// carries the stderr lines the inline code used to print directly — the
+/// caller prints them in file order so sequential and (later) parallel
+/// encoding produce identical stderr streams.
+struct EncodedTensor {
+    gguf_name: String,
+    dtype: GgmlType,
+    bytes: Vec<u8>,
+    scheme: GgufScheme,
+    /// True when the tensor was weighted-quantized (counted as quantized).
+    weighted_done: bool,
+    /// True when the tensor quantized under its own scheme.
+    quantized: bool,
+    kept_f32: bool,
+    /// Phase 2.3/6.3: encoder rejected it or a demotion landed on F16.
+    fell_back_f16: bool,
+    /// Row-width demotion fired (the CAUSE counter, distinct from
+    /// fell_back_f16 which counts the OUTCOME).
+    row_demoted: bool,
+    /// User-facing stderr lines, printed by the caller in file order.
+    warnings: Vec<String>,
+}
+
 /// Convert a HF safetensors input (single file or sharded folder) to GGUF.
 ///
 /// `on_progress`, when provided, is called as `(done, total)` after each
@@ -243,334 +268,49 @@ pub fn convert_hf_to_gguf(
     let mut effective_schemes: Vec<(String, GgufScheme)> = Vec::new();
     for (done, (name, shard_idx)) in names.iter().enumerate() {
         let reader = &readers[*shard_idx];
-        let info = reader.header().get(name).expect("name came from header");
-        let raw = reader.tensor_bytes(name)?;
-        let ndim = info.shape.len();
+        let encoded = encode_one_tensor(
+            cfg,
+            entry,
+            engine,
+            &mut policy_state,
+            model_facts,
+            reader,
+            name,
+            done,
+            total,
+        )?;
 
-        let gguf_name = hf_to_gguf_name(name).unwrap_or_else(|| name.clone());
-        // Phase 3.0 + 6.2: per-tensor type resolution — a faithful port of
-        // llama_tensor_get_type (llama-quant.cpp:683-739):
-        //   1. 1-D → F32 (never quantized — the shared convention);
-        //   2. --token-embedding-type / --output-tensor-type return EARLY
-        //      (:688-706): neither the recipe nor the method's engine runs
-        //      for those tensors. Exception: a recipe rule explicitly
-        //      naming per_layer_token_embd beats the embd override
-        //      (:688-699 `named` — it is a "large separate table");
-        //   3. the recipe's first matching rule = manual mode (:713-727):
-        //      it skips the engine INCLUDING its counter advancement —
-        //      upstream `manual = true` never calls
-        //      llama_tensor_get_type_impl, which owns the ++qs.i_* counter
-        //      increments (:570, :634, :730-731) — and the bare default
-        //      applies when no rule matches;
-        //   4. the method's own engine: the llama_policy engine for
-        //      composite methods (categories + counters + use_more_bits),
-        //      the flat registry rules otherwise.
-        // The manual/engine block only runs when the method's default type
-        // is quantized (:711) — f16/f32/bf16 methods ignore the recipe
-        // entirely, exactly like upstream. The category overrides at step
-        // 2 sit BEFORE that gate, so they apply even to f16 methods.
-        let cat = llama_policy::tensor_get_category(&gguf_name);
-        let scheme = if ndim < 2 {
-            GgufScheme::F32
-        } else if let Some(s) = category_override(cfg, &gguf_name, cat)? {
-            s
-        } else if !scheme_is_quantized(entry.policy.default) {
-            // Upstream skips the manual+engine block when the method's
-            // default type is not quantized (:711) — the recipe is inert.
-            entry.policy.default
-        } else if let Some(s) = cfg.recipe.as_ref().and_then(|r| r.scheme_for(&gguf_name)) {
-            // Manual mode — the engine and its counters are skipped.
-            s
-        } else {
-            match &mut policy_state {
-                Some(state) => {
-                    let ctx = llama_policy::PolicyCtx {
-                        name: &gguf_name,
-                        ndim,
-                        category: cat,
-                        facts: model_facts,
-                        state,
-                    };
-                    let s = llama_policy::resolve(&engine, &ctx);
-                    llama_policy::advance(state, cat);
-                    s
-                }
-                None => gguf_registry::scheme_for(entry, &gguf_name, ndim),
-            }
-        };
-
-        // Per-row block-size demotion — port of `tensor_type_fallback`
-        // (llama-quant.cpp:372-425), which upstream calls from
-        // `llama_tensor_get_type` (:309), i.e. at TYPE-SELECTION time. It
-        // must therefore run BEFORE the imatrix/weighted dispatch below
-        // (a demoted tensor may no longer be an imatrix scheme at all) and
-        // before `quantize()`.
-        //
-        // Why this exists: the GGUF contract requires ne[0] % blck_size == 0
-        // per ROW (gguf.cpp:724 rejects it, :1409 asserts it), while the
-        // pinned rlx-gguf 0.2.14 `quantize()` only checks the FLAT element
-        // count (rlx quantize.rs:199 `check_div(name, n, blk)`). Conv1d /
-        // ConvTranspose1d weights (VibeVoice-1.5B: 102 tensors with kernel
-        // sizes 4/7/8/10/16 → ne[0] = 4/7/8/10/16) have a divisible flat
-        // count but NOT a divisible row, so they were silently quantized
-        // into blocks straddling row boundaries. llama-quantize never
-        // writes such a tensor.
-        let ne0 = info.shape.last().copied().unwrap_or(0) as usize;
-        let pre = scheme;
-        let scheme = if ne0 == 0 {
-            scheme
-        } else {
-            let demoted = row_fallback_scheme(&gguf_name, ne0, scheme);
-            if demoted != scheme {
-                row_fallback += 1;
-                row_fallback_tensors.push(gguf_name.clone());
-            }
-            demoted
-        };
-        // A demotion that lands on F16 has the SAME user-visible outcome as
-        // the Phase 2.3 fallback — the tensor is not in the method's scheme —
-        // so it is reported the same way (`fallback_f16`, the CLI's "were NOT
-        // quantized with '<method>'" summary). `row_fallback` above is what
-        // records the CAUSE: a row width no quantized type can describe,
-        // discovered at type-selection time rather than by the encoder.
-        let demoted_to_f16 = pre != GgufScheme::F16 && scheme == GgufScheme::F16;
-
-        // Phase 6.3: record the effective scheme AFTER the per-row
-        // demotion — the recorded assignment is what actually lands in the
-        // file, so `--emit-recipe` round-trips to a stable model.
-        effective_schemes.push((gguf_name.clone(), scheme));
-        let ggml = scheme_to_ggml(scheme);
-
-        // Decode to f32 (GGUF encoders consume f32).
-        let floats = decode_f32(info.dtype, raw).ok_or_else(|| GgufError::BadDtype {
-            name: name.clone(),
-            dtype: info.dtype,
-        })?;
-
-        // Phase 4.4 entry semantics (llama-quant.cpp:1222-1251, :803-822):
-        // - no imatrix configured → legacy behaviour: everything goes
-        //   through the unweighted encoders (rlx for IQ*; the Option-None
-        //   `av_x + |x|` path for K-quants) — byte-identical to the
-        //   pre-Phase-4 output, and what the method-matrix sweep locks.
-        // - imatrix configured but no entry for this tensor:
-        //     * IQ-scheme tensor → HARD ERROR (very-low-bit garbage;
-        //       llama-quant.cpp:1245-1251 bails out the same way);
-        //     * Q2_K under q2_k_s → HARD ERROR (:818);
-        //     * any other K-quant → warn + proceed unweighted (:1226
-        //       logs "did not find weights" at INFO);
-        //     * token_embd / output are exempt from the hard errors (:804)
-        //       and a SIZE-mismatched token_embd entry is dropped with a
-        //       note (:1238 — "tok_embd should be ignored in this case").
-        let exempt = matches!(
-            gguf_name.as_str(),
-            "token_embd.weight" | "per_layer_token_embd.weight" | "output.weight"
-        );
-        let is_iq_scheme = matches!(
-            scheme,
-            GgufScheme::Iq1S
-                | GgufScheme::Iq1M
-                | GgufScheme::Iq2Xxs
-                | GgufScheme::Iq2Xs
-                | GgufScheme::Iq2S
-                | GgufScheme::Iq3Xxs
-                | GgufScheme::Iq3S
-                | GgufScheme::Iq4Nl
-                | GgufScheme::Iq4Xs
-        );
-        let mut weights = cfg
-            .imatrix
-            .as_ref()
-            .and_then(|im| im.weights_for(&gguf_name));
-        if cfg.imatrix.is_some() {
-            let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
-            if let Some(wv) = weights {
-                if n_per_row == 0 || wv.len() != n_per_row {
-                    if matches!(
-                        gguf_name.as_str(),
-                        "token_embd.weight" | "per_layer_token_embd.weight"
-                    ) {
-                        eprintln!(
-                            "note: imatrix size {} != n_per_row {} for tensor '{gguf_name}' — \
-                             quantizing it without weights (llama-quantize ignores tok_embd mismatches)",
-                            wv.len(),
-                            n_per_row
-                        );
-                        weights = None;
-                    } else {
-                        return Err(GgufError::Imatrix(format!(
-                            "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
-                            wv.len(),
-                            n_per_row
-                        )));
-                    }
-                }
-            }
-            if weights.is_none() {
-                // llama-quant.cpp:803-822 hard-requires an entry for IQ
-                // schemes (and Q2_K under the Q2_K_S ftype — but our
-                // registry has no q2_k_s method, Unsloth ships q2_k /
-                // q2_k_l, so that branch cannot occur here). token_embd /
-                // output are always exempt (:804-806).
-                let requires = is_iq_scheme && !exempt;
-                if requires {
-                    return Err(GgufError::Imatrix(format!(
-                        "Missing importance matrix for tensor '{gguf_name}' in a very low-bit \
-                         quantization (method '{}'); the result would be garbage, so bailing out",
-                        cfg.method_id
-                    )));
-                }
-                // Upstream logs "did not find weights" (llama-quant.cpp:1226)
-                // for every tensor lacking an entry. We note 2-D tensors
-                // only — 1-D norms/biases never carry imatrix entries, and a
-                // note per norm would be pure noise.
-                if ndim >= 2 {
-                    eprintln!(
-                        "note: did not find weights for '{gguf_name}' — quantizing it without \
-                         an importance matrix (llama-quantize logs the same)"
-                    );
-                }
-            }
+        // Report accounting + warning printing stay in file order here;
+        // the parallel path (IMP-004 step 2) reuses the exact same logic.
+        if encoded.row_demoted {
+            row_fallback += 1;
+            row_fallback_tensors.push(encoded.gguf_name.clone());
         }
-        let weighted = matches!(
-            (scheme, weights),
-            (GgufScheme::Q4K, Some(_))
-                | (GgufScheme::Q2K, Some(_))
-                | (GgufScheme::Q3K, Some(_))
-                | (GgufScheme::Q5K, Some(_))
-                | (GgufScheme::Q6K, Some(_))
-                | (GgufScheme::Iq2Xxs, Some(_))
-                | (GgufScheme::Iq2Xs, Some(_))
-                | (GgufScheme::Iq2S, Some(_))
-                | (GgufScheme::Iq3Xxs, Some(_))
-                | (GgufScheme::Iq3S, Some(_))
-                | (GgufScheme::Iq1S, Some(_))
-                | (GgufScheme::Iq1M, Some(_))
-                | (GgufScheme::Iq4Nl, Some(_))
-                | (GgufScheme::Iq4Xs, Some(_))
-        );
-        if weighted {
-            let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
-            let nrows = floats.len() / n_per_row.max(1);
-            // Size check mirrors llama-quant.cpp:1228: the entry must cover
-            // ne[0] (ne[2]=1 for our 2-D dense case).
-            let wv = weights.unwrap();
-            if n_per_row == 0 || wv.len() != n_per_row || floats.len() % n_per_row != 0 {
-                return Err(GgufError::Imatrix(format!(
-                    "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
-                    wv.len(),
-                    n_per_row
-                )));
-            }
-            let mut out = Vec::with_capacity(floats.len() / 2);
-            for r in 0..nrows {
-                let row = &floats[r * n_per_row..(r + 1) * n_per_row];
-                let bytes = match scheme {
-                    GgufScheme::Q4K => {
-                        gguf_quants::quantize_row_q4_k_weighted(row, n_per_row, Some(wv))
-                    }
-                    GgufScheme::Q3K => {
-                        gguf_quants::quantize_row_q3_k_weighted(row, n_per_row, Some(wv))
-                    }
-                    GgufScheme::Q5K => {
-                        gguf_quants::quantize_row_q5_k_weighted(row, n_per_row, Some(wv))
-                    }
-                    GgufScheme::Q6K => {
-                        gguf_quants::quantize_row_q6_k_weighted(row, n_per_row, Some(wv))
-                    }
-                    // IQ family: weights are REQUIRED upstream (NULL is
-                    // GGML_ASSERTed, ggml-quants.c:3302/:3480) — the driver
-                    // only routes here when the entry exists.
-                    GgufScheme::Iq2Xxs => {
-                        crate::gguf_iq_quants::quantize_row_iq2_xxs_weighted(row, n_per_row, wv)
-                    }
-                    GgufScheme::Iq2Xs => {
-                        crate::gguf_iq_quants::quantize_row_iq2_xs_weighted(row, n_per_row, wv)
-                    }
-                    // iq2_s/iq3_xxs/iq3_s accept Option (their *_ref
-                    // paths pass NULL upstream); the driver always has
-                    // weights here.
-                    GgufScheme::Iq2S => {
-                        crate::gguf_iq_quants::quantize_row_iq2_s_weighted(row, n_per_row, Some(wv))
-                    }
-                    GgufScheme::Iq3Xxs => crate::gguf_iq_quants::quantize_row_iq3_xxs_weighted(
-                        row,
-                        n_per_row,
-                        Some(wv),
-                    ),
-                    GgufScheme::Iq3S => {
-                        crate::gguf_iq_quants::quantize_row_iq3_s_weighted(row, n_per_row, Some(wv))
-                    }
-                    GgufScheme::Iq1S => {
-                        crate::gguf_iq_quants::quantize_row_iq1_s_weighted(row, n_per_row, wv)
-                    }
-                    GgufScheme::Iq1M => {
-                        crate::gguf_iq_quants::quantize_row_iq1_m_weighted(row, n_per_row, Some(wv))
-                    }
-                    GgufScheme::Iq4Nl => crate::gguf_iq_quants::quantize_row_iq4_nl_weighted(
-                        row,
-                        n_per_row,
-                        Some(wv),
-                    ),
-                    GgufScheme::Iq4Xs => crate::gguf_iq_quants::quantize_row_iq4_xs_weighted(
-                        row,
-                        n_per_row,
-                        Some(wv),
-                    ),
-                    _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
-                };
-                out.extend(bytes);
-            }
+        effective_schemes.push((encoded.gguf_name.clone(), encoded.scheme));
+        for line in &encoded.warnings {
+            eprintln!("{line}");
+        }
+        if encoded.weighted_done {
             quantized += 1;
-            let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
-            w.add_tensor_bytes(&gguf_name, shape, ggml, out)
-                .map_err(|e| GgufError::Gguf(e.to_string()))?;
-            if let Some(cb) = on_progress.as_mut() {
-                cb(done + 1, total);
-            }
-            continue;
+        } else if encoded.fell_back_f16 {
+            fallback_f16 += 1;
+            fallback_tensors.push(encoded.gguf_name.clone());
+        } else if encoded.quantized {
+            quantized += 1;
+        } else if encoded.kept_f32 {
+            kept_f32 += 1;
         }
 
-        // Encode; fall back to F16 if the element count doesn't divide the
-        // scheme's block size (keeps the output valid GGUF). Phase 2.3:
-        // the fallback must never be silent — one stderr warning per
-        // degraded tensor, and the report carries the exact list.
-        let (bytes, dtype) = match quantize(&floats, ggml) {
-            Ok(b) => {
-                if demoted_to_f16 {
-                    eprintln!(
-                        "warning: tensor '{gguf_name}' fell back to F16: \
-                         method '{method}' scheme {pre:?} cannot describe a row of {ne0} elements; \
-                         output is valid GGUF but this tensor is NOT {method}-quantized",
-                        method = cfg.method_id,
-                    );
-                    fallback_f16 += 1;
-                    fallback_tensors.push(gguf_name.clone());
-                } else if scheme != GgufScheme::F32 {
-                    quantized += 1;
-                } else {
-                    kept_f32 += 1;
-                }
-                (b, ggml)
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: tensor '{gguf_name}' fell back to F16: \
-                     method '{method}' scheme {scheme:?} cannot encode it ({e}); \
-                     output is valid GGUF but this tensor is NOT {method}-quantized",
-                    method = cfg.method_id,
-                );
-                let b =
-                    quantize(&floats, GgmlType::F16).map_err(|e| GgufError::Gguf(e.to_string()))?;
-                fallback_f16 += 1;
-                fallback_tensors.push(gguf_name.clone());
-                (b, GgmlType::F16)
-            }
-        };
-
-        // GGUF stores dims reversed relative to HF row-major; data bytes are
-        // unchanged (innermost HF dim stays contiguous == ggml ne0).
-        let shape: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
-        w.add_tensor_bytes(&gguf_name, shape, dtype, bytes)
+        let shape: Vec<usize> = reader
+            .header()
+            .get(name)
+            .expect("name came from header")
+            .shape
+            .iter()
+            .rev()
+            .map(|&d| d as usize)
+            .collect();
+        w.add_tensor_bytes(&encoded.gguf_name, shape, encoded.dtype, encoded.bytes)
             .map_err(|e| GgufError::Gguf(e.to_string()))?;
 
         if let Some(cb) = on_progress.as_mut() {
@@ -947,6 +687,371 @@ fn scheme_type_name(s: GgufScheme) -> &'static str {
         GgufScheme::Q1_0 => "Q1_0",
         GgufScheme::Q2_0 => "Q2_0",
     }
+}
+
+// ─── per-tensor encoding (IMP-004 step 1) ──────────────────────────
+
+// ─── per-tensor encoding (IMP-004 step 1) ──────────────────────────
+
+/// Encode ONE tensor: resolve its GGUF-side name and scheme (advancing
+/// the policy counters — this part is order-sensitive and stays in the
+/// sequential driver), apply the row-width demotion, and quantize the
+/// payload. Returns everything the driver needs; warnings come back as
+/// strings so the driver prints them in file order regardless of where
+/// encoding ran (IMP-004).
+#[allow(clippy::too_many_arguments)]
+fn encode_one_tensor(
+    cfg: &GgufConvertConfig,
+    entry: &gguf_registry::RegistryEntry,
+    engine: llama_policy::LlamaPolicy,
+    policy_state: &mut Option<llama_policy::PolicyState>,
+    model_facts: llama_policy::ModelFacts,
+    reader: &SafetensorsReader,
+    name: &str,
+    _done: usize,
+    _total: usize,
+) -> Result<EncodedTensor, GgufError> {
+    let info = reader.header().get(name).expect("name came from header");
+    let raw = reader.tensor_bytes(name)?;
+    let ndim = info.shape.len();
+
+    let gguf_name = hf_to_gguf_name(name).unwrap_or_else(|| name.to_string());
+    let mut warnings: Vec<String> = Vec::new();
+    let mut row_demoted = false;
+
+    // Phase 3.0 + 6.2: per-tensor type resolution — a faithful port of
+    // llama_tensor_get_type (llama-quant.cpp:683-739):
+    //   1. 1-D → F32 (never quantized — the shared convention);
+    //   2. --token-embedding-type / --output-tensor-type return EARLY
+    //      (:688-706): neither the recipe nor the method's engine runs
+    //      for those tensors. Exception: a recipe rule explicitly
+    //      naming per_layer_token_embd beats the embd override
+    //      (:688-699 `named` — it is a "large separate table");
+    //   3. the recipe's first matching rule = manual mode (:713-727):
+    //      it skips the engine INCLUDING its counter advancement —
+    //      upstream `manual = true` never calls
+    //      llama_tensor_get_type_impl, which owns the ++qs.i_* counter
+    //      increments (:570, :634, :730-731) — and the bare default
+    //      applies when no rule matches;
+    //   4. the method's own engine: the llama_policy engine for
+    //      composite methods (categories + counters + use_more_bits),
+    //      the flat registry rules otherwise.
+    // The manual/engine block only runs when the method's default type
+    // is quantized (:711) — f16/f32/bf16 methods ignore the recipe
+    // entirely, exactly like upstream. The category overrides at step
+    // 2 sit BEFORE that gate, so they apply even to f16 methods.
+    let cat = llama_policy::tensor_get_category(&gguf_name);
+    let scheme = if ndim < 2 {
+        GgufScheme::F32
+    } else if let Some(s) = category_override(cfg, &gguf_name, cat)? {
+        s
+    } else if !scheme_is_quantized(entry.policy.default) {
+        // Upstream skips the manual+engine block when the method's
+        // default type is not quantized (:711) — the recipe is inert.
+        entry.policy.default
+    } else if let Some(s) = cfg.recipe.as_ref().and_then(|r| r.scheme_for(&gguf_name)) {
+        // Manual mode — the engine and its counters are skipped.
+        s
+    } else {
+        match policy_state.as_mut() {
+            Some(state) => {
+                let ctx = llama_policy::PolicyCtx {
+                    name: &gguf_name,
+                    ndim,
+                    category: cat,
+                    facts: model_facts,
+                    state,
+                };
+                let s = llama_policy::resolve(&engine, &ctx);
+                llama_policy::advance(state, cat);
+                s
+            }
+            None => gguf_registry::scheme_for(entry, &gguf_name, ndim),
+        }
+    };
+
+    // Per-row block-size demotion — port of `tensor_type_fallback`
+    // (llama-quant.cpp:372-425), which upstream calls from
+    // `llama_tensor_get_type` (:309), i.e. at TYPE-SELECTION time. It
+    // must therefore run BEFORE the imatrix/weighted dispatch below
+    // (a demoted tensor may no longer be an imatrix scheme at all) and
+    // before `quantize()`.
+    //
+    // Why this exists: the GGUF contract requires ne[0] % blck_size == 0
+    // per ROW (gguf.cpp:724 rejects it, :1409 asserts it), while the
+    // pinned rlx-gguf 0.2.14 `quantize()` only checks the FLAT element
+    // count (rlx quantize.rs:199 `check_div(name, n, blk)`). Conv1d /
+    // ConvTranspose1d weights (VibeVoice-1.5B: 102 tensors with kernel
+    // sizes 4/7/8/10/16 → ne[0] = 4/7/8/10/16) have a divisible flat
+    // count but NOT a divisible row, so they were silently quantized
+    // into blocks straddling row boundaries. llama-quantize never
+    // writes such a tensor.
+    let ne0 = info.shape.last().copied().unwrap_or(0) as usize;
+    let pre = scheme;
+    let scheme = if ne0 == 0 {
+        scheme
+    } else {
+        let demoted = row_fallback_scheme(&gguf_name, ne0, scheme);
+        if demoted != scheme {
+            row_demoted = true;
+        }
+        demoted
+    };
+    // A demotion that lands on F16 has the SAME user-visible outcome as
+    // the Phase 2.3 fallback — the tensor is not in the method's scheme —
+    // so it is reported the same way (`fallback_f16`, the CLI's "were NOT
+    // quantized with '<method>'" summary). `row_fallback` above is what
+    // records the CAUSE: a row width no quantized type can describe,
+    // discovered at type-selection time rather than by the encoder.
+    let demoted_to_f16 = pre != GgufScheme::F16 && scheme == GgufScheme::F16;
+
+    // Phase 6.3: effective scheme is recorded by the DRIVER after this
+    // returns (it owns the report).
+    let ggml = scheme_to_ggml(scheme);
+
+    // Decode to f32 (GGUF encoders consume f32).
+    let floats = decode_f32(info.dtype, raw).ok_or_else(|| GgufError::BadDtype {
+        name: name.to_string(),
+        dtype: info.dtype,
+    })?;
+
+    // Phase 4.4 entry semantics (llama-quant.cpp:1222-1251, :803-822):
+    // - no imatrix configured → legacy behaviour: everything goes
+    //   through the unweighted encoders (rlx for IQ*; the Option-None
+    //   `av_x + |x|` path for K-quants) — byte-identical to the
+    //   pre-Phase-4 output, and what the method-matrix sweep locks.
+    // - imatrix configured but no entry for this tensor:
+    //     * IQ-scheme tensor → HARD ERROR (very-low-bit garbage;
+    //       llama-quant.cpp:1245-1251 bails out the same way);
+    //     * Q2_K under q2_k_s → HARD ERROR (:818);
+    //     * any other K-quant → warn + proceed unweighted (:1226
+    //       logs "did not find weights" at INFO);
+    //     * token_embd / output are exempt from the hard errors (:804)
+    //       and a SIZE-mismatched token_embd entry is dropped with a
+    //       note (:1238 — "tok_embd should be ignored in this case").
+    let exempt = matches!(
+        gguf_name.as_str(),
+        "token_embd.weight" | "per_layer_token_embd.weight" | "output.weight"
+    );
+    let is_iq_scheme = matches!(
+        scheme,
+        GgufScheme::Iq1S
+            | GgufScheme::Iq1M
+            | GgufScheme::Iq2Xxs
+            | GgufScheme::Iq2Xs
+            | GgufScheme::Iq2S
+            | GgufScheme::Iq3Xxs
+            | GgufScheme::Iq3S
+            | GgufScheme::Iq4Nl
+            | GgufScheme::Iq4Xs
+    );
+    let mut weights = cfg
+        .imatrix
+        .as_ref()
+        .and_then(|im| im.weights_for(&gguf_name));
+    if cfg.imatrix.is_some() {
+        let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
+        if let Some(wv) = weights {
+            if n_per_row == 0 || wv.len() != n_per_row {
+                if matches!(
+                    gguf_name.as_str(),
+                    "token_embd.weight" | "per_layer_token_embd.weight"
+                ) {
+                    warnings.push(format!(
+                        "note: imatrix size {} != n_per_row {} for tensor '{gguf_name}' — \
+                         quantizing it without weights (llama-quantize ignores tok_embd mismatches)",
+                        wv.len(),
+                        n_per_row
+                    ));
+                    weights = None;
+                } else {
+                    return Err(GgufError::Imatrix(format!(
+                        "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
+                        wv.len(),
+                        n_per_row
+                    )));
+                }
+            }
+        }
+        if weights.is_none() {
+            // llama-quant.cpp:803-822 hard-requires an entry for IQ
+            // schemes (and Q2_K under the Q2_K_S ftype — but our
+            // registry has no q2_k_s method, Unsloth ships q2_k /
+            // q2_k_l, so that branch cannot occur here). token_embd /
+            // output are always exempt (:804-806).
+            let requires = is_iq_scheme && !exempt;
+            if requires {
+                return Err(GgufError::Imatrix(format!(
+                    "Missing importance matrix for tensor '{gguf_name}' in a very low-bit \
+                     quantization (method '{}'); the result would be garbage, so bailing out",
+                    cfg.method_id
+                )));
+            }
+            // Upstream logs "did not find weights" (llama-quant.cpp:1226)
+            // for every tensor lacking an entry. We note 2-D tensors
+            // only — 1-D norms/biases never carry imatrix entries, and a
+            // note per norm would be pure noise.
+            if ndim >= 2 {
+                warnings.push(format!(
+                    "note: did not find weights for '{gguf_name}' — quantizing it without \
+                     an importance matrix (llama-quantize logs the same)"
+                ));
+            }
+        }
+    }
+    let weighted = matches!(
+        (scheme, weights),
+        (GgufScheme::Q4K, Some(_))
+            | (GgufScheme::Q2K, Some(_))
+            | (GgufScheme::Q3K, Some(_))
+            | (GgufScheme::Q5K, Some(_))
+            | (GgufScheme::Q6K, Some(_))
+            | (GgufScheme::Iq2Xxs, Some(_))
+            | (GgufScheme::Iq2Xs, Some(_))
+            | (GgufScheme::Iq2S, Some(_))
+            | (GgufScheme::Iq3Xxs, Some(_))
+            | (GgufScheme::Iq3S, Some(_))
+            | (GgufScheme::Iq1S, Some(_))
+            | (GgufScheme::Iq1M, Some(_))
+            | (GgufScheme::Iq4Nl, Some(_))
+            | (GgufScheme::Iq4Xs, Some(_))
+    );
+    if weighted {
+        let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
+        let nrows = floats.len() / n_per_row.max(1);
+        // Size check mirrors llama-quant.cpp:1228: the entry must cover
+        // ne[0] (ne[2]=1 for our 2-D dense case).
+        let wv = weights.unwrap();
+        if n_per_row == 0 || wv.len() != n_per_row || floats.len() % n_per_row != 0 {
+            return Err(GgufError::Imatrix(format!(
+                "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
+                wv.len(),
+                n_per_row
+            )));
+        }
+        let mut out = Vec::with_capacity(floats.len() / 2);
+        for r in 0..nrows {
+            let row = &floats[r * n_per_row..(r + 1) * n_per_row];
+            let bytes = match scheme {
+                GgufScheme::Q4K => {
+                    gguf_quants::quantize_row_q4_k_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Q3K => {
+                    gguf_quants::quantize_row_q3_k_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Q5K => {
+                    gguf_quants::quantize_row_q5_k_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Q6K => {
+                    gguf_quants::quantize_row_q6_k_weighted(row, n_per_row, Some(wv))
+                }
+                // IQ family: weights are REQUIRED upstream (NULL is
+                // GGML_ASSERTed, ggml-quants.c:3302/:3480) — the driver
+                // only routes here when the entry exists.
+                GgufScheme::Iq2Xxs => {
+                    crate::gguf_iq_quants::quantize_row_iq2_xxs_weighted(row, n_per_row, wv)
+                }
+                GgufScheme::Iq2Xs => {
+                    crate::gguf_iq_quants::quantize_row_iq2_xs_weighted(row, n_per_row, wv)
+                }
+                // iq2_s/iq3_xxs/iq3_s accept Option (their *_ref
+                // paths pass NULL upstream); the driver always has
+                // weights here.
+                GgufScheme::Iq2S => {
+                    crate::gguf_iq_quants::quantize_row_iq2_s_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Iq3Xxs => {
+                    crate::gguf_iq_quants::quantize_row_iq3_xxs_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Iq3S => {
+                    crate::gguf_iq_quants::quantize_row_iq3_s_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Iq1S => {
+                    crate::gguf_iq_quants::quantize_row_iq1_s_weighted(row, n_per_row, wv)
+                }
+                GgufScheme::Iq1M => {
+                    crate::gguf_iq_quants::quantize_row_iq1_m_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Iq4Nl => {
+                    crate::gguf_iq_quants::quantize_row_iq4_nl_weighted(row, n_per_row, Some(wv))
+                }
+                GgufScheme::Iq4Xs => {
+                    crate::gguf_iq_quants::quantize_row_iq4_xs_weighted(row, n_per_row, Some(wv))
+                }
+                _ => gguf_quants::quantize_row_q2_k_weighted(row, n_per_row, Some(wv)),
+            };
+            out.extend(bytes);
+        }
+        return Ok(EncodedTensor {
+            gguf_name,
+            dtype: ggml,
+            bytes: out,
+            scheme,
+            weighted_done: true,
+            quantized: false,
+            kept_f32: false,
+            fell_back_f16: false,
+            row_demoted,
+            warnings,
+        });
+    }
+
+    // Encode; fall back to F16 if the element count doesn't divide the
+    // scheme's block size (keeps the output valid GGUF). Phase 2.3:
+    // the fallback must never be silent — one stderr warning per
+    // degraded tensor, and the report carries the exact list.
+    let (bytes, dtype, result) = match quantize(&floats, ggml) {
+        Ok(b) => {
+            let result = if demoted_to_f16 {
+                warnings.push(format!(
+                    "warning: tensor '{gguf_name}' fell back to F16: \
+                     method '{method}' scheme {pre:?} cannot describe a row of {ne0} elements; \
+                     output is valid GGUF but this tensor is NOT {method}-quantized",
+                    method = cfg.method_id,
+                ));
+                "f16"
+            } else if scheme != GgufScheme::F32 {
+                "quantized"
+            } else {
+                "f32"
+            };
+            (b, ggml, result)
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "warning: tensor '{gguf_name}' fell back to F16: \
+                 method '{method}' scheme {scheme:?} cannot encode it ({e}); \
+                 output is valid GGUF but this tensor is NOT {method}-quantized",
+                method = cfg.method_id,
+            ));
+            let b = quantize(&floats, GgmlType::F16).map_err(|e| GgufError::Gguf(e.to_string()))?;
+            return Ok(EncodedTensor {
+                gguf_name,
+                dtype: GgmlType::F16,
+                bytes: b,
+                scheme,
+                weighted_done: false,
+                quantized: false,
+                kept_f32: false,
+                fell_back_f16: true,
+                row_demoted,
+                warnings,
+            });
+        }
+    };
+
+    Ok(EncodedTensor {
+        gguf_name,
+        dtype,
+        bytes,
+        scheme,
+        weighted_done: false,
+        quantized: result == "quantized",
+        kept_f32: result == "f32",
+        fell_back_f16: result == "f16",
+        row_demoted,
+        warnings,
+    })
 }
 
 #[cfg(test)]

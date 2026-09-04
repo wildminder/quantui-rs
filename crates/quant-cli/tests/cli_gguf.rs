@@ -2134,3 +2134,118 @@ fn gguf_conv_row_fallback_is_loud_and_writes_f16() {
         "block-aligned tensor keeps the requested scheme"
     );
 }
+
+// ─── [IMP-004] step 1: extraction refactor guarantees ───────────────
+
+/// [IMP-004] step 1: the extraction of the loop body into
+/// `encode_one_tensor` routes warnings through the return value; the
+/// driver must print them in FILE ORDER. Three odd-width tensors
+/// (kernels 7, 4, 10 → three demotions) must produce three stderr
+/// warnings, in input order, each naming its tensor.
+#[test]
+fn gguf_warning_order_is_file_order_after_refactor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let mk_conv = |name: &'static str, k: u64, seed: u64| Tensor {
+        name,
+        dtype: "BF16",
+        shape: vec![32, 1, k],
+        bytes: bf16_bytes(&synth((32 * k) as usize, seed)),
+    };
+    let tensors = vec![
+        mk_conv("model.layers.0.self_attn.q_proj.weight", 7, 1),
+        mk_conv("model.layers.0.self_attn.k_proj.weight", 4, 2),
+        mk_conv("model.layers.0.self_attn.v_proj.weight", 10, 3),
+        Tensor {
+            name: "model.norm.weight",
+            dtype: "BF16",
+            shape: vec![32],
+            bytes: bf16_bytes(&synth(32, 7)),
+        },
+    ];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 32
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("order.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let warns: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("not divisible by"))
+        .collect();
+    assert_eq!(warns.len(), 3, "3 demotions expected, got: {stderr}");
+    // File order: q_proj (layer0, kernel 7), k_proj, v_proj.
+    assert!(warns[0].contains("blk.0.attn_q.weight"), "{warns:?}");
+    assert!(warns[1].contains("blk.0.attn_k.weight"), "{warns:?}");
+    assert!(warns[2].contains("blk.0.attn_v.weight"), "{warns:?}");
+}
+
+/// [IMP-004] step 1: the report counters must survive the extraction
+/// unchanged. The tiny model (4 quantizable 2-D + 1 1-D norm) under q4_k_m
+/// has a known deterministic assignment; the summary line encodes all
+/// counter values. Any drift in quantized/kept_f32/fallback accounting
+/// shows up here.
+#[test]
+fn gguf_report_counters_stable_after_refactor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let out = tmp.path().join("counters.gguf");
+
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The known-good accounting for write_tiny_model + q4_k_m (q4_k_m's
+    // engine gives token_embd Q6_K, so nothing falls back):
+    // 5 tensors = 4 quantized (attn_q, ffn_down, token_embd, output)
+    //           + 1 kept F32 (the 1-D norm).
+    // Anchored on the exact phrase the CLI prints so any counter drift
+    // fails this test.
+    let summary: Vec<&str> = stdout.lines().filter(|l| l.starts_with("wrote ")).collect();
+    assert_eq!(summary.len(), 1, "{stdout}");
+    assert!(
+        summary[0].contains("(5 tensors: 4 quantized, 1 kept F32, 0 F16-fallback;"),
+        "counter drift detected: {}",
+        summary[0]
+    );
+}
