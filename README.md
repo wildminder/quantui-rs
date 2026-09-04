@@ -480,7 +480,7 @@ docs/plans/            design plan + execution log
 ## Development
 
 ```sh
-cargo test --workspace                 # 452 tests incl. golden byte-parity
+cargo test --workspace                 # 460 tests incl. golden byte-parity
 cargo clippy --workspace --all-targets # clean with -D warnings
 cargo fmt --check
 cargo bench -p quant-core              # throughput benchmarks (needs fixture)
