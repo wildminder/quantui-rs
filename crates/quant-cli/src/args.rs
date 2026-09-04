@@ -221,6 +221,15 @@ pub struct GgufArgs {
     #[arg(long, value_name = "PATH")]
     pub emit_recipe: Option<PathBuf>,
 
+    /// After conversion, compare the output against a REFERENCE GGUF
+    /// (e.g. an unsloth / llama-quantize produced file) and print an
+    /// equivalence report: per-tensor dtype diff (name-mapped), byte
+    /// comparison, dead-block/scale-rule/genuine classification of
+    /// payload differences, and a spec-conformance scan of our file.
+    /// Exit 3 only if our file has spec violations.
+    #[arg(long, value_name = "REFERENCE_GGUF")]
+    pub verify_against: Option<PathBuf>,
+
     /// Override the GGUF architecture string (else detected from config.json).
     #[arg(long)]
     pub arch: Option<String>,

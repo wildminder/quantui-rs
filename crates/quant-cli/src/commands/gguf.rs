@@ -246,6 +246,78 @@ pub fn run(args: GgufArgs) -> ExitCode {
             // per-tensor warnings already went to stderr during conversion;
             // restate the summary here so it is impossible to miss, without
             // failing the run (resume semantics — see plan §3-H).
+            // Task #7: --verify-against — oracle equivalence report vs a
+            // reference GGUF. Report tool: exit 0 regardless of diffs,
+            // UNLESS our own file has spec violations (then exit 3).
+            if let Some(ref_path) = &args.verify_against {
+                match quant_core::gguf_verify::verify_against(&report.output, ref_path) {
+                    Ok(vr) => {
+                        let (exact, equiv, divergent) = vr.summary();
+                        println!();
+                        println!(
+                            "verify-against: {} vs {}",
+                            report.output.display(),
+                            ref_path.display()
+                        );
+                        println!(
+                            "  byte-exact: {exact} | numerically-equivalent: {equiv} | divergent: {divergent}"
+                        );
+                        for d in &vr.diffs {
+                            println!(
+                                "  ! {:<18} blocks {}/{} differ, max|Δ|={:.3e} [{}]",
+                                format!("{} ({})", d.name, kind_label(d.kind)),
+                                d.diff_blocks,
+                                d.total_blocks,
+                                d.max_abs_err,
+                                kind_label(d.kind)
+                            );
+                        }
+                        for m in &vr.dtype_mismatch {
+                            println!("  ~ dtype mismatch: {m}");
+                        }
+                        for m in &vr.dims_mismatch {
+                            println!("  ~ dims mismatch: {m}");
+                        }
+                        if !vr.ours_only.is_empty() {
+                            println!(
+                                "  ? ours-only (unmatched after name mapping): {}",
+                                vr.ours_only.len()
+                            );
+                            for u in vr.ours_only.iter().take(10) {
+                                println!("      {u}");
+                            }
+                        }
+                        if !vr.ref_only.is_empty() {
+                            println!("  ? reference-only: {}", vr.ref_only.len());
+                            for u in vr.ref_only.iter().take(10) {
+                                println!("      {u}");
+                            }
+                        }
+                        if vr.skipped_f32 > 0 {
+                            println!("  (skipped {} F32 tensors)", vr.skipped_f32);
+                        }
+                        if vr.spec_violations.is_empty() {
+                            println!("  spec-conformance: OK (0 violations)");
+                        } else {
+                            println!(
+                                "  spec-conformance: {} VIOLATIONS (quantized tensor with ne[0] % blck_size != 0):",
+                                vr.spec_violations.len()
+                            );
+                            for v in vr.spec_violations.iter().take(25) {
+                                println!("      {v}");
+                            }
+                        }
+                        if !vr.spec_violations.is_empty() {
+                            return ExitCode::from(3);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: verify-against failed: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+
             if report.fallback_f16 > 0 {
                 eprintln!(
                     "warning: {} of {} tensors were NOT quantized with '{}' and were stored as F16: [{}]",
@@ -297,6 +369,15 @@ pub fn run(args: GgufArgs) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(code)
         }
+    }
+}
+
+/// Short human label for a verify-against diff classification.
+fn kind_label(k: quant_core::gguf_verify::DiffKind) -> &'static str {
+    match k {
+        quant_core::gguf_verify::DiffKind::DeadBlockCosmetic => "dead-block cosmetic",
+        quant_core::gguf_verify::DiffKind::ScaleRuleDiff => "scale-rule diff",
+        quant_core::gguf_verify::DiffKind::GenuineDivergence => "GENUINE DIVERGENCE",
     }
 }
 

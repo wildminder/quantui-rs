@@ -29,7 +29,9 @@ enum Commands {
     /// Quantize a safetensors model (single file or sharded folder).
     Quantize(QuantizeArgs),
     /// Convert a HF safetensors model to GGUF (single file or sharded folder).
-    Gguf(GgufArgs),
+    // Boxed: GgufArgs has grown (Phase 6 recipes + verify-against) and a
+    // bare variant dominated the enum (clippy::large_enum_variant).
+    Gguf(Box<GgufArgs>),
     /// Structural + numeric validation of a quantized output.
     Validate(ValidateArgs),
     /// Inspect a safetensors header without loading tensors.
@@ -40,7 +42,7 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Quantize(args) => commands::quantize::run(args),
-        Commands::Gguf(args) => commands::gguf::run(args),
+        Commands::Gguf(args) => commands::gguf::run(*args),
         Commands::Validate(args) => commands::validate::run(args),
         Commands::Info(args) => commands::info::run(args),
     }

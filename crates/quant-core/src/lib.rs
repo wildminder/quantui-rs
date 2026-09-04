@@ -27,6 +27,7 @@ mod gguf_iq_tables_data;
 pub mod gguf_quants;
 pub mod gguf_recipe;
 pub mod gguf_registry;
+pub mod gguf_verify;
 pub mod imatrix;
 pub mod llama_policy;
 pub mod st_io;

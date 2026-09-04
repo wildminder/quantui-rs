@@ -984,6 +984,10 @@ pub fn hf_to_gguf_name(name: &str) -> Option<String> {
         }
         "lm_head.weight" => return Some("output.weight".into()),
         "model.norm.weight" | "norm.weight" => return Some("output_norm.weight".into()),
+        // LFM2's pre-embedding norm (tensor_mapping.py:65 → TOKEN_EMBD_NORM).
+        "model.embedding_norm.weight" | "embedding_norm.weight" => {
+            return Some("token_embd_norm.weight".into())
+        }
         _ => {}
     }
 
@@ -1010,6 +1014,11 @@ pub fn hf_to_gguf_name(name: &str) -> Option<String> {
         "self_attn.k_proj" => "attn_k",
         "self_attn.v_proj" => "attn_v",
         "self_attn.o_proj" => "attn_output",
+        // LFM2.5's full-attention layers (out_proj / q_layernorm /
+        // k_layernorm; tensor_mapping.py:330, :698, :715).
+        "self_attn.out_proj" => "attn_output",
+        "self_attn.q_layernorm" => "attn_q_norm",
+        "self_attn.k_layernorm" => "attn_k_norm",
         "self_attn.q_norm" => "attn_q_norm",
         "self_attn.k_norm" => "attn_k_norm",
         "self_attn.rotary_emb.inv_freq" => return None, // skip rotary cache
@@ -1019,6 +1028,19 @@ pub fn hf_to_gguf_name(name: &str) -> Option<String> {
         "mlp.gate" => "ffn_gate_inp",
         "input_layernorm" => "attn_norm",
         "post_attention_layernorm" => "ffn_norm",
+        // LFM2 layer cores (tensor_mapping.py:1464-1468, :214 + the
+        // llama-pth w1/w2/w3 entries; arch `lfm2`, llama-arch.cpp:126).
+        "conv.conv" => "shortconv.conv",
+        "conv.in_proj" => "shortconv.in_proj",
+        "conv.out_proj" => "shortconv.out_proj",
+        "feed_forward.w1" => "ffn_gate",
+        "feed_forward.w2" => "ffn_down",
+        "feed_forward.w3" => "ffn_up",
+        "operator_norm" => "attn_norm", // lfm2's pre-attention norm
+        // `ffn_norm` (LFM2 uses the internlm2-style pattern,
+        // tensor_mapping.py:407) — same GGUF name as llama's
+        // post_attention_layernorm.
+        "ffn_norm" => "ffn_norm",
         _ => return None,
     };
     Some(format!("{blk}.{mapped}{suffix}"))
@@ -1234,26 +1256,85 @@ mod tests {
     }
 
     #[test]
+    fn name_mapping_lfm2_cores() {
+        // LFM2 layer cores map per the pinned llama.cpp reference
+        // (tensor_mapping.py SHORTCONV_* :1464-1468, w1/w2/w3 llama-pth
+        // arms, operator_norm :214; arch `lfm2`, llama-arch.cpp:126).
+        // The wrapper strip feeds the same table, and the mapping matches
+        // what real unsloth LFM2 GGUFs use.
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.conv.conv.weight").as_deref(),
+            Some("blk.0.shortconv.conv.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.conv.in_proj.weight").as_deref(),
+            Some("blk.0.shortconv.in_proj.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.conv.out_proj.weight").as_deref(),
+            Some("blk.0.shortconv.out_proj.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.feed_forward.w1.weight").as_deref(),
+            Some("blk.0.ffn_gate.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.feed_forward.w2.weight").as_deref(),
+            Some("blk.0.ffn_down.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.feed_forward.w3.weight").as_deref(),
+            Some("blk.0.ffn_up.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.operator_norm.weight").as_deref(),
+            Some("blk.0.attn_norm.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.0.ffn_norm.weight").as_deref(),
+            Some("blk.0.ffn_norm.weight")
+        );
+        // LFM2's pre-embedding norm → token_embd_norm (tensor_mapping.py:65).
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.embedding_norm.weight").as_deref(),
+            Some("token_embd_norm.weight")
+        );
+        // Bare (post-strip) forms map identically.
+        assert_eq!(
+            hf_to_gguf_name("embedding_norm.weight").as_deref(),
+            Some("token_embd_norm.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("layers.0.operator_norm.weight").as_deref(),
+            Some("blk.0.attn_norm.weight")
+        );
+        // LFM2.5 full-attention layer arms (tensor_mapping.py:330, :698,
+        // :715 — layers 2/5/9/13/17/21/24/27 of LFM2.5-VL-3B).
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.2.self_attn.out_proj.weight").as_deref(),
+            Some("blk.2.attn_output.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.2.self_attn.q_layernorm.weight")
+                .as_deref(),
+            Some("blk.2.attn_q_norm.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.2.self_attn.k_layernorm.weight")
+                .as_deref(),
+            Some("blk.2.attn_k_norm.weight")
+        );
+        assert_eq!(
+            hf_to_gguf_name("model.language_model.layers.2.self_attn.q_proj.weight").as_deref(),
+            Some("blk.2.attn_q.weight")
+        );
+    }
+
+    #[test]
     fn name_mapping_arch_specific_cores_pass_through() {
-        // LFM2 layer cores are NOT in the dense table — they must keep their
-        // ORIGINAL full name (including the wrapper), never be guessed.
-        assert_eq!(
-            hf_to_gguf_name("model.language_model.layers.0.conv.conv.weight"),
-            None
-        );
-        assert_eq!(
-            hf_to_gguf_name("model.language_model.layers.0.feed_forward.w1.weight"),
-            None
-        );
-        assert_eq!(
-            hf_to_gguf_name("model.language_model.layers.0.operator_norm.weight"),
-            None
-        );
-        assert_eq!(
-            hf_to_gguf_name("model.language_model.layers.0.ffn_norm.weight"),
-            None
-        );
-        // Vision tower / projector / conv heads pass through untouched.
+        // Vision tower / projector / conv heads are NOT in any mapping
+        // table — they must keep their ORIGINAL full name (including the
+        // wrapper), never be guessed.
         assert_eq!(
             hf_to_gguf_name(
                 "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight"

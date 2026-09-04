@@ -473,6 +473,128 @@ fn gguf_convert_single_file_exit_0() {
     assert!(f.tensors.contains_key("output.weight"));
 }
 
+/// Task #7: `--verify-against` — after converting the tiny model, compare
+/// the output against ITSELF (the trivially byte-exact oracle case) and
+/// against a differently-quantized variant (dtype mismatches only, since
+/// the tiny fixture has no dead blocks). Exit code stays 0 (report tool)
+/// when the output is spec-conformant.
+#[test]
+fn gguf_verify_against_reports_equivalence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    // Convert twice: q8_0 (the file under test) and f16 (the reference).
+    let ours = tmp.path().join("ours-q8_0.gguf");
+    let reference = tmp.path().join("ref-f16.gguf");
+    for (out, method) in [(&ours, "q8_0"), (&reference, "f16")] {
+        let status = bin()
+            .args([
+                "gguf",
+                model_dir.join("model.safetensors").to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--method",
+                method,
+                "--no-progress",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{method} conversion must succeed");
+    }
+
+    // (a) self-comparison: everything byte-exact.
+    let self_out = tmp.path().join("self.gguf");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            self_out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+            "--verify-against",
+            ours.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "self-verify must exit 0: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("byte-exact: 4"),
+        "4 quantized tensors byte-exact vs itself (1-D norm kept F32 and skipped), got: {stdout}"
+    );
+    assert!(stdout.contains("skipped 1 F32"));
+    assert!(stdout.contains("spec-conformance: OK"));
+
+    // (b) cross-dtype comparison: all shared tensors land in dtype_mismatch.
+    let cross_out = tmp.path().join("cross.gguf");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            cross_out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+            "--verify-against",
+            reference.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(status.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("dtype mismatch"),
+        "q8_0 vs f16 must report dtype mismatches: {stdout}"
+    );
+}
+
+/// Task #7: --verify-against against a MALFORMED reference file must not
+/// crash the CLI — the reference is untrusted input. The parse failure
+/// surfaces as exit 1 with a clear message. (Violations in OUR file are
+/// the core-level exit-3 contract, covered by quant-core gguf_verify
+/// tests, because the converter itself can no longer emit such a file.)
+#[test]
+fn gguf_verify_against_bad_reference_is_a_clean_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let junk = tmp.path().join("junk.gguf");
+    std::fs::write(&junk, b"not a gguf file at all").unwrap();
+
+    let out = tmp.path().join("out.gguf");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+            "--verify-against",
+            junk.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(1),
+        "unparseable reference must exit 1, stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("verify-against failed"),
+        "error must name the failing step: {stderr}"
+    );
+}
+
 /// Generic nested-prefix name mapping, end-to-end: a wrapped multimodal
 /// checkpoint (`model.language_model.*` = VibeVoice / LFM2-VL layout, plus a
 /// vision tower that stays outside the wrapper) must land the wrapped dense
@@ -509,8 +631,8 @@ fn gguf_nested_prefix_wrapped_lms_map_to_blk_and_lfm2_arch() {
             2,
         ),
         mk1d("model.language_model.norm.weight", h, 11),
-        // LFM2 arch-specific core INSIDE the wrapper — no dense mapping,
-        // must keep its original full name.
+        // LFM2 core INSIDE the wrapper — maps per the llama.cpp reference
+        // (shortconv/ffn/operator_norm arms of tensor_mapping.py).
         mk2d(
             "model.language_model.layers.0.feed_forward.w1.weight",
             h,
@@ -576,15 +698,16 @@ fn gguf_nested_prefix_wrapped_lms_map_to_blk_and_lfm2_arch() {
     assert!(f.tensors.contains_key("token_embd.weight"));
     assert!(f.tensors.contains_key("blk.0.attn_q.weight"));
     assert!(f.tensors.contains_key("output_norm.weight"));
-    // Arch-specific + outside-wrapper tensors keep their original names.
-    assert!(f
-        .tensors
-        .contains_key("model.language_model.layers.0.feed_forward.w1.weight"));
+    // LFM2 core maps per the llama.cpp reference table.
+    assert!(f.tensors.contains_key("blk.0.ffn_gate.weight"));
+    // Outside-wrapper tensors keep their original names.
     assert!(f
         .tensors
         .contains_key("model.vision_tower.vision_model.patch_proj.weight"));
     // And nothing leaked under a mangled name.
-    assert!(!f.tensors.contains_key("blk.0.feed_forward.w1.weight"));
+    assert!(!f
+        .tensors
+        .contains_key("model.language_model.layers.0.feed_forward.w1.weight"));
     assert_eq!(
         f.tensors.len(),
         5,
