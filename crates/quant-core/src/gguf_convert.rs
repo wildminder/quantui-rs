@@ -125,11 +125,23 @@ pub struct GgufConvertReport {
     /// degradation is not acceptable — the CLI prints one warning line per
     /// entry and tests assert the exact list).
     pub fallback_tensors: Vec<String>,
+    /// Tensors demoted to a wider block-aligned scheme (or F16) because the
+    /// GGUF row size `ne[0]` was not a multiple of the scheme's block size
+    /// (llama-quant.cpp:372-425). Distinct from [`Self::fallback_f16`].
+    pub row_fallback: usize,
+    /// GGUF names of every tensor whose scheme was demoted because the row
+    /// size `ne[0]` is not a multiple of the scheme's block size (port of
+    /// llama-quantize `tensor_type_fallback`, llama-quant.cpp:372-425).
+    /// Kept SEPARATE from [`Self::fallback_f16`]: that one means "the
+    /// encoder rejected the tensor" (Phase 2.3, flat element count), this
+    /// one means "the requested scheme cannot legally describe this row
+    /// width" — a different defect with a different remedy.
+    pub row_fallback_tensors: Vec<String>,
     /// Effective per-tensor scheme assignment in conversion order
     /// (Phase 6.3 `--emit-recipe`): `(gguf_name, scheme)` AFTER all
-    /// overrides (recipe, category overrides) but BEFORE the F16
-    /// divisibility fallback (the recipe vocabulary is method ids, not
-    /// F16-fallback states).
+    /// overrides (recipe, category overrides) AND after the per-row
+    /// block-size demotion — the demoted scheme is what actually lands in
+    /// the file, so a recipe emitted from it round-trips byte-for-byte.
     pub effective_schemes: Vec<(String, GgufScheme)>,
 }
 
@@ -228,6 +240,8 @@ pub fn convert_hf_to_gguf(
     let mut fallback_f16 = 0usize;
     let mut kept_f32 = 0usize;
     let mut fallback_tensors: Vec<String> = Vec::new();
+    let mut row_fallback = 0usize;
+    let mut row_fallback_tensors: Vec<String> = Vec::new();
     let mut effective_schemes: Vec<(String, GgufScheme)> = Vec::new();
     for (done, (name, shard_idx)) in names.iter().enumerate() {
         let reader = &readers[*shard_idx];
@@ -286,8 +300,46 @@ pub fn convert_hf_to_gguf(
                 None => gguf_registry::scheme_for(entry, &gguf_name, ndim),
             }
         };
-        // Phase 6.3: record the effective scheme (pre-F16-fallback — the
-        // assignment the recipe vocabulary can express).
+
+        // Per-row block-size demotion — port of `tensor_type_fallback`
+        // (llama-quant.cpp:372-425), which upstream calls from
+        // `llama_tensor_get_type` (:309), i.e. at TYPE-SELECTION time. It
+        // must therefore run BEFORE the imatrix/weighted dispatch below
+        // (a demoted tensor may no longer be an imatrix scheme at all) and
+        // before `quantize()`.
+        //
+        // Why this exists: the GGUF contract requires ne[0] % blck_size == 0
+        // per ROW (gguf.cpp:724 rejects it, :1409 asserts it), while the
+        // pinned rlx-gguf 0.2.14 `quantize()` only checks the FLAT element
+        // count (rlx quantize.rs:199 `check_div(name, n, blk)`). Conv1d /
+        // ConvTranspose1d weights (VibeVoice-1.5B: 102 tensors with kernel
+        // sizes 4/7/8/10/16 → ne[0] = 4/7/8/10/16) have a divisible flat
+        // count but NOT a divisible row, so they were silently quantized
+        // into blocks straddling row boundaries. llama-quantize never
+        // writes such a tensor.
+        let ne0 = info.shape.last().copied().unwrap_or(0) as usize;
+        let pre = scheme;
+        let scheme = if ne0 == 0 {
+            scheme
+        } else {
+            let demoted = row_fallback_scheme(&gguf_name, ne0, scheme);
+            if demoted != scheme {
+                row_fallback += 1;
+                row_fallback_tensors.push(gguf_name.clone());
+            }
+            demoted
+        };
+        // A demotion that lands on F16 has the SAME user-visible outcome as
+        // the Phase 2.3 fallback — the tensor is not in the method's scheme —
+        // so it is reported the same way (`fallback_f16`, the CLI's "were NOT
+        // quantized with '<method>'" summary). `row_fallback` above is what
+        // records the CAUSE: a row width no quantized type can describe,
+        // discovered at type-selection time rather than by the encoder.
+        let demoted_to_f16 = pre != GgufScheme::F16 && scheme == GgufScheme::F16;
+
+        // Phase 6.3: record the effective scheme AFTER the per-row
+        // demotion — the recorded assignment is what actually lands in the
+        // file, so `--emit-recipe` round-trips to a stable model.
         effective_schemes.push((gguf_name.clone(), scheme));
         let ggml = scheme_to_ggml(scheme);
 
@@ -486,7 +538,16 @@ pub fn convert_hf_to_gguf(
         // degraded tensor, and the report carries the exact list.
         let (bytes, dtype) = match quantize(&floats, ggml) {
             Ok(b) => {
-                if scheme != GgufScheme::F32 {
+                if demoted_to_f16 {
+                    eprintln!(
+                        "warning: tensor '{gguf_name}' fell back to F16: \
+                         method '{method}' scheme {pre:?} cannot describe a row of {ne0} elements; \
+                         output is valid GGUF but this tensor is NOT {method}-quantized",
+                        method = cfg.method_id,
+                    );
+                    fallback_f16 += 1;
+                    fallback_tensors.push(gguf_name.clone());
+                } else if scheme != GgufScheme::F32 {
                     quantized += 1;
                 } else {
                     kept_f32 += 1;
@@ -539,6 +600,8 @@ pub fn convert_hf_to_gguf(
         kept_f32,
         output_bytes,
         fallback_tensors,
+        row_fallback,
+        row_fallback_tensors,
         effective_schemes,
     })
 }
@@ -722,6 +785,169 @@ fn scheme_to_ggml(s: GgufScheme) -> GgmlType {
         GgufScheme::Tq2_0 => GgmlType::TQ2_0,
         GgufScheme::Q1_0 => GgmlType::Q1_0,
         GgufScheme::Q2_0 => GgmlType::Q2_0,
+    }
+}
+
+/// Number of elements in one quantized block (`ggml_blck_size`,
+/// ggml.c type_traits table — the `blck_size` field).
+///
+/// Values mirror the PINNED encoder `rlx-gguf` 0.2.14 rather than
+/// upstream llama.cpp where the two disagree, because rlx is what writes
+/// the bytes: `Q2_0` is 128 here (rlx `q2_dequant.rs:28`) vs 64 in
+/// llama.cpp (`ggml-common.h`), and `NVFP4` is 16 (rlx
+/// `mx_dequant.rs:27`) vs 64 upstream.
+///
+/// The match is EXHAUSTIVE on purpose — no wildcard arm — so a new
+/// `GgmlType` variant added by a rlx bump is a compile error here rather
+/// than a silently wrong block size.
+pub fn ggml_blck_size(t: GgmlType) -> usize {
+    match t {
+        // ── unquantized: every element is its own "block" ──
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => 1,
+        GgmlType::I8 | GgmlType::I16 | GgmlType::I32 | GgmlType::I64 | GgmlType::F64 => 1,
+        // ── 32-element blocks ──
+        GgmlType::Q4_0
+        | GgmlType::Q4_1
+        | GgmlType::Q5_0
+        | GgmlType::Q5_1
+        | GgmlType::Q8_0
+        | GgmlType::Q8_1
+        | GgmlType::IQ4NL => 32,
+        GgmlType::MXFP4 => 32,
+        // ── 256-element blocks (K-quants, I-quants, ternary) ──
+        GgmlType::Q2K
+        | GgmlType::Q3K
+        | GgmlType::Q4K
+        | GgmlType::Q5K
+        | GgmlType::Q6K
+        | GgmlType::Q8K => 256,
+        GgmlType::IQ2XXS
+        | GgmlType::IQ2XS
+        | GgmlType::IQ3XXS
+        | GgmlType::IQ1S
+        | GgmlType::IQ3S
+        | GgmlType::IQ2S
+        | GgmlType::IQ4XS
+        | GgmlType::IQ1M => 256,
+        GgmlType::TQ1_0 | GgmlType::TQ2_0 => 256,
+        GgmlType::I8_S | GgmlType::FV5 | GgmlType::FV5B => 256,
+        // ── 128-element blocks ──
+        GgmlType::I2_S => 128,
+        GgmlType::Q1_0 | GgmlType::Q2_0 => 128,
+        // ── 16-element blocks ──
+        GgmlType::NVFP4 => 16,
+    }
+}
+
+/// Demote `target` when the GGUF row size `ne[0]` is not a multiple of the
+/// scheme's block size.
+///
+/// Faithful port of `tensor_type_fallback`
+/// (`docs/ref/llama.cpp/src/llama-quant.cpp:372-425`). Upstream calls it
+/// from `llama_tensor_get_type` (:309), i.e. at type-selection time, and
+/// `llama-quantize` therefore NEVER writes a tensor whose `ne[0]` is not
+/// block-aligned.
+///
+/// Every demotion logs one warning line to stderr — silent degradation is
+/// the bug we are fixing. Upstream `throw`s when no smaller type is
+/// available; we return F16 and say so, because aborting a whole model
+/// conversion over one odd-shaped conv kernel is worse than storing that
+/// tensor unquantized (and matches the Phase 2.3 philosophy).
+fn row_fallback_scheme(name: &str, ne0: usize, target: GgufScheme) -> GgufScheme {
+    let qk_k = ggml_blck_size(scheme_to_ggml(target));
+    // Fast path: the row is already block-aligned. Stays silent — a clean
+    // conversion must produce NO output (existing tests assert this).
+    if ne0 % qk_k == 0 {
+        return target;
+    }
+
+    let new_type = match target {
+        // Very-low-bit i-quants have nothing below them except IQ4_NL.
+        GgufScheme::Iq1S
+        | GgufScheme::Iq1M
+        | GgufScheme::Iq2Xxs
+        | GgufScheme::Iq2Xs
+        | GgufScheme::Iq2S
+        | GgufScheme::Iq3Xxs
+        | GgufScheme::Iq3S
+        | GgufScheme::Iq4Xs => GgufScheme::Iq4Nl,
+        GgufScheme::Q2_0 | GgufScheme::Q2K | GgufScheme::Q3K => GgufScheme::Q4_0,
+        // Ternary types: upstream has no smaller ternary, Q4_0 is the
+        // narrowest legal 32-block fallback.
+        GgufScheme::Tq1_0 | GgufScheme::Tq2_0 => GgufScheme::Q4_0,
+        GgufScheme::Q4K => GgufScheme::Q5_0,
+        GgufScheme::Q5K => GgufScheme::Q5_1,
+        GgufScheme::Q6K => GgufScheme::Q8_0,
+        _ => {
+            if qk_k <= 32 {
+                // Already the narrowest block available — nothing to demote
+                // to (upstream: `return qtype; // TODO: what to do here?`).
+                target
+            } else {
+                // Upstream throws `format("unsupported quantization type ...")`.
+                GgufScheme::F16
+            }
+        }
+    };
+
+    // Second check (llama-quant.cpp:411-421): the demoted type must also
+    // divide the row, otherwise there is no legal quantized type at all
+    // ("most likely, this tensor's first dimension is not divisible by 32").
+    let mut return_type = new_type;
+    let unusual = ne0 % ggml_blck_size(scheme_to_ggml(return_type)) != 0;
+    if unusual {
+        // Upstream: `return_type = GGML_TYPE_F16;`
+        return_type = GgufScheme::F16;
+    }
+
+    // Upstream logs ONE line in three parts (:379, :419, :422) — kept as a
+    // single line here so per-tensor greps stay 1:1 with tensor count.
+    eprintln!(
+        "warning: {name:<36} - ncols {ne0:>6} not divisible by {qk_k:>3} \
+         (required for type {tgt:>7}) {unusual}-> falling back to {ret:>7}",
+        tgt = scheme_type_name(target),
+        unusual = if unusual {
+            "(WARNING: must use F16 due to unusual shape) "
+        } else {
+            ""
+        },
+        ret = scheme_type_name(return_type),
+    );
+
+    return_type
+}
+
+/// Upstream `ggml_type_name()` spelling, so the warning line above is
+/// byte-comparable with `llama-quantize` output.
+fn scheme_type_name(s: GgufScheme) -> &'static str {
+    match s {
+        GgufScheme::F32 => "F32",
+        GgufScheme::F16 => "F16",
+        GgufScheme::Bf16 => "BF16",
+        GgufScheme::Q8_0 => "Q8_0",
+        GgufScheme::Q4_0 => "Q4_0",
+        GgufScheme::Q4_1 => "Q4_1",
+        GgufScheme::Q5_0 => "Q5_0",
+        GgufScheme::Q5_1 => "Q5_1",
+        GgufScheme::Q2K => "Q2_K",
+        GgufScheme::Q3K => "Q3_K",
+        GgufScheme::Q4K => "Q4_K",
+        GgufScheme::Q5K => "Q5_K",
+        GgufScheme::Q6K => "Q6_K",
+        GgufScheme::Q8K => "Q8_K",
+        GgufScheme::Iq2Xxs => "IQ2_XXS",
+        GgufScheme::Iq2Xs => "IQ2_XS",
+        GgufScheme::Iq3Xxs => "IQ3_XXS",
+        GgufScheme::Iq4Nl => "IQ4_NL",
+        GgufScheme::Iq1S => "IQ1_S",
+        GgufScheme::Iq1M => "IQ1_M",
+        GgufScheme::Iq2S => "IQ2_S",
+        GgufScheme::Iq3S => "IQ3_S",
+        GgufScheme::Iq4Xs => "IQ4_XS",
+        GgufScheme::Tq1_0 => "TQ1_0",
+        GgufScheme::Tq2_0 => "TQ2_0",
+        GgufScheme::Q1_0 => "Q1_0",
+        GgufScheme::Q2_0 => "Q2_0",
     }
 }
 

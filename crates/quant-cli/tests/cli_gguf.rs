@@ -67,8 +67,14 @@ fn synth(n: usize, seed: u64) -> Vec<f32> {
 
 fn write_tiny_model(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    let h = 32usize;
-    let v = 64usize;
+    // Both dims are 256 on purpose: the GGUF row width `ne[0]` (the LAST
+    // HF dim) must be a multiple of the widest block size any test here
+    // selects (K-quants use 256), otherwise llama-quantize's own row
+    // fallback (`tensor_type_fallback`) legitimately demotes Q6_K → Q8_0
+    // and the recipe/override assertions below can no longer observe the
+    // type they asked for. 256 is divisible by 32 and 256.
+    let h = 256usize;
+    let v = 256usize;
     let mk2d = |name: &'static str, rows: usize, cols: usize, seed: u64| Tensor {
         name,
         dtype: "BF16",
@@ -236,10 +242,14 @@ fn gguf_f16_fallback_is_loud() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Exactly one per-tensor warning line, naming the GGUF-side tensor.
+    // The row-width fallback now fires at TYPE-SELECTION time (port of
+    // llama-quantize `tensor_type_fallback`, llama-quant.cpp:372-425), so
+    // the tensor is never handed to the Q8_0 encoder at all. Exactly ONE
+    // stderr line reports it, naming the GGUF-side tensor and matching
+    // upstream's three-part phrasing (:379 + :419 + :422 on one line).
     let per_tensor: Vec<&str> = stderr
         .lines()
-        .filter(|l| l.contains("fell back to F16"))
+        .filter(|l| l.contains("not divisible by"))
         .collect();
     assert_eq!(
         per_tensor.len(),
@@ -251,8 +261,148 @@ fn gguf_f16_fallback_is_loud() {
         "warning must name the tensor: {}",
         per_tensor[0]
     );
+    assert!(
+        per_tensor[0].contains("(WARNING: must use F16 due to unusual shape)"),
+        "100 is not divisible by 32 and Q8_0 has no smaller block: {}",
+        per_tensor[0]
+    );
+    assert!(
+        per_tensor[0].contains("-> falling back to     F16"),
+        "must name the demoted type: {}",
+        per_tensor[0]
+    );
 
-    // And the summary line names the method and the tensor list.
+    // And the tensor really landed as F16 — the warning is not cosmetic.
+    let f = rlx_gguf::GgufFile::from_path(&out).expect("parse output");
+    let attn_q = f.tensors.get("blk.0.attn_q.weight").unwrap();
+    assert_eq!(
+        attn_q.dtype,
+        rlx_gguf::GgmlType::F16,
+        "attn_q must be stored as F16, got {:?}",
+        attn_q.dtype
+    );
+
+    // A summary line restates it: a model full of odd-shaped conv kernels
+    // must not bury the problem in per-tensor noise.
+    let summary: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("incompatible with"))
+        .collect();
+    assert_eq!(
+        summary.len(),
+        1,
+        "expected 1 summary warning, got: {stderr}"
+    );
+    assert!(summary[0].contains("blk.0.attn_q.weight"));
+}
+
+/// The counterpart of [`gguf_f16_fallback_is_loud`] for the Conv1d bug: a
+/// tensor whose ROW width is not a multiple of the block size while its FLAT
+/// element count IS. `[32, 1, 7]` has 224 elements (7 x 32, so the flat
+/// divisibility check passes) but GGUF's row is `ne[0] = 7`, which no
+/// quantized type can describe. llama-quantize demotes such a tensor to F16
+/// at type-selection time (`tensor_type_fallback`); so must we, loudly.
+#[test]
+fn gguf_conv_row_width_demotion_is_loud_and_writes_f16() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    // 32 x 1 x 7 = 224 elements (a multiple of 32, so the flat count is
+    // legal) but the GGUF row ne[0] is 7, which no block size divides.
+    let vals = synth(32 * 7, 42);
+    let tensors = vec![
+        Tensor {
+            name: "model.layers.0.self_attn.q_proj.weight",
+            dtype: "BF16",
+            shape: vec![32, 1, 7],
+            bytes: bf16_bytes(&vals),
+        },
+        Tensor {
+            name: "model.norm.weight",
+            dtype: "BF16",
+            shape: vec![32],
+            bytes: bf16_bytes(&synth(32, 7)),
+        },
+    ];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 8
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("conv.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a row-width demotion must not fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Loud: one warning naming the tensor and reporting the row width that
+    // no quantized block size divides.
+    let warn: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("not divisible by"))
+        .collect();
+    assert_eq!(
+        warn.len(),
+        1,
+        "expected exactly 1 row-width warning, got: {stderr}"
+    );
+    assert!(
+        warn[0].contains("blk.0.attn_q.weight"),
+        "warning must name the tensor: {}",
+        warn[0]
+    );
+    assert!(
+        warn[0]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] == "ncols" && w[1] == "7"),
+        "warning must report the GGUF row width (7), got: {}",
+        warn[0]
+    );
+
+    // The tensor is F16 in the output header — NOT a Q8_0 tensor whose
+    // blocks straddle row boundaries.
+    let f = rlx_gguf::GgufFile::from_path(&out).expect("parse output");
+    let t = f
+        .tensors
+        .get("blk.0.attn_q.weight")
+        .expect("probe tensor missing from output");
+    assert_eq!(
+        t.dtype,
+        rlx_gguf::GgmlType::F16,
+        "a row no quantized block divides must land as F16 in the file"
+    );
+
+    // And the summary still tells the user the tensor is not q8_0.
     let summary: Vec<&str> = stderr
         .lines()
         .filter(|l| l.contains("were NOT quantized with 'q8_0'"))
@@ -262,7 +412,6 @@ fn gguf_f16_fallback_is_loud() {
         1,
         "expected 1 summary warning, got: {stderr}"
     );
-    assert!(summary[0].contains("blk.0.attn_q.weight"));
 }
 
 /// The counterpart: a clean fixture produces NO fallback warnings.
@@ -1289,4 +1438,133 @@ fn gguf_q4_1_q5_1_end_to_end_byte_parity() {
             .unwrap_or_else(|| panic!("{method}: no norm tensor found"));
         assert_eq!(norm.dtype, rlx_gguf::GgmlType::F32);
     }
+}
+
+/// CLI level: a Conv1d/ConvTranspose1d weight whose `ne[0]` is the kernel
+/// size (VibeVoice-1.5B has 102 of them, kernel sizes 4/7/8/10/16, none
+/// divisible by 32) is demoted loudly, the run still succeeds, and the
+/// tensor lands as F16 — never as a Q8_0 whose blocks straddle rows.
+#[test]
+fn gguf_conv_row_fallback_is_loud_and_writes_f16() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let mk = |name: &'static str, shape: Vec<u64>, seed: u64| {
+        let n = shape.iter().product::<u64>() as usize;
+        Tensor {
+            name,
+            dtype: "BF16",
+            shape,
+            bytes: bf16_bytes(&synth(n, seed)),
+        }
+    };
+    let tensors = vec![
+        // ne[0] = 7  (Conv1d kernel)
+        mk("model.decoder.layers.0.conv1d.weight", vec![32, 1, 7], 1),
+        // ne[0] = 10 (ConvTranspose1d kernel)
+        mk(
+            "model.decoder.layers.0.conv_transpose.weight",
+            vec![16, 256, 10],
+            2,
+        ),
+        // Block-aligned control — must keep Q8_0 and stay silent.
+        mk("model.decoder.layers.0.proj.weight", vec![256, 256], 3),
+    ];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 256,
+            "num_hidden_layers": 1,
+            "vocab_size": 256,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("m-q8_0.gguf");
+    let output = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a row-width fallback must not fail the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // One warning line per offending tensor, phrased like upstream.
+    for (name, ncols) in [
+        ("model.decoder.layers.0.conv1d.weight", 7usize),
+        ("model.decoder.layers.0.conv_transpose.weight", 10),
+    ] {
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains(name) && l.contains("not divisible by"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected 1 warning for {name}, got: {stderr}"
+        );
+        assert!(
+            lines[0].contains(&format!("ncols {ncols:>6}")),
+            "must report the row width: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("(WARNING: must use F16 due to unusual shape)"),
+            "Q8_0 has no smaller block, so F16 is the only legal type: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("-> falling back to     F16"),
+            "must name the demoted type: {}",
+            lines[0]
+        );
+    }
+
+    // The block-aligned tensor is never mentioned — no false positives.
+    assert!(
+        !stderr.contains("proj.weight"),
+        "block-aligned tensor must stay silent: {stderr}"
+    );
+
+    // And the file really holds F16 for the two conv tensors.
+    let f = rlx_gguf::GgufFile::from_path(&out).expect("parse output");
+    for name in [
+        "model.decoder.layers.0.conv1d.weight",
+        "model.decoder.layers.0.conv_transpose.weight",
+    ] {
+        assert_eq!(
+            f.tensors.get(name).unwrap().dtype,
+            rlx_gguf::GgmlType::F16,
+            "{name} must be stored as F16"
+        );
+    }
+    assert_eq!(
+        f.tensors
+            .get("model.decoder.layers.0.proj.weight")
+            .unwrap()
+            .dtype,
+        rlx_gguf::GgmlType::Q8_0,
+        "block-aligned tensor keeps the requested scheme"
+    );
 }

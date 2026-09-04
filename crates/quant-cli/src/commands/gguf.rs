@@ -255,6 +255,21 @@ pub fn run(args: GgufArgs) -> ExitCode {
                     report.fallback_tensors.join(", ")
                 );
             }
+            // Per-row block-size demotion (port of llama-quantize
+            // `tensor_type_fallback`). The per-tensor warnings already went
+            // to stderr; restate the summary so a model full of odd-shaped
+            // conv kernels is impossible to miss. Distinct wording from the
+            // block above — these tensors ARE quantized (or legally F16),
+            // they just did not get the requested block size.
+            if report.row_fallback > 0 {
+                eprintln!(
+                    "warning: {} of {} tensors had a row width (ne[0]) incompatible with \
+                     the requested block size and were demoted: [{}]",
+                    report.row_fallback,
+                    report.tensors,
+                    report.row_fallback_tensors.join(", ")
+                );
+            }
             println!(
                 "wrote {} ({} tensors: {} quantized, {} kept F32, {} F16-fallback; arch {}; {:.1} MB in {:.2}s)",
                 report.output.display(),
