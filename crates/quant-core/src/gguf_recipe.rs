@@ -232,6 +232,104 @@ fn scheme_id(scheme: GgufScheme) -> String {
     format!("{scheme:?}")
 }
 
+/// Errors from extracting a recipe from a reference GGUF
+/// (`--recipe-from`, task #8).
+#[derive(Debug, thiserror::Error)]
+pub enum RecipeFromError {
+    #[error("recipe-from: cannot read reference GGUF: {0}")]
+    Gguf(String),
+    #[error("recipe-from: tensor '{name}' has GGML type {code} ({type_name}), which has no encoder in this build")]
+    UnsupportedType {
+        name: String,
+        code: u32,
+        type_name: String,
+    },
+}
+
+/// Extract the per-tensor dtype assignment from an existing GGUF
+/// (unsloth, llama-quantize, or our own output) as a [`TensorRecipe`].
+///
+/// Rules are `^name$=qtype` lines — exact-anchored regexes reproduce the
+/// reference assignment precisely (llama.cpp GGUF names can contain regex
+/// metacharacters like `.`; anchoring makes every rule name-exact). The
+/// ggml type → method-id mapping is the inverse of the registry's
+/// `scheme_to_ggml`; types with no encoder in this build (e.g. Q8_1)
+/// error with the offending tensor named.
+///
+/// F32 entries are skipped: 1-D norms/biases go to F32 by the shared
+/// convention anyway (recipe step 1 runs before rules), so emitting rules
+/// for them is noise. The caller is expected to combine this with the
+/// method default (`--method`) so tensors absent from the reference fall
+/// back cleanly.
+pub fn recipe_from_gguf(path: &std::path::Path) -> Result<TensorRecipe, RecipeFromError> {
+    use rlx_gguf::{GgmlType, GgufFile};
+
+    let f = GgufFile::from_path(path)
+        .map_err(|e| RecipeFromError::Gguf(format!("{}: {e}", path.display())))?;
+
+    // Deterministic order: sorted by name.
+    let mut names: Vec<&rlx_gguf::GgufTensor> = f.tensors.values().collect();
+    names.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut text = String::from(
+        "# recipe extracted from reference GGUF (--recipe-from)\n\
+         # one ^name$=qtype rule per tensor, sorted by name\n",
+    );
+    for t in names {
+        if t.dtype == GgmlType::F32 {
+            continue; // shared convention, no rule needed
+        }
+        let scheme = scheme_for_ggml(t.dtype).ok_or_else(|| RecipeFromError::UnsupportedType {
+            name: t.name.clone(),
+            code: t.dtype as u32,
+            type_name: format!("{:?}", t.dtype),
+        })?;
+        // Anchor: exact-name match. Regex-escape the name first — GGUF
+        // tensor names are dotted, and `.` is a regex wildcard.
+        let pattern = regex::escape(&t.name);
+        text.push_str(&format!("^{pattern}$={}\n", scheme_id(scheme)));
+    }
+    TensorRecipe::parse(&text, &path.display().to_string())
+        .map_err(|e| RecipeFromError::Gguf(e.to_string()))
+}
+
+/// ggml type → scheme (inverse of `gguf_convert::scheme_to_ggml`).
+/// `None` for types this build has no encoder for.
+fn scheme_for_ggml(t: rlx_gguf::GgmlType) -> Option<crate::gguf_registry::GgufScheme> {
+    use crate::gguf_registry::GgufScheme as S;
+    use rlx_gguf::GgmlType as G;
+    match t {
+        G::F32 => Some(S::F32),
+        G::F16 => Some(S::F16),
+        G::BF16 => Some(S::Bf16),
+        G::Q8_0 => Some(S::Q8_0),
+        G::Q4_0 => Some(S::Q4_0),
+        G::Q4_1 => Some(S::Q4_1),
+        G::Q5_0 => Some(S::Q5_0),
+        G::Q5_1 => Some(S::Q5_1),
+        G::Q2K => Some(S::Q2K),
+        G::Q3K => Some(S::Q3K),
+        G::Q4K => Some(S::Q4K),
+        G::Q5K => Some(S::Q5K),
+        G::Q6K => Some(S::Q6K),
+        G::Q8K => Some(S::Q8K),
+        G::IQ2XXS => Some(S::Iq2Xxs),
+        G::IQ2XS => Some(S::Iq2Xs),
+        G::IQ3XXS => Some(S::Iq3Xxs),
+        G::IQ4NL => Some(S::Iq4Nl),
+        G::IQ1S => Some(S::Iq1S),
+        G::IQ1M => Some(S::Iq1M),
+        G::IQ2S => Some(S::Iq2S),
+        G::IQ3S => Some(S::Iq3S),
+        G::IQ4XS => Some(S::Iq4Xs),
+        G::TQ1_0 => Some(S::Tq1_0),
+        G::TQ2_0 => Some(S::Tq2_0),
+        G::Q1_0 => Some(S::Q1_0),
+        G::Q2_0 => Some(S::Q2_0),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

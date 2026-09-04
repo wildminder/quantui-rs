@@ -230,6 +230,16 @@ pub struct GgufArgs {
     #[arg(long, value_name = "REFERENCE_GGUF")]
     pub verify_against: Option<PathBuf>,
 
+    /// Extract the per-tensor dtype assignment from an existing GGUF
+    /// (unsloth, llama-quantize, or our own output) and apply it: one
+    /// exact-name rule per reference tensor, fed through the same
+    /// machinery as --tensor-type-file (the row-width demotion guard
+    /// still applies on top). Reference tensors missing from the input
+    /// are ignored; input tensors missing from the reference keep the
+    /// method default. F32 rules are skipped (1-D convention).
+    #[arg(long, value_name = "REFERENCE_GGUF")]
+    pub recipe_from: Option<PathBuf>,
+
     /// Override the GGUF architecture string (else detected from config.json).
     #[arg(long)]
     pub arch: Option<String>,

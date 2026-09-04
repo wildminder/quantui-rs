@@ -139,18 +139,17 @@ pub fn run(args: GgufArgs) -> ExitCode {
     // Phase 6: per-tensor recipe + the two category overrides. Every qtype
     // must be a USABLE method id — validated here (exit 2) so a typo never
     // surfaces mid-conversion.
-    let recipe = match &args.tensor_type_file {
-        Some(path) => match quant_core::gguf_recipe::TensorRecipe::load(path) {
+    //
+    // Task #8: --recipe-from extracts the recipe from a reference GGUF
+    // instead of reading a file; it feeds the SAME TensorRecipe machinery
+    // (row-width demotion still applies on top of the extracted rules).
+    let recipe = if let Some(ref_path) = &args.recipe_from {
+        match quant_core::gguf_recipe::recipe_from_gguf(ref_path) {
             Ok(r) => {
                 eprintln!(
-                    "recipe: {} rule(s){} loaded from {}",
+                    "recipe-from: {} rule(s) extracted from {} (F32 skipped; exact-name rules)",
                     r.rules.len(),
-                    if r.default.is_some() {
-                        " + default"
-                    } else {
-                        ""
-                    },
-                    path.display()
+                    ref_path.display()
                 );
                 Some(r)
             }
@@ -158,8 +157,30 @@ pub fn run(args: GgufArgs) -> ExitCode {
                 eprintln!("error: {e}");
                 return ExitCode::from(2);
             }
-        },
-        None => None,
+        }
+    } else {
+        match &args.tensor_type_file {
+            Some(path) => match quant_core::gguf_recipe::TensorRecipe::load(path) {
+                Ok(r) => {
+                    eprintln!(
+                        "recipe: {} rule(s){} loaded from {}",
+                        r.rules.len(),
+                        if r.default.is_some() {
+                            " + default"
+                        } else {
+                            ""
+                        },
+                        path.display()
+                    );
+                    Some(r)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+            None => None,
+        }
     };
     for (flag, id) in [
         (

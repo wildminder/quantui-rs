@@ -595,6 +595,136 @@ fn gguf_verify_against_bad_reference_is_a_clean_error() {
     );
 }
 
+/// Task #8: `--recipe-from` — extract the per-tensor assignment from a
+/// reference GGUF and apply it. The reference here is our own previous
+/// output (mixed q8_0/f16 recipe), so the re-conversion must reproduce
+/// the same per-tensor dtypes even under a DIFFERENT default method; the
+/// applied assignment is dumped via --emit-recipe and must equal the
+/// extracted recipe.
+#[test]
+fn gguf_recipe_from_reference_reproduces_assignment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    // Pass 1: mixed assignment via --tensor-type-file.
+    let recipe_path = tmp.path().join("mixed.recipe");
+    std::fs::write(
+        &recipe_path,
+        "^blk\\.0\\.attn_q\\.weight$=q8_0\n^blk\\.0\\.ffn_down\\.weight$=f16\n",
+    )
+    .unwrap();
+    let pass1 = tmp.path().join("pass1.gguf");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            pass1.to_str().unwrap(),
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            recipe_path.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "pass 1 must succeed");
+
+    // Pass 2: --recipe-from pass1 under a different base method (q6_k),
+    // plus --emit-recipe to dump the effective assignment.
+    let pass2 = tmp.path().join("pass2.gguf");
+    let dump = tmp.path().join("effective.recipe");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            pass2.to_str().unwrap(),
+            "--method",
+            "q6_k",
+            "--recipe-from",
+            pass1.to_str().unwrap(),
+            "--emit-recipe",
+            dump.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "pass 2 must succeed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("recipe-from: 4 rule(s) extracted"),
+        "extraction must report 4 non-F32 rules (1-D norm is F32, skipped): {stderr}"
+    );
+
+    // Dtype-level reproduction: pass1 vs pass2 per-tensor dtypes identical.
+    let f1 = rlx_gguf::GgufFile::from_path(&pass1).unwrap();
+    let f2 = rlx_gguf::GgufFile::from_path(&pass2).unwrap();
+    assert_eq!(f1.tensors.len(), f2.tensors.len());
+    for (name, t1) in &f1.tensors {
+        let t2 = f2
+            .tensors
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing from pass2"));
+        assert_eq!(t1.dtype, t2.dtype, "round-trip dtype mismatch for {name}");
+    }
+    // The recipe's specific picks landed.
+    assert_eq!(
+        f2.tensors.get("blk.0.attn_q.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::Q8_0
+    );
+    assert_eq!(
+        f2.tensors.get("blk.0.ffn_down.weight").unwrap().dtype,
+        rlx_gguf::GgmlType::F16
+    );
+
+    // The dumped effective recipe re-parses and contains both rules
+    // (the dump uses unescaped ^name$ anchors — fine, `.` matches `.`).
+    let dump_text = std::fs::read_to_string(&dump).unwrap();
+    assert!(dump_text.contains("^blk.0.attn_q.weight$=q8_0"));
+    assert!(dump_text.contains("^blk.0.ffn_down.weight$=f16"));
+}
+
+/// Task #8 exit-2 path: --recipe-from on an unparseable file.
+#[test]
+fn gguf_recipe_from_bad_reference_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+    let junk = tmp.path().join("junk.gguf");
+    std::fs::write(&junk, b"definitely not gguf").unwrap();
+
+    let out = tmp.path().join("out.gguf");
+    let status = bin()
+        .args([
+            "gguf",
+            model_dir.join("model.safetensors").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "q8_0",
+            "--recipe-from",
+            junk.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        status.status.code(),
+        Some(2),
+        "unparseable recipe-from reference must exit 2: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("recipe-from"),
+        "error must name the failing flag: {stderr}"
+    );
+}
+
 /// Generic nested-prefix name mapping, end-to-end: a wrapped multimodal
 /// checkpoint (`model.language_model.*` = VibeVoice / LFM2-VL layout, plus a
 /// vision tower that stays outside the wrapper) must land the wrapped dense
