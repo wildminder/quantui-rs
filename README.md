@@ -759,7 +759,7 @@ docs/plans/            design plans + execution log (local-only, not git-tracked
 ```
 
 ```sh
-cargo test --workspace                 # 517 tests incl. golden byte-parity
+cargo test --workspace                 # 512 tests incl. golden byte-parity
 cargo clippy --workspace --all-targets # clean with -D warnings
 cargo fmt --check
 cargo bench -p quant-core              # throughput benchmarks (needs fixture)
