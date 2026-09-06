@@ -632,3 +632,99 @@ fn plain_int8_unaffected_by_convrot_path() {
         &golden("linear_basic_bf16/output.safetensors")
     ));
 }
+
+// --------------------------------------------------------------------------- //
+// WP7 / NTH-004 — `quantize --verify-output`
+// --------------------------------------------------------------------------- //
+
+/// [NTH-004] single file + `--verify-output`: the run re-parses the
+/// artifact's header and prints the confirmation line; exit 0.
+#[test]
+fn quantize_verify_output_flag_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out.safetensors");
+    let o = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
+            out.to_str().unwrap(),
+            "--no-progress",
+            "--verify-output",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains("verified output:"),
+        "missing verification line: {stdout}"
+    );
+}
+
+/// [NTH-004] the flag-off contract: a default run prints NO verification
+/// line — the surface stays quiet unless asked.
+#[test]
+fn quantize_without_flag_stays_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out.safetensors");
+    let o = bin()
+        .args([
+            "quantize",
+            golden("linear_basic_bf16/input.safetensors")
+                .to_str()
+                .unwrap(),
+            out.to_str().unwrap(),
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        !stdout.contains("verified output:"),
+        "verification line must be flag-gated: {stdout}"
+    );
+}
+
+/// [NTH-004] sharded run + `--verify-output`: every shard file named in
+/// the global manifest is re-parsed; one confirmation line covering all
+/// of them; exit 0.
+#[test]
+fn quantize_verify_output_sharded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    let o = bin()
+        .args([
+            "quantize",
+            golden("sharded_model/input").to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+            "--no-progress",
+            "--verify-output",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains("verified output:"),
+        "missing verification line: {stdout}"
+    );
+    // The sharded path verifies per-shard; the line must name the file
+    // count (one entry per shard in the manifest).
+    assert!(
+        stdout.contains("2 file(s)") || stdout.contains("3 file(s)"),
+        "expected the sharded file count in the line: {stdout}"
+    );
+}

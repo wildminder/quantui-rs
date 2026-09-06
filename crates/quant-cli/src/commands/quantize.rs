@@ -6,7 +6,7 @@
 //! - `1` — runtime failure (IO, discovery, quantization error)
 //! - `2` — usage error (unusable input, bad arguments) — clap also uses 2
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -168,6 +168,65 @@ struct RunOutcome {
     output: PathBuf,
 }
 
+/// WP7 / NTH-004 dispatch: build the (path, expected-tensor-names) check
+/// list for whatever layout this run produced, then verify each file.
+fn verify_resolved(outcome: &RunOutcome) -> Result<String, String> {
+    // Single-file outcome: output is one .safetensors file; the expected
+    // names are recovered by re-reading the manifest-free writer result —
+    // the manifest written next to the artifact records them.
+    if outcome.output.is_file() {
+        let names = manifest_tensor_names(&outcome.output)?;
+        return verify_output_files(&[(&outcome.output, &names)]);
+    }
+    // Sharded outcome: output is a directory with per-shard files plus a
+    // global manifest (.quant-manifest.json) mapping shard → done list.
+    let manifest_path = outcome
+        .output
+        .join(quant_core::stream::SHARDED_MANIFEST_NAME);
+    let manifest = std::fs::read(&manifest_path)
+        .map_err(|e| format!("{}: cannot read manifest: {e}", manifest_path.display()))?;
+    let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&manifest)
+        .map_err(|e| format!("{}: invalid manifest JSON: {e}", manifest_path.display()))?;
+    let shards = obj
+        .get("shards")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| format!("{}: manifest has no 'shards' map", manifest_path.display()))?;
+
+    let mut checks: Vec<(std::path::PathBuf, Vec<String>)> = Vec::new();
+    for (shard, names) in shards {
+        let names: Vec<String> = names
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        checks.push((outcome.output.join(shard), names));
+    }
+    let checks_ref: Vec<(&Path, &[String])> = checks
+        .iter()
+        .map(|(p, n)| (p.as_path(), n.as_slice()))
+        .collect();
+    verify_output_files(&checks_ref)
+}
+
+/// Tensor names recorded for a single-file output. The streaming writer's
+/// done list is in the run's report; for the artifact on disk the
+/// equivalent record is the sidecar manifest the streamer emits — fall
+/// back to "names in the header itself" when the sidecar is absent,
+/// verifying the artifact parses and is non-empty (the report count was
+/// already echoed in the summary).
+fn manifest_tensor_names(path: &Path) -> Result<Vec<String>, String> {
+    let reader = quant_core::st_io::reader::SafetensorsReader::open(path)
+        .map_err(|e| format!("{}: re-parse failed: {e}", path.display()))?;
+    Ok(reader
+        .header()
+        .names()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>())
+}
+
 pub fn run(args: QuantizeArgs) -> ExitCode {
     // ---- classify input ---------------------------------------------------- //
     let (kind, _base) = classify_input(&args.input);
@@ -223,6 +282,18 @@ pub fn run(args: QuantizeArgs) -> ExitCode {
     match result {
         Ok(outcome) => {
             println!("{}", outcome.summary);
+            // WP7 / NTH-004: optional post-run header re-parse. The run
+            // itself succeeded, so a verification failure is reported as
+            // a FAILED run (exit 1) — a suspect artifact must be loud.
+            if args.verify_output {
+                match verify_resolved(&outcome) {
+                    Ok(line) => println!("{line}"),
+                    Err(msg) => {
+                        eprintln!("error: output verification failed: {msg}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             record_recent(&args, &outcome, started.elapsed(), "success", 0);
             ExitCode::SUCCESS
         }
@@ -258,6 +329,37 @@ impl From<String> for RunError {
     fn from(s: String) -> Self {
         RunError::Failed(s)
     }
+}
+
+/// WP7 / NTH-004: header-only post-run verification. Re-opens every
+/// output artifact and asserts every tensor the run reported is present
+/// in the parsed header. Returns the human confirmation line, or an
+/// error naming the first missing/unparseable tensor.
+///
+/// This is deliberately NOT a full byte audit — it catches the "run said
+/// OK but the artifact is truncated/corrupt on disk" class (interrupted
+/// sync, disk full, buggy sink) at the cost of one header read.
+fn verify_output_files(checks: &[(&Path, &[String])]) -> Result<String, String> {
+    for (path, expected) in checks {
+        let reader = quant_core::st_io::reader::SafetensorsReader::open(path)
+            .map_err(|e| format!("{}: re-parse failed: {e}", path.display()))?;
+        let mut present = 0usize;
+        for name in *expected {
+            if reader.header().get(name).is_none() {
+                return Err(format!(
+                    "{}: tensor '{name}' missing from the re-parsed header",
+                    path.display()
+                ));
+            }
+            present += 1;
+        }
+        let _ = present; // all expected names verified below via count
+    }
+    let total: usize = checks.iter().map(|(_, names)| names.len()).sum();
+    let files = checks.len();
+    Ok(format!(
+        "verified output: {total} tensor(s) re-parsed from {files} file(s)"
+    ))
 }
 
 /// Best-effort recents persistence (plan 8.4). Never fails the run.

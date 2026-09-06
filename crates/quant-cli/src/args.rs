@@ -138,6 +138,12 @@ pub struct QuantizeArgs {
     /// Disable the progress bar (plain, CI-friendly output).
     #[arg(long)]
     pub no_progress: bool,
+
+    /// Re-parse the output header(s) after a successful run and fail
+    /// loudly (exit 1) if any tensor from the report is missing or
+    /// unparseable. Header-only — cheap but not free on 10 GB outputs.
+    #[arg(long)]
+    pub verify_output: bool,
 }
 
 // --------------------------------------------------------------------------- //

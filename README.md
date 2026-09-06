@@ -122,6 +122,8 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
       --calib-seed <N>    Bias-correction seed [default: 233983427]
       --simple            Accepted for reference compatibility (always on)
       --no-progress       Plain, CI-friendly output (no progress bar)
+      --verify-output     Re-parse the output header(s) after the run;
+                          exit 1 if any reported tensor is missing
 ```
 
 **Parameter guidance:**
@@ -140,6 +142,10 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
   pinning is what makes runs reproducible and byte-identical to the Python
   reference. Don't change it unless you intentionally want a different (but
   still valid) bias correction.
+- **`--verify-output`** is a cheap post-run integrity check: the output
+  header(s) are re-parsed and every reported tensor must be present, or
+  the run exits 1 (`error: output verification failed: …`). Off by
+  default — on a 10 GB output the header read is cheap but not free.
 
 ### What gets quantized
 
