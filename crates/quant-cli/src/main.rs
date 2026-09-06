@@ -8,7 +8,8 @@ mod commands;
 mod profiles;
 mod progress;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, shells::Shell as CompletableShell};
 
 use args::{GgufArgs, InfoArgs, QuantizeArgs, ValidateArgs};
 
@@ -36,6 +37,14 @@ enum Commands {
     Validate(ValidateArgs),
     /// Inspect a safetensors header without loading tensors.
     Info(InfoArgs),
+    /// Emit a shell completion script (hidden from --help; documented in
+    /// the README's "Shell completions" section). WP8 / NTH-005.
+    #[command(hide = true)]
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: CompletableShell,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -45,5 +54,13 @@ fn main() -> std::process::ExitCode {
         Commands::Gguf(args) => commands::gguf::run(*args),
         Commands::Validate(args) => commands::validate::run(args),
         Commands::Info(args) => commands::info::run(args),
+        Commands::Completions { shell } => {
+            // `generate` writes the script to stdout; a broken pipe
+            // (quantui-rs completions bash | head) must not panic.
+            let mut cmd = Cli::command();
+            let mut out = std::io::stdout();
+            generate(shell, &mut cmd, "quantui-rs", &mut out);
+            std::process::ExitCode::SUCCESS
+        }
     }
 }

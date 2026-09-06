@@ -18,6 +18,9 @@ use proptest::prelude::*;
 use quant_core::dtype::DType;
 use quant_core::st_io::header::Header;
 
+/// One parsed-back tensor: (name, dtype_raw, shape, data_offsets).
+type ParsedTensor = (String, String, Vec<u64>, (u64, u64));
+
 /// All dtype strings the parser accepts (DType::from_header_str).
 const DTYPES: &[&str] = &[
     "F64", "F32", "F16", "BF16", "I64", "I32", "I16", "I8", "U8", "U16", "BOOL", "F8_E4M3",
@@ -88,11 +91,11 @@ fn header_serialize_parse_round_trip() {
         let back = Header::parse_json_bytes(&padded, Path::new("prop"))
             .expect("valid header must parse");
 
-        let orig: Vec<(String, String, Vec<u64>, (u64, u64))> = entries.iter().map(|(n, d, s)| {
+        let orig: Vec<ParsedTensor> = entries.iter().map(|(n, d, s)| {
             let info = h.get(n).expect("entry present");
             (n.clone(), d.clone(), s.clone(), info.data_offsets)
         }).collect();
-        let parsed: Vec<(String, String, Vec<u64>, (u64, u64))> = back
+        let parsed: Vec<ParsedTensor> = back
             .iter()
             .map(|(n, i)| (n.clone(), i.dtype_raw.clone(), i.shape.clone(), i.data_offsets))
             .collect();

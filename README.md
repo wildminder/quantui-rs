@@ -33,10 +33,11 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
 9. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
 10. [Validating (`validate`) and inspecting (`info`)](#validate-info)
 11. [Exit codes](#exit-codes)
-12. [Worked examples: real models](#worked-examples)
-13. [Parity contract & known boundaries](#parity)
-14. [Performance](#performance)
-15. [Repository layout & development](#development)
+12. [Shell completions](#completions)
+13. [Worked examples: real models](#worked-examples)
+14. [Parity contract & known boundaries](#parity)
+15. [Performance](#performance)
+16. [Repository layout & development](#development)
 
 ---
 
@@ -599,6 +600,37 @@ Parses only the header (no tensor payloads).
 | 2 | Usage error (bad arguments, unknown GGUF method, missing input, missing `--imatrix`, bad recipe) |
 | 3 | **gguf only**: `--verify-against` found spec violations in OUR output |
 | 130 | Cancelled by Ctrl-C (partial output is resumable) |
+
+---
+
+<a name="completions"></a>
+## Shell completions
+
+The `completions` subcommand emits a completion script for your shell
+(hidden from `--help` to keep the surface clean):
+
+```sh
+# bash: one-shot, current session
+source <(quantui-rs completions bash)
+
+# bash: persistent
+quantui-rs completions bash > ~/.local/share/bash-completion/completions/quantui-rs
+
+# zsh
+quantui-rs completions zsh > "${fpath[1]}/_quantui-rs"
+
+# fish
+quantui-rs completions fish > ~/.config/fish/completions/quantui-rs.fish
+
+# PowerShell
+quantui-rs completions powershell >> $PROFILE
+
+# elvish
+quantui-rs completions elvish >> ~/.elvish/rc.elv
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`. After
+reloading your shell, `quantui-rs <TAB>` completes subcommands and flags.
 
 ---
 
