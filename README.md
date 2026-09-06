@@ -305,6 +305,34 @@ quantui-rs gguf --audit "$f" || echo "$f is spec-violating"
   `tensor_type_fallback` (IQ\*→IQ4_NL, Q2_K/Q3_K/TQ\*→Q4_0, Q4_K→Q5_0,
   Q5_K→Q5_1, Q6_K→Q8_0, else F16) — loudly, with a per-tensor warning and a
   summary. The output is always a spec-conformant GGUF.
+- **Parallel encoding**: tensor *payloads* are quantized in parallel on a
+  rayon pool, in chunks of 8 tensors or 512 MiB of raw input (whichever
+  comes first). Everything order-sensitive — name mapping, scheme
+  resolution (the llama-quantize policy counters), writing, warnings,
+  report accounting and progress — stays sequential, so the output is
+  **byte-identical** regardless of thread count.
+
+### `QUANTUI_RS_GGUF_JOBS` — encode thread count
+
+```sh
+QUANTUI_RS_GGUF_JOBS=1 quantui-rs gguf model.safetensors -m q8_0   # sequential
+QUANTUI_RS_GGUF_JOBS=8 quantui-rs gguf model.safetensors -m q8_0   # 8 threads
+```
+
+Unset = one thread per logical core (`available_parallelism`). `1` forces
+the fully sequential pipeline (chunk size 1 on a single-thread pool) —
+there is only one code path, `jobs` merely parameterises it, so this is
+also the reference mode if you ever want to A/B the output:
+
+```sh
+QUANTUI_RS_GGUF_JOBS=1 quantui-rs gguf m.safetensors seq.gguf -m q8_0
+QUANTUI_RS_GGUF_JOBS=4 quantui-rs gguf m.safetensors par.gguf -m q8_0
+fc /b seq.gguf par.gguf        # Windows (`cmp` on Linux) — identical
+```
+
+Parallelism does **not** change the file: both runs above produce the same
+bytes, the same stderr and the same report. It only changes how fast they
+are produced.
 
 ### Method capability matrix
 

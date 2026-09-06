@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use rlx_gguf::{quantize, GgmlType, GgufWriter, MetaValue};
 
 use crate::discover::{classify_input, resolve_union, InputKind};
@@ -27,6 +28,37 @@ use crate::dtype::DType;
 use crate::gguf_names::{hf_to_gguf_name, load_arch_info};
 use crate::gguf_registry::{self, GgufScheme};
 use crate::{gguf_quants, llama_policy, st_io::reader::SafetensorsReader};
+
+/// Max tensors held in one parallel encode chunk (IMP-004 step 2).
+///
+/// Payload encoding is the only parallel step; resolution (which advances
+/// the llama.cpp policy counters) and the write/accounting/progress tail
+/// stay sequential. Chunking bounds the in-flight f32 working set: the
+/// decode phase materialises every tensor as f32, which for a large model
+/// is several times the source size.
+const PAR_CHUNK_TENSORS: usize = 8;
+
+/// Max raw source bytes in one parallel encode chunk (512 MiB).
+const PAR_CHUNK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Env knob for the encode thread count: `QUANTUI_RS_GGUF_JOBS`.
+///
+/// `1` (or an unavailable parallelism hint) collapses the pipeline to
+/// fully sequential — chunk size 1 on a single-thread pool — which is the
+/// escape hatch if a scheduler ever perturbed output. There is still only
+/// ONE code path: `jobs` merely parameterises it.
+fn gguf_jobs() -> usize {
+    let explicit = std::env::var("QUANTUI_RS_GGUF_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1);
+    match explicit {
+        Some(n) => n,
+        None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    }
+}
 
 /// Errors from GGUF conversion.
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +116,14 @@ pub struct GgufConvertConfig {
     /// `--output-tensor-type`: overrides the scheme for the
     /// `output.weight` tensor (llama-quant.cpp:704-706).
     pub output_tensor_type: Option<String>,
+    /// Override the parallel payload-encode thread count (IMP-004).
+    /// `None` → `QUANTUI_RS_GGUF_JOBS`, else the machine's available
+    /// parallelism. `Some(1)` forces the fully sequential pipeline
+    /// (chunk of one on a single-thread pool) — the escape hatch, and the
+    /// reference mode the byte-identity tests compare against. Exposed
+    /// here so tests can switch modes without mutating process-global
+    /// environment state.
+    pub jobs: Option<usize>,
 }
 
 impl Default for GgufConvertConfig {
@@ -99,6 +139,7 @@ impl Default for GgufConvertConfig {
             recipe: None,
             token_embedding_type: None,
             output_tensor_type: None,
+            jobs: None,
         }
     }
 }
@@ -151,6 +192,10 @@ pub struct GgufConvertReport {
 /// encoding produce identical stderr streams.
 struct EncodedTensor {
     gguf_name: String,
+    /// GGUF-ordered shape (HF shape reversed) for the writer. Captured
+    /// during resolution so the sequential write phase never has to look
+    /// the header entry back up — a chunk may straddle a shard boundary.
+    shape_out: Vec<usize>,
     dtype: GgmlType,
     bytes: Vec<u8>,
     scheme: GgufScheme,
@@ -258,7 +303,31 @@ pub fn convert_hf_to_gguf(
         is_70b_type: false,
     };
 
-    // 6. Encode each tensor.
+    // 6. Encode each tensor — chunked two-phase pipeline (IMP-004 step 2).
+    //
+    //   Phase A (this thread, SEQUENTIAL): `resolve_one_tensor` — name
+    //     mapping, scheme resolution (which advances the llama.cpp policy
+    //     counters and is therefore strictly order-sensitive), row
+    //     demotion, imatrix eligibility, and decode to f32 (the IO).
+    //   Phase B (rayon, PARALLEL): `encode_resolved` — a pure function of
+    //     (ResolvedTensor, cfg) touching no shared mutable state, so the
+    //     emitted bytes cannot depend on scheduling. `collect()` into a
+    //     `Result<Vec<_>>` preserves chunk order.
+    //   Phase C (this thread, SEQUENTIAL): writer push, warning print,
+    //     report accounting, progress callback — all in file order, so
+    //     stderr, the report and the progress stream are byte-identical
+    //     to the pre-parallelism output.
+    //
+    // A chunk closes after [PAR_CHUNK_TENSORS] tensors or once it holds
+    // [PAR_CHUNK_BYTES] of raw source, which bounds the in-flight f32
+    // working set (decode materialises every tensor as f32).
+    let jobs = cfg.jobs.unwrap_or_else(gguf_jobs);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .map_err(|e| GgufError::Gguf(format!("rayon thread pool: {e}")))?;
+    let chunk_tensors = if jobs <= 1 { 1 } else { PAR_CHUNK_TENSORS };
+
     let mut quantized = 0usize;
     let mut fallback_f16 = 0usize;
     let mut kept_f32 = 0usize;
@@ -266,9 +335,21 @@ pub fn convert_hf_to_gguf(
     let mut row_fallback = 0usize;
     let mut row_fallback_tensors: Vec<String> = Vec::new();
     let mut effective_schemes: Vec<(String, GgufScheme)> = Vec::new();
-    for (done, (name, shard_idx)) in names.iter().enumerate() {
+    let mut emitted = 0usize;
+    let mut chunk: Vec<ResolvedTensor> = Vec::new();
+    let mut chunk_bytes = 0u64;
+
+    let total_tensors = names.len();
+    for (idx, (name, shard_idx)) in names.iter().enumerate() {
         let reader = &readers[*shard_idx];
-        let encoded = encode_one_tensor(
+        let raw_len = reader
+            .header()
+            .get(name)
+            .map(|i| i.data_offsets.1.saturating_sub(i.data_offsets.0))
+            .unwrap_or(0);
+
+        // ── Phase A ──
+        let resolved = resolve_one_tensor(
             cfg,
             entry,
             engine,
@@ -276,45 +357,52 @@ pub fn convert_hf_to_gguf(
             model_facts,
             reader,
             name,
-            done,
-            total,
         )?;
-
-        // Report accounting + warning printing stay in file order here;
-        // the parallel path (IMP-004 step 2) reuses the exact same logic.
-        if encoded.row_demoted {
-            row_fallback += 1;
-            row_fallback_tensors.push(encoded.gguf_name.clone());
-        }
-        effective_schemes.push((encoded.gguf_name.clone(), encoded.scheme));
-        for line in &encoded.warnings {
-            eprintln!("{line}");
-        }
-        if encoded.weighted_done {
-            quantized += 1;
-        } else if encoded.fell_back_f16 {
-            fallback_f16 += 1;
-            fallback_tensors.push(encoded.gguf_name.clone());
-        } else if encoded.quantized {
-            quantized += 1;
-        } else if encoded.kept_f32 {
-            kept_f32 += 1;
+        chunk_bytes += raw_len;
+        chunk.push(resolved);
+        let is_last = idx + 1 == total_tensors;
+        if chunk.len() < chunk_tensors && chunk_bytes < PAR_CHUNK_BYTES && !is_last {
+            continue;
         }
 
-        let shape: Vec<usize> = reader
-            .header()
-            .get(name)
-            .expect("name came from header")
-            .shape
-            .iter()
-            .rev()
-            .map(|&d| d as usize)
-            .collect();
-        w.add_tensor_bytes(&encoded.gguf_name, shape, encoded.dtype, encoded.bytes)
-            .map_err(|e| GgufError::Gguf(e.to_string()))?;
+        // ── Phase B ──
+        let batch = std::mem::take(&mut chunk);
+        chunk_bytes = 0;
+        let batch: Vec<EncodedTensor> = pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|r| encode_resolved(r, cfg))
+                .collect::<Result<Vec<_>, GgufError>>()
+        })?;
 
-        if let Some(cb) = on_progress.as_mut() {
-            cb(done + 1, total);
+        // ── Phase C ──
+        for enc in batch {
+            if enc.row_demoted {
+                row_fallback += 1;
+                row_fallback_tensors.push(enc.gguf_name.clone());
+            }
+            effective_schemes.push((enc.gguf_name.clone(), enc.scheme));
+            for line in &enc.warnings {
+                eprintln!("{line}");
+            }
+            if enc.weighted_done {
+                quantized += 1;
+            } else if enc.fell_back_f16 {
+                fallback_f16 += 1;
+                fallback_tensors.push(enc.gguf_name.clone());
+            } else if enc.quantized {
+                quantized += 1;
+            } else if enc.kept_f32 {
+                kept_f32 += 1;
+            }
+
+            w.add_tensor_bytes(&enc.gguf_name, enc.shape_out, enc.dtype, enc.bytes)
+                .map_err(|e| GgufError::Gguf(e.to_string()))?;
+
+            emitted += 1;
+            if let Some(cb) = on_progress.as_mut() {
+                cb(emitted, total);
+            }
         }
     }
 
@@ -700,7 +788,37 @@ fn scheme_type_name(s: GgufScheme) -> &'static str {
 /// strings so the driver prints them in file order regardless of where
 /// encoding ran (IMP-004).
 #[allow(clippy::too_many_arguments)]
-fn encode_one_tensor(
+/// Intermediate result of the sequential resolution phase (IMP-004):
+/// everything decided WITHOUT encoding. `floats` is owned so the encode
+/// phase can run on another thread without borrowing the reader.
+struct ResolvedTensor {
+    gguf_name: String,
+    scheme: GgufScheme,
+    ggml: GgmlType,
+    /// Decoded f32 payload (moved into the encode phase).
+    floats: Vec<f32>,
+    shape_hf: Vec<u64>,
+    /// GGUF-ordered shape (HF shape reversed) — carried through to the
+    /// writer so the write phase is independent of whatever shard the
+    /// chunk happens to be on.
+    shape_out: Vec<usize>,
+    /// imatrix weights for this tensor (owned copy), present only when
+    /// the weighted path will consume them.
+    weights: Option<Vec<f32>>,
+    /// Demotion context needed by the encode-phase warnings.
+    pre_scheme: GgufScheme,
+    ne0: usize,
+    demoted_to_f16: bool,
+    row_demoted: bool,
+    warnings: Vec<String>,
+}
+
+/// Sequential resolution phase (IMP-004): name mapping, scheme
+/// resolution (advancing the policy counters — order-sensitive), row
+/// demotion, imatrix eligibility, and decode to f32. Pure decision work
+/// + IO; the payload encoding is factored out to [encode_resolved].
+#[allow(clippy::too_many_arguments)]
+fn resolve_one_tensor(
     cfg: &GgufConvertConfig,
     entry: &gguf_registry::RegistryEntry,
     engine: llama_policy::LlamaPolicy,
@@ -708,9 +826,7 @@ fn encode_one_tensor(
     model_facts: llama_policy::ModelFacts,
     reader: &SafetensorsReader,
     name: &str,
-    _done: usize,
-    _total: usize,
-) -> Result<EncodedTensor, GgufError> {
+) -> Result<ResolvedTensor, GgufError> {
     let info = reader.header().get(name).expect("name came from header");
     let raw = reader.tensor_bytes(name)?;
     let ndim = info.shape.len();
@@ -804,9 +920,6 @@ fn encode_one_tensor(
     // records the CAUSE: a row width no quantized type can describe,
     // discovered at type-selection time rather than by the encoder.
     let demoted_to_f16 = pre != GgufScheme::F16 && scheme == GgufScheme::F16;
-
-    // Phase 6.3: effective scheme is recorded by the DRIVER after this
-    // returns (it owns the report).
     let ggml = scheme_to_ggml(scheme);
 
     // Decode to f32 (GGUF encoders consume f32).
@@ -899,8 +1012,51 @@ fn encode_one_tensor(
             }
         }
     }
+
+    let weights_owned = weights.map(|w| w.to_vec());
+
+    Ok(ResolvedTensor {
+        gguf_name,
+        scheme,
+        ggml,
+        floats,
+        shape_hf: info.shape.clone(),
+        shape_out: info.shape.iter().rev().map(|&d| d as usize).collect(),
+        weights: weights_owned,
+        pre_scheme: pre,
+        ne0,
+        demoted_to_f16,
+        row_demoted,
+        warnings,
+    })
+}
+
+/// Encode phase (IMP-004): pure function of (ResolvedTensor, cfg) — no
+/// shared mutable state, so it can run on any thread. Deterministic: the
+/// same ResolvedTensor produces a byte-identical payload everywhere.
+fn encode_resolved(r: ResolvedTensor, cfg: &GgufConvertConfig) -> Result<EncodedTensor, GgufError> {
+    let ResolvedTensor {
+        gguf_name,
+        scheme,
+        ggml,
+        floats,
+        shape_hf,
+        shape_out,
+        weights,
+        pre_scheme: pre,
+        ne0,
+        demoted_to_f16,
+        row_demoted,
+        mut warnings,
+    } = r;
+
+    // The weighted path is a pure decision of (scheme, weights) — no
+    // counter or IO state — so it lives in the encode phase (IMP-004).
+    // `weights` is owned here, so the match borrows it via `Some(_)`
+    // patterns and `weights.as_deref()` provides the `&[f32]` the
+    // encoders expect (HEAD used an `Option<&[f32]>` Copy).
     let weighted = matches!(
-        (scheme, weights),
+        (scheme, weights.as_deref()),
         (GgufScheme::Q4K, Some(_))
             | (GgufScheme::Q2K, Some(_))
             | (GgufScheme::Q3K, Some(_))
@@ -917,11 +1073,11 @@ fn encode_one_tensor(
             | (GgufScheme::Iq4Xs, Some(_))
     );
     if weighted {
-        let n_per_row = info.shape.last().copied().unwrap_or(0) as usize;
+        let n_per_row = shape_hf.last().copied().unwrap_or(0) as usize;
         let nrows = floats.len() / n_per_row.max(1);
         // Size check mirrors llama-quant.cpp:1228: the entry must cover
         // ne[0] (ne[2]=1 for our 2-D dense case).
-        let wv = weights.unwrap();
+        let wv: &[f32] = weights.as_deref().expect("weighted implies weights");
         if n_per_row == 0 || wv.len() != n_per_row || floats.len() % n_per_row != 0 {
             return Err(GgufError::Imatrix(format!(
                 "imatrix size {} != n_per_row {} for tensor '{gguf_name}'",
@@ -984,6 +1140,7 @@ fn encode_one_tensor(
         }
         return Ok(EncodedTensor {
             gguf_name,
+            shape_out,
             dtype: ggml,
             bytes: out,
             scheme,
@@ -1027,6 +1184,7 @@ fn encode_one_tensor(
             let b = quantize(&floats, GgmlType::F16).map_err(|e| GgufError::Gguf(e.to_string()))?;
             return Ok(EncodedTensor {
                 gguf_name,
+                shape_out,
                 dtype: GgmlType::F16,
                 bytes: b,
                 scheme,
@@ -1042,6 +1200,7 @@ fn encode_one_tensor(
 
     Ok(EncodedTensor {
         gguf_name,
+        shape_out,
         dtype,
         bytes,
         scheme,

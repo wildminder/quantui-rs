@@ -2249,3 +2249,221 @@ fn gguf_report_counters_stable_after_refactor() {
         summary[0]
     );
 }
+
+// ─── [IMP-004] step 2: parallel encoding must be byte-identical ─────
+
+/// Run `gguf` with `QUANTUI_RS_GGUF_JOBS=<jobs>` and capture the output.
+/// The variable is set on the child process only, so these tests stay
+/// independent of each other and of every other test in the suite.
+fn gguf_with_jobs(args: &[&str], jobs: &str) -> std::process::Output {
+    bin()
+        .args(args)
+        .env("QUANTUI_RS_GGUF_JOBS", jobs)
+        .output()
+        .unwrap()
+}
+
+/// Convert the same model twice — once fully sequential (`JOBS=1`, which
+/// collapses the pipeline to a chunk of one on a single-thread pool) and
+/// once parallel (`JOBS=4`) — and return both output files' bytes.
+fn seq_and_par_bytes(
+    model: &Path,
+    extra_args: &[&str],
+    seq_out: &Path,
+    par_out: &Path,
+) -> (Vec<u8>, Vec<u8>) {
+    for (out, jobs) in [(seq_out, "1"), (par_out, "4")] {
+        let model_path = model.join("model.safetensors");
+        let model_arg = model_path.to_str().unwrap().to_string();
+        let out_arg = out.to_str().unwrap().to_string();
+        let mut args: Vec<&str> = vec!["gguf", &model_arg, &out_arg];
+        args.extend_from_slice(extra_args);
+        args.push("--no-progress");
+        let o = gguf_with_jobs(&args, jobs);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "JOBS={jobs} conversion failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let a = std::fs::read(seq_out).unwrap();
+    let b = std::fs::read(par_out).unwrap();
+
+    // Guard against a vacuous pass: both files must really hold the
+    // model's tensors (a driver that dropped its final chunk would emit
+    // two equally-empty files and still compare equal).
+    for (path, jobs) in [(seq_out, "1"), (par_out, "4")] {
+        let f = rlx_gguf::GgufFile::from_path(path).unwrap();
+        assert!(
+            f.tensors.len() >= 4,
+            "JOBS={jobs}: output {path:?} holds only {} tensors",
+            f.tensors.len()
+        );
+    }
+    (a, b)
+}
+
+/// [IMP-004] step 2: the parallelism must not change a single output
+/// byte. Plain composite method (q8_0) on the tiny model: scheme
+/// resolution, the write order and every payload must be identical.
+#[test]
+fn parallel_output_is_byte_identical_sequential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let (a, b) = seq_and_par_bytes(
+        &model_dir,
+        &["--method", "q8_0"],
+        &tmp.path().join("seq.gguf"),
+        &tmp.path().join("par.gguf"),
+    );
+    assert_eq!(a.len(), b.len(), "output size changed under parallelism");
+    assert!(
+        a == b,
+        "parallel encoding is NOT byte-identical to sequential (q8_0)"
+    );
+}
+
+/// [IMP-004] step 2: same guarantee with a **recipe** in play. The recipe
+/// short-circuits the policy engine for matched tensors, so the parallel
+/// path must reproduce both the manual assignments and the engine's
+/// counter state for the unmatched ones.
+#[test]
+fn parallel_recipe_output_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    let recipe_path = tmp.path().join("mixed.recipe");
+    std::fs::write(
+        &recipe_path,
+        "^blk\\.0\\.attn_q\\.weight$=q8_0\n^blk\\.0\\.ffn_down\\.weight$=f16\n",
+    )
+    .unwrap();
+
+    let (a, b) = seq_and_par_bytes(
+        &model_dir,
+        &[
+            "--method",
+            "q4_k_m",
+            "--tensor-type-file",
+            recipe_path.to_str().unwrap(),
+        ],
+        &tmp.path().join("seq.gguf"),
+        &tmp.path().join("par.gguf"),
+    );
+    assert!(
+        a == b,
+        "parallel encoding is NOT byte-identical to sequential (q4_k_m + recipe)"
+    );
+}
+
+/// [IMP-004] step 2: same guarantee with an **imatrix** in play — this is
+/// the branch with the most per-tensor state, because the weighted
+/// K-quant encoders take a per-row weight vector that must reach exactly
+/// the tensor it belongs to.
+#[test]
+fn parallel_imatrix_output_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    write_tiny_model(&model_dir);
+
+    // Per-column weights for blk.0.attn_q (n_per_row = 256); positive,
+    // like a real importance matrix.
+    let weights: Vec<f32> = synth(256, 5).iter().map(|v| v.abs() + 0.05).collect();
+    let imatrix_path = write_legacy_imatrix(tmp.path(), "blk.0.attn_q.weight", &weights);
+
+    let (a, b) = seq_and_par_bytes(
+        &model_dir,
+        &[
+            "--method",
+            "q4_k_s",
+            "--imatrix",
+            imatrix_path.to_str().unwrap(),
+        ],
+        &tmp.path().join("seq.gguf"),
+        &tmp.path().join("par.gguf"),
+    );
+    assert!(
+        a == b,
+        "parallel encoding is NOT byte-identical to sequential (q4_k_s + imatrix)"
+    );
+}
+
+/// [IMP-004] step 2: stderr must be identical and in FILE ORDER in both
+/// modes. Three odd-width tensors (kernels 7, 4, 10) each produce a
+/// "fell back to F16" warning, and those are the ones that matter here:
+/// they are generated inside the ENCODE phase (parallel) but printed by
+/// the driver afterwards, so their order is exactly what the two-phase
+/// split puts at risk.
+///
+/// (The "not divisible by" line these tensors also emit comes from the
+/// resolve phase, which is sequential by construction — filtering on it
+/// would make this test vacuous.)
+#[test]
+fn parallel_warning_order_stable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let mk_conv = |name: &'static str, k: u64, seed: u64| Tensor {
+        name,
+        dtype: "BF16",
+        shape: vec![32, 1, k],
+        bytes: bf16_bytes(&synth((32 * k) as usize, seed)),
+    };
+    let tensors = vec![
+        mk_conv("model.layers.0.self_attn.q_proj.weight", 7, 1),
+        mk_conv("model.layers.0.self_attn.k_proj.weight", 4, 2),
+        mk_conv("model.layers.0.self_attn.v_proj.weight", 10, 3),
+        Tensor {
+            name: "model.norm.weight",
+            dtype: "BF16",
+            shape: vec![32],
+            bytes: bf16_bytes(&synth(32, 7)),
+        },
+    ];
+    std::fs::write(
+        model_dir.join("model.safetensors"),
+        build_safetensors(&tensors),
+    )
+    .unwrap();
+
+    let mut runs = Vec::new();
+    for (jobs, out_name) in [("1", "seq.gguf"), ("4", "par.gguf")] {
+        let out = tmp.path().join(out_name);
+        let o = gguf_with_jobs(
+            &[
+                "gguf",
+                model_dir.join("model.safetensors").to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--method",
+                "q8_0",
+                "--no-progress",
+            ],
+            jobs,
+        );
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "JOBS={jobs} failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+        let warns: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.contains("fell back to F16"))
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(warns.len(), 3, "JOBS={jobs}: expected 3 warnings: {stderr}");
+        runs.push(warns);
+    }
+
+    // Same three lines, same order, in both modes — and in file order.
+    assert_eq!(runs[0], runs[1], "stderr diverged under parallelism");
+    assert!(runs[0][0].contains("blk.0.attn_q.weight"), "{:?}", runs[0]);
+    assert!(runs[0][1].contains("blk.0.attn_k.weight"), "{:?}", runs[0]);
+    assert!(runs[0][2].contains("blk.0.attn_v.weight"), "{:?}", runs[0]);
+}

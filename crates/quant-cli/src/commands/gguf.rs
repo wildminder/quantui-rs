@@ -345,6 +345,8 @@ pub fn run(args: GgufArgs) -> ExitCode {
         recipe,
         token_embedding_type: args.token_embedding_type.clone(),
         output_tensor_type: args.output_tensor_type.clone(),
+        // None → QUANTUI_RS_GGUF_JOBS / available parallelism (IMP-004).
+        jobs: None,
     };
 
     let mut sink: Box<dyn ProgressSink> = if args.no_progress {
