@@ -5,15 +5,25 @@ on:
     branches: [main]
   pull_request:
 
-# Phase 11.3: full regression + golden byte-parity on both Windows and Linux.
-# The golden fixtures (tests/golden/**) are committed and marked binary in
-# .gitattributes so byte-compare parity tests are valid on every OS.
+# Phase 11.3: full regression + golden byte-parity on Windows, Linux and
+# macOS (WP9 / NTH-002). The golden fixtures (tests/golden/**) are committed
+# and marked binary in .gitattributes so byte-compare parity tests are valid
+# on every OS.
+#
+# Pre-registered macOS watch items (plan 9.2, checked before the first run):
+#   - ctrlc::set_handler is supported on macOS (kqueue/signalfd not needed);
+#   - memmap2 is supported (no platform gate in its docs);
+#   - no #[cfg(windows)] anywhere in crates/ EXCEPT the deliberate
+#     Ctrl-C CLI integration test (cli_all_formats.rs E.3): delivering
+#     CTRL_BREAK_EVENT to a child process group is a Windows console
+#     mechanism; the core cancel path is covered in-process on every OS.
+#   - tests build paths with PathBuf::join, no hardcoded separators.
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
