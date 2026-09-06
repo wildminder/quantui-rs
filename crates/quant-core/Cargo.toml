@@ -29,6 +29,8 @@ rlx-gguf = "=0.2.14"
 half = "2"
 # Phase 11.1: throughput benchmark (GB/s) of the streaming quantizer.
 criterion = { version = "0.5", features = ["html_reports"] }
+# WP6 / NTH-001: property-based parser hardening.
+proptest = "1"
 
 [[bench]]
 name = "stream_throughput"
