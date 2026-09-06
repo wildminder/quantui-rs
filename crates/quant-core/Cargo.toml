@@ -35,3 +35,8 @@ proptest = "1"
 [[bench]]
 name = "stream_throughput"
 harness = false
+
+# WP10 / NTH-003: nightly regression tracking on the committed small fixture.
+[[bench]]
+name = "stream_small"
+harness = false

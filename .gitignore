@@ -7,7 +7,10 @@ _backup
 # not just in _backup/ — ignore them so `git add -A` can't sweep one in.
 *.rar
 # Phase 11.1: large generated benchmark fixture + criterion HTML reports.
+# WP10 exception: tests/bench/bench_small.safetensors is COMMITTED (nightly
+# bench needs it with zero setup); only the big generated fixtures stay out.
 /tests/bench/*.safetensors
+!/tests/bench/bench_small.safetensors
 /crates/quant-core/target/
 target/criterion/
 docs/

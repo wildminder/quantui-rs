@@ -1,0 +1,39 @@
+name: bench
+
+# WP10 / NTH-003: nightly benchmark regression tracking.
+#
+# Deliberately NOT a merge gate — timing CI on shared runners is noisy,
+# so this is an awareness signal only. Each nightly run saves a criterion
+# baseline named `nightly` and uploads the full report (target/criterion)
+# as a workflow artifact with 30-day retention.
+#
+# Future refinement (documented, not implemented): download the previous
+# night's artifact in a follow-up step and `--baseline` against it to
+# detect day-over-day drift automatically. For now, compare two
+# artifacts' `estimates.json` by hand, or run locally:
+#   cargo bench -p quant-core --bench stream_small -- --save-baseline mine
+#   ... change code ...
+#   cargo bench -p quant-core --bench stream_small -- --baseline mine
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bench (save nightly baseline)
+        run: cargo bench -p quant-core --bench stream_small -- --save-baseline nightly
+      - name: Bench (self-comparison against the baseline just saved)
+        # Proves the baseline mechanism works; same-run variance must be ~0.
+        run: cargo bench -p quant-core --bench stream_small -- --baseline nightly
+      - name: Upload criterion report
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-nightly
+          path: target/criterion
+          retention-days: 30

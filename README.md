@@ -759,15 +759,37 @@ docs/plans/            design plans + execution log (local-only, not git-tracked
 ```
 
 ```sh
-cargo test --workspace                 # 478 tests incl. golden byte-parity
+cargo test --workspace                 # 517 tests incl. golden byte-parity
 cargo clippy --workspace --all-targets # clean with -D warnings
 cargo fmt --check
 cargo bench -p quant-core              # throughput benchmarks (needs fixture)
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt + clippy + full test suite + release
-build on Windows and Linux. Golden fixtures are committed and marked binary so
-byte-compare tests are valid on every OS.
+build on Windows, Linux and macOS. Golden fixtures are committed and marked
+binary so byte-compare tests are valid on every OS.
+
+### Benchmarks & the nightly report
+
+- `cargo bench -p quant-core --bench stream_throughput` — GB/s on a ~1 GB
+  generated fixture (`python tools/gen_bench_fixture.py` first).
+- `cargo bench -p quant-core --bench stream_small` — the same full
+  `stream_quantize` path on the **committed** 8 MB fixture
+  (`tests/bench/bench_small.safetensors`, reproducible via
+  `tools/gen_bench_small.py`, SHA-256 self-checked).
+
+A nightly workflow (`.github/workflows/bench.yml`) runs `stream_small` on
+ubuntu, saves a criterion baseline and uploads the full report to the
+`criterion-nightly` workflow artifact (30-day retention). It is an
+**awareness signal, not a merge gate** — shared-runner timing is noisy. To
+read the artifact: download it, open `report/index.html`, and compare
+`change` columns against the previous night's artifact. Local A/B:
+
+```sh
+cargo bench -p quant-core --bench stream_small -- --save-baseline mine
+# ... change code ...
+cargo bench -p quant-core --bench stream_small -- --baseline mine
+```
 
 ### GGUF tooling scripts (`tools/`)
 
