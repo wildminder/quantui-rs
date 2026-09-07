@@ -142,7 +142,7 @@ fn convert_q4_k_m_single_file() {
         method_id: "q4_k_m".into(),
         ..Default::default()
     };
-    let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None)
+    let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None, None)
         .expect("conversion succeeds");
 
     assert_eq!(report.tensors, 12);
@@ -220,7 +220,7 @@ fn convert_f16_is_lossless_for_floats() {
         ..Default::default()
     };
     let report =
-        convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None).unwrap();
+        convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None, None).unwrap();
     assert_eq!(report.method_id, "f16");
 
     let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
@@ -243,7 +243,7 @@ fn rejects_dynamic_and_unknown_methods() {
         method_id: "q4_k_xl".into(),
         ..Default::default()
     };
-    let err = convert_hf_to_gguf(&input, &out, &dyn_cfg, None).unwrap_err();
+    let err = convert_hf_to_gguf(&input, &out, &dyn_cfg, None, None).unwrap_err();
     assert!(matches!(
         err,
         quant_core::gguf_convert::GgufError::DynamicMethod(_)
@@ -253,7 +253,7 @@ fn rejects_dynamic_and_unknown_methods() {
         method_id: "nope".into(),
         ..Default::default()
     };
-    let err = convert_hf_to_gguf(&input, &out, &bad_cfg, None).unwrap_err();
+    let err = convert_hf_to_gguf(&input, &out, &bad_cfg, None, None).unwrap_err();
     assert!(matches!(
         err,
         quant_core::gguf_convert::GgufError::UnknownMethod(_, _)
@@ -278,6 +278,7 @@ fn progress_callback_fires_per_tensor() {
         &out,
         &cfg,
         Some(&mut cb),
+        None,
     )
     .unwrap();
     assert_eq!(calls.len(), 12);
@@ -382,7 +383,8 @@ fn convert_sharded_folder() {
         method_id: "q8_0".into(),
         ..Default::default()
     };
-    let report = convert_hf_to_gguf(&dir, &out, &cfg, None).expect("sharded conversion succeeds");
+    let report =
+        convert_hf_to_gguf(&dir, &out, &cfg, None, None).expect("sharded conversion succeeds");
 
     assert_eq!(report.tensors, 7, "all tensors from both shards");
     assert_eq!(report.arch, "llama");

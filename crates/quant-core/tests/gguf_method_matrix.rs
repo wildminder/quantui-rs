@@ -154,8 +154,14 @@ fn run_conversion(method: &str, dir: &Path) -> (GgufConvertReport, PathBuf) {
         method_id: method.to_string(),
         ..Default::default()
     };
-    let report = convert_hf_to_gguf(dir.join("model.safetensors").as_path(), &out, &cfg, None)
-        .unwrap_or_else(|e| panic!("{method}: conversion failed: {e}"));
+    let report = convert_hf_to_gguf(
+        dir.join("model.safetensors").as_path(),
+        &out,
+        &cfg,
+        None,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{method}: conversion failed: {e}"));
     (report, out)
 }
 

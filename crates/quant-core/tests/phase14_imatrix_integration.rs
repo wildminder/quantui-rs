@@ -126,7 +126,7 @@ fn run_weighted_conversion_case(
         imatrix: Some(build_imatrix(&weights)),
         ..Default::default()
     };
-    let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None)
+    let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None, None)
         .expect("conversion succeeds");
     assert_eq!(report.fallback_f16, 0);
 
@@ -237,7 +237,7 @@ fn conversion_without_imatrix_differs() {
         method_id: "q4_k_s".into(),
         ..Default::default()
     };
-    convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None).unwrap();
+    convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None, None).unwrap();
 
     let f = rlx_gguf::GgufFile::from_path(&out).unwrap();
     let t = f.tensors.get("blk.0.attn_q.weight").unwrap();

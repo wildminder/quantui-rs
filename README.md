@@ -312,6 +312,14 @@ quantui-rs gguf --audit "$f" || echo "$f is spec-violating"
   `tensor_type_fallback` (IQ\*→IQ4_NL, Q2_K/Q3_K/TQ\*→Q4_0, Q4_K→Q5_0,
   Q5_K→Q5_1, Q6_K→Q8_0, else F16) — loudly, with a per-tensor warning and a
   summary. The output is always a spec-conformant GGUF.
+- **Warning rendering**: per-tensor warnings are rendered ABOVE the live
+  progress bar (via indicatif), so the bar stays the last line instead of
+  being re-broken by each warning. On a terminal the first warning of each
+  recurring kind is shown and the repeats are folded into one `note:`
+  line at the end (the full tensor list is in the run summary); piped or
+  `--no-progress` output prints every warning line, byte-identical to
+  historical output. The warning stream (report list + callback) is
+  identical for every `QUANTUI_RS_GGUF_JOBS` setting.
 - **Parallel encoding**: tensor *payloads* are quantized in parallel on a
   rayon pool, in chunks of 8 tensors or 512 MiB of raw input (whichever
   comes first). Everything order-sensitive — name mapping, scheme

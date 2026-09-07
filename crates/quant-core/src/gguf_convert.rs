@@ -182,6 +182,14 @@ pub struct GgufConvertReport {
     /// block-size demotion — the demoted scheme is what actually lands in
     /// the file, so a recipe emitted from it round-trips byte-for-byte.
     pub effective_schemes: Vec<(String, GgufScheme)>,
+    /// Every user-facing warning line produced by the conversion, in file
+    /// order (Phase A resolve warnings precede Phase C encode warnings for
+    /// the SAME tensor). Supersedes the pre-callback `eprintln!`s: the
+    /// caller either consumed them live via `on_warning` or can inspect
+    /// them here without stderr capture. Order is identical for every
+    /// `jobs` setting — per-tensor pairs stay adjacent regardless of
+    /// chunking, unlike the old interleaved stderr stream.
+    pub warnings: Vec<String>,
 }
 
 /// Result of encoding ONE tensor (IMP-004 step 1, the extraction of the
@@ -218,11 +226,19 @@ struct EncodedTensor {
 /// `on_progress`, when provided, is called as `(done, total)` after each
 /// tensor is encoded — the same `(cur, total)` shape the streaming quantizer
 /// uses, so the CLI can drive one progress bar.
+///
+/// `on_warning`, when provided, receives every user-facing warning line in
+/// file order (the resolve-phase line for a tensor precedes its encode-phase
+/// lines). When it is `None` the lines are still collected into
+/// [`GgufConvertReport::warnings`] — nothing is silently dropped, and no
+/// stderr is printed by the core (rendering is the caller's job; the CLI
+/// prints them above the progress bar so the bar stays the last line).
 pub fn convert_hf_to_gguf(
     input: &Path,
     output: &Path,
     cfg: &GgufConvertConfig,
     mut on_progress: Option<&mut dyn FnMut(usize, usize)>,
+    mut on_warning: Option<&mut dyn FnMut(&str)>,
 ) -> Result<GgufConvertReport, GgufError> {
     // 1. Resolve the method (reject unknown, Dynamic 2.0, and no-encoder
     //    up front — Phase 2.1: every rejection names the specific cause).
@@ -313,10 +329,11 @@ pub fn convert_hf_to_gguf(
     //     (ResolvedTensor, cfg) touching no shared mutable state, so the
     //     emitted bytes cannot depend on scheduling. `collect()` into a
     //     `Result<Vec<_>>` preserves chunk order.
-    //   Phase C (this thread, SEQUENTIAL): writer push, warning print,
-    //     report accounting, progress callback — all in file order, so
-    //     stderr, the report and the progress stream are byte-identical
-    //     to the pre-parallelism output.
+    //   Phase C (this thread, SEQUENTIAL): writer push, warning
+    //     collect/callback (file order), report accounting, progress
+    //     callback — all in file order, so the warning stream, the report
+    //     and the progress are byte-identical to the pre-parallelism
+    //     output for any jobs setting.
     //
     // A chunk closes after [PAR_CHUNK_TENSORS] tensors or once it holds
     // [PAR_CHUNK_BYTES] of raw source, which bounds the in-flight f32
@@ -335,6 +352,7 @@ pub fn convert_hf_to_gguf(
     let mut row_fallback = 0usize;
     let mut row_fallback_tensors: Vec<String> = Vec::new();
     let mut effective_schemes: Vec<(String, GgufScheme)> = Vec::new();
+    let mut report_warnings: Vec<String> = Vec::new();
     let mut emitted = 0usize;
     let mut chunk: Vec<ResolvedTensor> = Vec::new();
     let mut chunk_bytes = 0u64;
@@ -382,8 +400,19 @@ pub fn convert_hf_to_gguf(
                 row_fallback_tensors.push(enc.gguf_name.clone());
             }
             effective_schemes.push((enc.gguf_name.clone(), enc.scheme));
+            // Warnings: collect (file order) + live callback. Rendering is
+            // the caller's job — the CLI prints above the progress bar so
+            // the bar stays the last line instead of being re-broken by
+            // each per-tensor line (the warning-spam bug). Per-tensor
+            // pairs stay adjacent regardless of chunk size, so JOBS=1 and
+            // JOBS=8 see the SAME stream — unlike the old interleaved
+            // stderr, which batched resolve-warns then encode-warns per
+            // chunk and therefore differed between modes.
             for line in &enc.warnings {
-                eprintln!("{line}");
+                report_warnings.push(line.clone());
+                if let Some(cb) = on_warning.as_mut() {
+                    cb(line);
+                }
             }
             if enc.weighted_done {
                 quantized += 1;
@@ -428,6 +457,7 @@ pub fn convert_hf_to_gguf(
         fallback_tensors,
         row_fallback,
         row_fallback_tensors,
+        warnings: report_warnings,
         effective_schemes,
     })
 }
@@ -674,12 +704,20 @@ pub fn ggml_blck_size(t: GgmlType) -> usize {
 /// `llama-quantize` therefore NEVER writes a tensor whose `ne[0]` is not
 /// block-aligned.
 ///
-/// Every demotion logs one warning line to stderr — silent degradation is
-/// the bug we are fixing. Upstream `throw`s when no smaller type is
-/// available; we return F16 and say so, because aborting a whole model
-/// conversion over one odd-shaped conv kernel is worse than storing that
-/// tensor unquantized (and matches the Phase 2.3 philosophy).
-fn row_fallback_scheme(name: &str, ne0: usize, target: GgufScheme) -> GgufScheme {
+/// Every demotion records ONE warning line — silent degradation is the
+/// bug we are fixing. Upstream `throw`s when no smaller type is available;
+/// we return F16 and say so, because aborting a whole model conversion
+/// over one odd-shaped conv kernel is worse than storing that tensor
+/// unquantized (and matches the Phase 2.3 philosophy). The line is
+/// PUSHED into `warnings` (byte-identical format to the old `eprintln!`;
+/// tests grep "not divisible by") — the caller renders it, so the CLI can
+/// place it above the progress bar instead of breaking it.
+fn row_fallback_scheme(
+    name: &str,
+    ne0: usize,
+    target: GgufScheme,
+    warnings: &mut Vec<String>,
+) -> GgufScheme {
     let qk_k = ggml_blck_size(scheme_to_ggml(target));
     // Fast path: the row is already block-aligned. Stays silent — a clean
     // conversion must produce NO output (existing tests assert this).
@@ -728,7 +766,7 @@ fn row_fallback_scheme(name: &str, ne0: usize, target: GgufScheme) -> GgufScheme
 
     // Upstream logs ONE line in three parts (:379, :419, :422) — kept as a
     // single line here so per-tensor greps stay 1:1 with tensor count.
-    eprintln!(
+    warnings.push(format!(
         "warning: {name:<36} - ncols {ne0:>6} not divisible by {qk_k:>3} \
          (required for type {tgt:>7}) {unusual}-> falling back to {ret:>7}",
         tgt = scheme_type_name(target),
@@ -738,7 +776,7 @@ fn row_fallback_scheme(name: &str, ne0: usize, target: GgufScheme) -> GgufScheme
             ""
         },
         ret = scheme_type_name(return_type),
-    );
+    ));
 
     return_type
 }
@@ -907,7 +945,7 @@ fn resolve_one_tensor(
     let scheme = if ne0 == 0 {
         scheme
     } else {
-        let demoted = row_fallback_scheme(&gguf_name, ne0, scheme);
+        let demoted = row_fallback_scheme(&gguf_name, ne0, scheme, &mut warnings);
         if demoted != scheme {
             row_demoted = true;
         }

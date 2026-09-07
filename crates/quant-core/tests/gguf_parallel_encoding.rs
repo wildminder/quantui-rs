@@ -168,7 +168,8 @@ fn multi_chunk_output_is_byte_identical_sequential() {
             ..Default::default()
         };
         let report =
-            convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None).unwrap();
+            convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None, None)
+                .unwrap();
         assert_eq!(
             report.tensors, 24,
             "jobs={jobs}: every tensor must be accounted for"
@@ -235,6 +236,7 @@ fn progress_reaches_total_in_both_modes() {
                 &out,
                 &cfg,
                 Some(&mut cb),
+                None,
             )
             .unwrap();
         }

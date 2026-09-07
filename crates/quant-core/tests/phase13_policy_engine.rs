@@ -125,7 +125,7 @@ fn convert(model_dir: &Path, method: &str) -> (GgufConvertReport, PathBuf) {
         method_id: method.to_string(),
         ..Default::default()
     };
-    let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None)
+    let report = convert_hf_to_gguf(&model_dir.join("model.safetensors"), &out, &cfg, None, None)
         .unwrap_or_else(|e| panic!("{method}: conversion failed: {e}"));
     (report, out)
 }

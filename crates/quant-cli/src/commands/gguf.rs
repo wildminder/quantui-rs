@@ -356,9 +356,20 @@ pub fn run(args: GgufArgs) -> ExitCode {
     };
 
     let started = std::time::Instant::now();
+    // Warning-spam fix: both callbacks share ONE sink — progress keeps the
+    // bar moving, warnings render ABOVE the bar (via the same indicatif
+    // instance) instead of re-breaking it. RefCell split-borrow: core
+    // invokes the callbacks strictly sequentially (never reentrant), so
+    // the runtime borrow can never conflict.
+    let sink_cell = std::cell::RefCell::new(&mut sink);
     let result = {
-        let mut cb = |cur: usize, total: usize| sink.update(cur, total);
-        convert_hf_to_gguf(input, &output, &cfg, Some(&mut cb))
+        let mut cb = |cur: usize, total: usize| {
+            sink_cell.borrow_mut().update(cur, total);
+        };
+        let mut wb = |line: &str| {
+            sink_cell.borrow_mut().warn(line);
+        };
+        convert_hf_to_gguf(input, &output, &cfg, Some(&mut cb), Some(&mut wb))
     };
     sink.finish();
 
@@ -391,9 +402,11 @@ pub fn run(args: GgufArgs) -> ExitCode {
             }
 
             // Phase 2.3: a silent F16 degrade is a bug, not a feature. The
-            // per-tensor warnings already went to stderr during conversion;
-            // restate the summary here so it is impossible to miss, without
-            // failing the run (resume semantics — see plan §3-H).
+            // per-tensor warnings were rendered above the progress bar
+            // during conversion (first-of-kind on a live bar, all of them
+            // when piped); this summary restates the full list so it is
+            // impossible to miss, without failing the run (resume
+            // semantics — see plan §3-H).
             // Task #7: --verify-against — oracle equivalence report vs a
             // reference GGUF. Report tool: exit 0 regardless of diffs,
             // UNLESS our own file has spec violations (then exit 3).
@@ -476,11 +489,12 @@ pub fn run(args: GgufArgs) -> ExitCode {
                 );
             }
             // Per-row block-size demotion (port of llama-quantize
-            // `tensor_type_fallback`). The per-tensor warnings already went
-            // to stderr; restate the summary so a model full of odd-shaped
-            // conv kernels is impossible to miss. Distinct wording from the
-            // block above — these tensors ARE quantized (or legally F16),
-            // they just did not get the requested block size.
+            // `tensor_type_fallback`). The per-tensor warnings were
+            // rendered above the progress bar during conversion; this
+            // summary restates the full list so a model full of odd-shaped
+            // conv kernels is impossible to miss. Distinct wording from
+            // the block above — these tensors ARE quantized (or legally
+            // F16), they just did not get the requested block size.
             if report.row_fallback > 0 {
                 eprintln!(
                     "warning: {} of {} tensors had a row width (ne[0]) incompatible with \

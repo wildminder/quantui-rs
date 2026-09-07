@@ -217,7 +217,14 @@ fn round_trip_through_conversion_reproduces_dtypes() {
         recipe: Some(quant_core::gguf_recipe::TensorRecipe::load(&recipe_path).unwrap()),
         ..Default::default()
     };
-    convert_hf_to_gguf(&model_dir.join("model.safetensors"), &pass1, &cfg, None).unwrap();
+    convert_hf_to_gguf(
+        &model_dir.join("model.safetensors"),
+        &pass1,
+        &cfg,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Extract the recipe from pass1's output.
     let extracted = quant_core::gguf_recipe::recipe_from_gguf(&pass1).unwrap();
@@ -232,7 +239,14 @@ fn round_trip_through_conversion_reproduces_dtypes() {
         recipe: Some(extracted),
         ..Default::default()
     };
-    convert_hf_to_gguf(&model_dir.join("model.safetensors"), &pass2, &cfg2, None).unwrap();
+    convert_hf_to_gguf(
+        &model_dir.join("model.safetensors"),
+        &pass2,
+        &cfg2,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Dtype-level comparison: pass1 vs pass2 assignments must be identical.
     let f1 = rlx_gguf::GgufFile::from_path(&pass1).unwrap();

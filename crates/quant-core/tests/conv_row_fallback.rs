@@ -166,8 +166,8 @@ fn run(tensors: &[Tensor], method: &str) -> Outcome {
         method_id: method.into(),
         ..Default::default()
     };
-    let report =
-        convert_hf_to_gguf(&dir.join("model.safetensors"), &out, &cfg, None).expect("conversion");
+    let report = convert_hf_to_gguf(&dir.join("model.safetensors"), &out, &cfg, None, None)
+        .expect("conversion");
     let f = rlx_gguf::GgufFile::from_path(&out).expect("parse output");
     let dtypes = f
         .tensors
