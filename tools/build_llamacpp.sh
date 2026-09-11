@@ -14,12 +14,12 @@
 #   CMAKE      cmake executable to configure the build (default: PATH lookup)
 #   SRC        llama.cpp checkout to build (required, e.g. your local
 #              llama.cpp source; the tree is not vendored in this repo)
-#   BUILD      build dir (default: <LOCAL-BUILD>)
+#   BUILD      build dir (default: $TMPDIR/llamacpp-build)
 # Usage: bash build_llamacpp.sh [target]
 set -e
 
 SRC="${SRC:?set SRC to your llama.cpp checkout}"
-BUILD="${BUILD:-<LOCAL-BUILD>}"
+BUILD="${BUILD:-${TMPDIR:-/tmp}/llamacpp-build}"
 NINJA="${NINJA:-ninja}"
 CMAKE="${CMAKE:-cmake}"
 
