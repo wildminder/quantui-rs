@@ -197,7 +197,7 @@ fn fp8_union_single_mode_structural_and_deterministic() {
 //
 // Reference behavior, confirmed at source:
 //   * INT8 — the quantui REFERENCE streaming quantizer
-//     (`docs/ref/quantui/stream_quant.py`) reads the header RAW
+//     (the reference stream_quant.py) reads the header RAW
 //     (`_resolve_union_header` -> `read_safetensors_header`) and walks `names`
 //     in on-disk order.                                 -> FileOrderAll2D
 //   * FP8 / MXFP8 / NVFP4 — ctq. Every ctq entry point builds its key list

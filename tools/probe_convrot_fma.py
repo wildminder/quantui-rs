@@ -7,7 +7,7 @@ the port must use fused multiply-add (f32::mul_add in Rust), not the
 f64-cribbed double rounding.
 
 Run:
-    CUDA_VISIBLE_DEVICES=-1 <LOCAL-PYTHON> tools/probe_convrot_fma.py
+    CUDA_VISIBLE_DEVICES=-1 python tools/probe_convrot_fma.py
 """
 
 from __future__ import annotations

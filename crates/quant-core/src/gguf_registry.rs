@@ -255,7 +255,7 @@ pub static METHODS: &[RegistryEntry] = &[
             engine: LlamaPolicy::Flat,
         },
     ),
-    // NOTE: the ported reference `docs/ref/quantui/quant_methods.py:131`
+    // NOTE: the ported reference quantui quant_methods.py:131
     // labels q5_1 a "Dynamic 2.0 format", which is why this entry used to be
     // rejected. That is wrong, and per the project's source-of-truth order
     // (official Unsloth > llama.cpp > the quantui reference) it does not
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn registry_matches_reference_method_list() {
-        // Verbatim port of docs/ref/quantui/quant_methods.py METHODS
+        // Verbatim port of the reference quantui quant_methods.py METHODS
         // (ids, labels, dynamic flags, bpw, descriptions, order).
         let expected: &[(&str, &str, bool, Option<f64>, &str)] = &[
             (

@@ -15,13 +15,14 @@ answers "is the DATA recoverable" independent of the layout question.
 
 import json
 import mmap
+import os
 import struct
 import sys
 from pathlib import Path
 
-DEFAULT_GGUF = Path(
-    r"<COMFYUI>/ComfyUI/models/diffusion_models/VibeVoice-1.5B-q8_0.gguf"
-)
+# Path to the q8_0 GGUF to analyze (required; pass it as the first argument
+# or set QUANTUI_PROBE_GGUF). Developed against a VibeVoice-1.5B-q8_0.gguf.
+DEFAULT_GGUF = Path(os.environ.get("QUANTUI_PROBE_GGUF", "model-q8_0.gguf"))
 
 # (name, type_size, block_size) — GGML types present in this file
 GGML_TYPE = {

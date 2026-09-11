@@ -14,8 +14,8 @@
 //! - `use_more_bits(i, n)` (llama-quant.cpp:434),
 //! - model facts the policy consults: `n_gqa`, `n_expert`, `LLM_TYPE_70B`.
 //!
-//! Source: docs/ref/llama.cpp (MIT, "Copyright (c) 2023-2026 The ggml
-//! authors"). Line references below point into that tree.
+//! Source: llama.cpp (MIT, "Copyright (c) 2023-2026 The ggml
+//! authors"). Line references below point into the vendored upstream tree.
 
 use crate::gguf_registry::GgufScheme;
 

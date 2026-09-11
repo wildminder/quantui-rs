@@ -1,10 +1,16 @@
-"""Verify the 102 F16 conv tensors in the FIXED GGUF against the HF source."""
-import json, mmap, struct, sys
+"""Verify the 102 F16 conv tensors in the FIXED GGUF against the HF source.
+
+Usage:
+    python tools/check_fixed_f16.py <fixed.gguf> <hf_model_dir>
+"""
+import json, mmap, os, struct, sys
 from pathlib import Path
 import numpy as np
 
-GGUF = Path(r"<REPO-DIR>/target/vibevoice-1.5b-q8_0-fixed.gguf")
-HF_DIR = Path(r"<COMFYUI>/ComfyUI/models/tts/VibeVoice/VibeVoice-1.5B")
+if len(sys.argv) != 3:
+    sys.exit("usage: check_fixed_f16.py <fixed.gguf> <hf_model_dir>")
+GGUF = Path(sys.argv[1])
+HF_DIR = Path(sys.argv[2])
 
 # --- parse GGUF header (v3) ---
 f = open(GGUF, "rb"); data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)

@@ -1,7 +1,7 @@
 /* Debug harness 2: call the BUILT ggml.dll's ggml_quantize_chunk with
  * our fixture row + weights, byte-compare against the verbatim-C harness.
  * Build (Git Bash + MSVC env, from tools/):
- *   cl /nologo /O2 qp_dll_dbg.c /link ../<LOCAL-BUILD>/bin/ggml.lib
+ *   cl /nologo /O2 qp_dll_dbg.c /link ..<llamacpp-build>/bin/ggml.lib
  * Simpler: load ggml.dll at runtime via LoadLibraryA to avoid lib paths.
  */
 #include <stdio.h>

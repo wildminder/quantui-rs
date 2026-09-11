@@ -7,10 +7,10 @@ fixture that DISCRIMINATES the two, the on-disk (file) order of the 2D
 `.weight` tensors must differ from their sorted-by-name order. That is only
 possible if `save_file` writes the header in dict insertion order.
 
-Run with the ctq venv interpreter (needs torch + safetensors):
+Run with a torch environment that has torch + safetensors:
 
     CUDA_VISIBLE_DEVICES=-1 ^
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools\\probe_st_order.py
+    python tools\\probe_st_order.py
 """
 
 from __future__ import annotations

@@ -130,7 +130,7 @@ pub fn encode_comfy_quant_int8_convrot(orig_dtype: &str, convrot_groupsize: u32)
 /// every INT8 row-wise layer carries it, rotated or not:
 /// * batch driver `fp8_conversion.py:583-594`: `per_row = True` when
 ///   `converter.scaling_mode == "row"`, passed to `create_comfy_quant_tensor`;
-/// * streaming reference `docs/ref/quantui/quantui/tensor_quant.py:252-255`:
+/// * streaming reference (the reference quantui tensor_quant.py:252-255):
 ///   `per_row = scaling == "row"`, passed unconditionally.
 ///
 /// A ConvRot run whose tensor is NOT rotated (in_features not divisible by

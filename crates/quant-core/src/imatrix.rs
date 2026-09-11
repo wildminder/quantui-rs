@@ -2,9 +2,9 @@
 //! llama.cpp's `common/imatrix-loader.cpp` + the derivation half of
 //! `tools/quantize/quantize.cpp::load_imatrix`.
 //!
-//! Unsloth coverage plan Phase 4.1 (spec §3-B2). Source: docs/ref/llama.cpp
+//! Unsloth coverage plan Phase 4.1 (spec §3-B2). Source: llama.cpp
 //! (MIT, "Copyright (c) 2023-2026 The ggml authors"). Line references point
-//! into that tree.
+//! into the vendored upstream tree.
 //!
 //! Two file formats, auto-detected (loader order per imatrix-loader.cpp:82):
 //!

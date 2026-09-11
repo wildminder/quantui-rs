@@ -20,7 +20,7 @@ Mean: cascade_sum (multi_row_sum/row_sum dispatch) then f32 /S.
 Dumps every stage to tools/convrot_probe3/ for the Rust unit tests.
 
 Run:
-    CUDA_VISIBLE_DEVICES=-1 <LOCAL-PYTHON> tools/probe_convrot_chain.py
+    CUDA_VISIBLE_DEVICES=-1 python tools/probe_convrot_chain.py
 """
 
 from __future__ import annotations

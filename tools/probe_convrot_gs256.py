@@ -9,7 +9,7 @@ torch.matmul((M,1,256) f32, (256,256) f32) on CPU eager — candidates:
   d) naive sequential (known mismatch)
 
 Run:
-    CUDA_VISIBLE_DEVICES=-1 <LOCAL-PYTHON> tools/probe_convrot_gs256.py
+    CUDA_VISIBLE_DEVICES=-1 python tools/probe_convrot_gs256.py
 """
 
 from __future__ import annotations

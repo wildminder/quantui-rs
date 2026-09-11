@@ -1,8 +1,8 @@
 //! Weighted GGML quantizers — a port of llama.cpp's `ggml-quants.c`
 //! K-quant paths, for use with an importance matrix (plan Phase 4.3).
 //!
-//! Source: docs/ref/llama.cpp, MIT ("Copyright (c) 2023-2026 The ggml
-//! authors"), upstream tree vendored locally. Line references below point
+//! Source: llama.cpp, MIT ("Copyright (c) 2023-2026 The ggml
+//! authors"), the vendored upstream tree. Line references below point
 //! into `ggml/src/ggml-quants.c` of that tree.
 //!
 //! Scope decision (vertical slices): slice 1 ported the shared

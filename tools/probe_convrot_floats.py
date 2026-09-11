@@ -14,8 +14,8 @@ For each: dump inputs + outputs as raw f32 LE binaries, and print whether
 simple dot-product with f64-accumulated-then-f32-chunks (the oneDNN K-chunk
 scheme used in bias_correction.rs) reproduces torch bit-exactly.
 
-Run with the ctq venv, CUDA hidden:
-    CUDA_VISIBLE_DEVICES=-1 <LOCAL-PYTHON> tools/probe_convrot_floats.py
+Run with the torch environment the goldens were made with, CUDA hidden:
+    CUDA_VISIBLE_DEVICES=-1 python tools/probe_convrot_floats.py
 """
 
 from __future__ import annotations

@@ -16,8 +16,8 @@ B) ``exp_biased = ceil(torch.log2(scale_needed)) + 127``. For x slightly
    Characterize torch CPU log2 around powers of 2 and check whether
    "f64 log2 -> round to f32 -> ceil" is an exact emulator.
 
-Run with the ctq venv interpreter (same torch build that made the goldens):
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/probe_mxfp8_scale.py
+Run with the torch environment the goldens were made with:
+    CUDA_VISIBLE_DEVICES=-1 python tools/probe_mxfp8_scale.py
 """
 
 from __future__ import annotations

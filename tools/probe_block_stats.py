@@ -1,6 +1,17 @@
-"""Distribution of the q8_0 code mismatches: which blocks, what values."""
-import json, mmap, struct
+"""Distribution of the q8_0 code mismatches: which blocks, what values.
+
+Usage:
+    python tools/probe_block_stats.py <original.safetensors> <ours.gguf> <unsloth.gguf>
+
+(developed against a LFM2.5-VL-3B model: ours = quantui-rs output,
+unsloth = the reference encoder's output; any q8_0 GGUF pair works)
+"""
+import json, mmap, struct, sys
 import numpy as np
+
+if len(sys.argv) != 4:
+    sys.exit("usage: probe_block_stats.py <src.safetensors> <ours.gguf> <unsloth.gguf>")
+ST, OURS, UNSLOTH = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def gguf_all(path):
     f = open(path, "rb")
@@ -35,7 +46,6 @@ def gguf_all(path):
     data_start = (pos + 31) // 32 * 32
     return tensors, data_start, mm
 
-ST = "<LOCAL-MODELS>lfm/LFM2.5-VL-3B-original.safetensors"
 TNAME_HF = "model.language_model.layers.0.conv.in_proj.weight"
 f = open(ST, "rb")
 (hlen,) = struct.unpack("<Q", f.read(8))
@@ -58,8 +68,8 @@ def load(path, tname):
     q = raw[:, 2:].astype(np.int8)
     return d, q
 
-d_o, q_o = load("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q8_0-ours.gguf", TNAME_HF)
-d_u, q_u = load("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q8_0-unsloth.gguf", "blk.0.shortconv.in_proj.weight")
+d_o, q_o = load(OURS, TNAME_HF)
+d_u, q_u = load(UNSLOTH, "blk.0.shortconv.in_proj.weight")
 
 # dequantized values
 v_o = q_o.astype(np.float32) * d_o[:, None]

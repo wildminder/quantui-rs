@@ -109,7 +109,7 @@ fn extracted_recipe_carries_format_version_header() {
     assert_eq!(r.rules.len(), 1);
     assert_eq!(r.rules[0].pattern, r"^blk\.0\.attn_q\.weight$");
 
-    // The constant is what the docs/CLI emit; keep it pinned so an
+    // The constant is what the CLI/README document; keep it pinned so an
     // accidental bump is a visible change.
     assert_eq!(quant_core::gguf_recipe::RECIPE_FORMAT_VERSION, "v1");
 

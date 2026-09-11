@@ -16,11 +16,11 @@ The input shards are the COMMITTED fixtures under
 Determinism: pinned calib seed 233983427, CUDA hidden (eager backend), simple
 mode, heur on — identical to ``gen_golden_formats.py``.
 
-Run with the ctq venv interpreter, CUDA hidden:
+Run with a torch environment that has the reference package (ctq), CUDA
+hidden:
 
     CUDA_VISIBLE_DEVICES=-1 \\
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe \\
-        tools/gen_golden_sharded_formats.py
+    python tools/gen_golden_sharded_formats.py
 
 Optional ``--only <fmt> [fmt ...]`` restricts generation to a subset.
 """

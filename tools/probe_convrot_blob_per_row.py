@@ -8,7 +8,7 @@ Run the three configs below over `tests/golden/linear_basic_bf16/input.safetenso
 `.comfy_quant` blob:
 
     CUDA_VISIBLE_DEVICES=-1 \
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/probe_convrot_blob_per_row.py
+    python tools/probe_convrot_blob_per_row.py
 
 Observed output:
 

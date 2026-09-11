@@ -8,8 +8,8 @@ legacy schemes (F16/BF16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1) are byte-identical between
 gguf-py and rlx-gguf; K-quants are NOT (rlx uses a simpler min/max search) and
 are therefore excluded here.
 
-Run with the ctq venv (has gguf + numpy):
-    <LOCAL-PYTHON> tools/gen_golden_gguf.py
+Run with a torch environment that has gguf + numpy:
+    python tools/gen_golden_gguf.py
 
 Output: tests/golden/gguf_quants/
     <case>.f32.bin            raw little-endian f32 input vector

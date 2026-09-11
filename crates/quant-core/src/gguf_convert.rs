@@ -699,7 +699,7 @@ pub fn ggml_blck_size(t: GgmlType) -> usize {
 /// scheme's block size.
 ///
 /// Faithful port of `tensor_type_fallback`
-/// (`docs/ref/llama.cpp/src/llama-quant.cpp:372-425`). Upstream calls it
+/// (llama.cpp llama-quant.cpp:372-425). Upstream calls it
 /// from `llama_tensor_get_type` (:309), i.e. at type-selection time, and
 /// `llama-quantize` therefore NEVER writes a tensor whose `ne[0]` is not
 /// block-aligned.

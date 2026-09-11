@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Phase 11.1 — Python reference throughput harness.
 
-Times the reference streaming quantizer (``docs/ref/quantui/stream_quant.py``)
-on the SAME ~1 GB fixture the Rust criterion bench uses, so the GB/s numbers
-are directly comparable. Run with the ctq venv (needs torch + convert_to_quant):
+Times the reference streaming quantizer (the quantui reference package's
+stream_quant.py) on the SAME ~1 GB fixture the Rust criterion bench uses,
+so the GB/s numbers are directly comparable. Run with a torch environment
+that has the reference package:
 
     python tools/bench_python_ref.py [--runs N]
 
@@ -19,8 +20,13 @@ import sys
 import tempfile
 import time
 
-# Make the reference package importable (Textual-free __init__).
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "docs", "ref"))
+# Make the reference package importable (Textual-free __init__). The
+# reference checkout lives outside the published repo — set QUANTUI_REF_DIR
+# to the folder containing the quantui package before running.
+_REF_DIR = os.environ.get("QUANTUI_REF_DIR")
+if not _REF_DIR:
+    raise SystemExit("set QUANTUI_REF_DIR to your reference quantui checkout")
+sys.path.insert(0, _REF_DIR)
 
 from quantui.stream_quant import stream_quantize  # noqa: E402
 from quantui.tensor_quant import QuantConfig  # noqa: E402

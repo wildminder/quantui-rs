@@ -16,14 +16,20 @@ For each probed tensor:
 
 import json
 import mmap
+import os
 import struct
 import sys
 from pathlib import Path
 
 import numpy as np
 
-GGUF = Path(r"<COMFYUI>/ComfyUI/models/diffusion_models/VibeVoice-1.5B-q8_0.gguf")
-HF = Path(r"<COMFYUI>/ComfyUI/models/tts/VibeVoice/VibeVoice-1.5B")
+# Paths: pass as arguments (GGUF first, then the HF source dir), or set
+# QUANTUI_PROBE_GGUF / QUANTUI_PROBE_HF. Developed against a
+# VibeVoice-1.5B q8_0 GGUF and its HF checkpoint.
+GGUF = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ.get("QUANTUI_PROBE_GGUF", ""))
+HF = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(os.environ.get("QUANTUI_PROBE_HF", ""))
+if not GGUF.is_file() or not HF.is_dir():
+    sys.exit("usage: verify_vibevoice_data.py <quantized.gguf> <hf_model_dir>  (or set QUANTUI_PROBE_GGUF/QUANTUI_PROBE_HF)")
 
 PROBE_TENSORS = [
     "model.semantic_tokenizer.encoder.head.conv.conv.weight",

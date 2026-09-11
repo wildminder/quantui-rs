@@ -1,5 +1,5 @@
 //! Weighted IQ-quantizers — ports of llama.cpp's `quantize_row_iq*_impl`
-//! functions (docs/ref/llama.cpp, MIT; see `ggml_iq_grid` for the lattice
+//! functions (llama.cpp, MIT; see `ggml_iq_grid` for the lattice
 //! infrastructure and `gguf_quants` for the shared K-quant helpers).
 //!
 //! Scope (Unsloth plan Phase 4.3):

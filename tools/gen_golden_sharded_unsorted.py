@@ -46,7 +46,8 @@ Shapes are multiples of 128 rows/cols so every format quantizes them
 
 Formats generated (per shard, CUDA hidden, seed 233983427):
 
-    int8  -> quantui REFERENCE streaming (docs/ref/quantui/stream_quant.py).
+    int8  -> quantui REFERENCE streaming (the reference package's
+             stream_quant.py).
              It reads the header RAW (read_safetensors_header), so it walks
              names in FILE order -> draws zzz(256) first.
     fp8   -> ctq whole-file. ctq builds its key list from safe_open.keys(),
@@ -61,11 +62,11 @@ while fp8/mxfp8/nvfp4 must draw in sorted order. A port that collapsed the two
 orders into a single one mismatches at least one golden, whichever way it
 collapses.
 
-Run with the ctq venv interpreter, CUDA hidden:
+Run with a torch environment that has the reference package, QUANTUI_REF_DIR
+set to your reference quantui checkout, CUDA hidden:
 
     CUDA_VISIBLE_DEVICES=-1 ^
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe ^
-        tools\\gen_golden_sharded_unsorted.py
+    python tools\\gen_golden_sharded_unsorted.py
 
 Optional ``--only <fmt> [fmt ...]`` restricts generation to a subset.
 """
@@ -80,9 +81,11 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 WS_ROOT = os.path.normpath(os.path.join(_HERE, os.pardir))
-# The INT8 goldens come from the reference streaming quantizer, which lives in
-# docs/ref (same path setup as tools/gen_golden.py).
-_REF_DIR = os.path.normpath(os.path.join(WS_ROOT, "docs", "ref"))
+# The INT8 goldens come from the reference streaming quantizer, made
+# importable below (same QUANTUI_REF_DIR setup as tools/gen_golden.py).
+_REF_DIR = os.environ.get("QUANTUI_REF_DIR")
+if not _REF_DIR:
+    raise SystemExit("set QUANTUI_REF_DIR to your reference quantui checkout")
 if _REF_DIR not in sys.path:
     sys.path.insert(0, _REF_DIR)
 

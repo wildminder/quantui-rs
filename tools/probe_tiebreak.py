@@ -3,8 +3,13 @@
 llama.cpp quantize_row_q8_0_ref: q = roundf(x*id)  (half-away-from-zero)
 numpy np.round:                   q = round-half-to-even
 Compare both reconstructions against the actual bytes in each file.
+
+Usage:
+    python tools/probe_tiebreak.py <original.safetensors> <ours.gguf> <unsloth.gguf>
+
+(developed against a LFM2.5-VL-3B model; any q8_0 GGUF pair works)
 """
-import json, mmap, struct
+import json, mmap, struct, sys
 import numpy as np
 
 def gguf_all(path):
@@ -40,7 +45,9 @@ def gguf_all(path):
     data_start = (pos + 31) // 32 * 32
     return tensors, data_start, mm
 
-ST = "<LOCAL-MODELS>lfm/LFM2.5-VL-3B-original.safetensors"
+if len(sys.argv) != 4:
+    sys.exit("usage: probe_tiebreak.py <src.safetensors> <ours.gguf> <unsloth.gguf>")
+ST, OURS, UNSLOTH = sys.argv[1], sys.argv[2], sys.argv[3]
 TNAME_HF = "model.language_model.layers.0.conv.in_proj.weight"
 f = open(ST, "rb")
 (hlen,) = struct.unpack("<Q", f.read(8))
@@ -74,8 +81,8 @@ def q_from(path, tname):
     raw = np.frombuffer(bytes(mm[ds+off:ds+off+(nn//32)*34]), dtype=np.uint8).reshape(nn//32, 34)
     return raw[:, 2:].astype(np.int8)
 
-q_ours = q_from("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q8_0-ours.gguf", TNAME_HF)
-q_uns  = q_from("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q8_0-unsloth.gguf", "blk.0.shortconv.in_proj.weight")
+q_ours = q_from(OURS, TNAME_HF)
+q_uns  = q_from(UNSLOTH, "blk.0.shortconv.in_proj.weight")
 
 print(f"ties (prod ends exactly on .5): {(prod % 1 == 0.5).sum()} / {n}")
 print(f"ours  == rule A (roundf, llama.cpp): {np.array_equal(q_ours, qA)}")

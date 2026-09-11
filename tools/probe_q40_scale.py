@@ -1,5 +1,11 @@
-"""Why do Q4_0 payloads differ? Inspect block scale + nibbles vs source."""
-import json, mmap, struct
+"""Why do Q4_0 payloads differ? Inspect block scale + nibbles vs source.
+
+Usage:
+    python tools/probe_q40_scale.py <original.safetensors> <ours.gguf> <unsloth.gguf>
+
+(developed against a LFM2.5-VL-3B model; any Q4_0 GGUF pair works)
+"""
+import json, mmap, struct, sys
 import numpy as np
 
 def gguf_all(path):
@@ -35,7 +41,9 @@ def gguf_all(path):
     data_start = (pos + 31) // 32 * 32
     return tensors, data_start, mm
 
-ST = "<LOCAL-MODELS>lfm/LFM2.5-VL-3B-original.safetensors"
+if len(sys.argv) != 4:
+    sys.exit("usage: probe_q40_scale.py <src.safetensors> <ours.gguf> <unsloth.gguf>")
+ST, OURS, UNSLOTH = sys.argv[1], sys.argv[2], sys.argv[3]
 TNAME_HF = "model.language_model.layers.0.feed_forward.w1.weight"  # ffn_gate
 f = open(ST, "rb")
 (hlen,) = struct.unpack("<Q", f.read(8))
@@ -61,8 +69,8 @@ def load_q40(path, tname):
     q[:, 16:] = (qs >> 4).astype(np.int8)
     return d, q
 
-d_o, q_o = load_q40("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q4_0-ours.gguf", TNAME_HF)
-d_u, q_u = load_q40("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q4_0-unsloth.gguf", "blk.0.ffn_gate.weight")
+d_o, q_o = load_q40(OURS, TNAME_HF)
+d_u, q_u = load_q40(UNSLOTH, "blk.0.ffn_gate.weight")
 
 print(f"blocks: {nb}")
 dm = (d_o != d_u).sum()

@@ -1,6 +1,6 @@
 """Probe: does ``safetensors.safe_open(...).keys()`` return FILE order?
 
-Answer (verified on this box, safetensors as pinned in the ctq venv):
+Answer (verified against the pinned safetensors the goldens were made with):
 
     NO. ``keys()`` returns the names SORTED ALPHABETICALLY, deterministically,
     regardless of the on-disk header order.
@@ -22,8 +22,8 @@ So ctq's calibration draw order is SORTED-BY-NAME over the 2D ``.weight``
 tensors, for all three ctq formats, in the default (non-low-memory) path.
 
 The quantui reference streaming path is different: it reads the header RAW
-(``docs/ref/quantui/stream_quant.py::_resolve_union_header`` ->
-``read_safetensors_header``) and walks ``names`` in FILE order. INT8's bias
+(the reference stream_quant.py's `_resolve_union_header` ->
+`read_safetensors_header`) and walks ``names`` in FILE order. INT8's bias
 correction comes from that path, so INT8 really is file order.
 
 Consequence for the Rust port: ``Format::calib_order()`` must map
@@ -34,11 +34,11 @@ sorts within each group — see ``tools/probe_st_order.py``) but which is legal
 and does occur. ``tests/golden/sharded_unsorted`` is the discriminating
 fixture.
 
-Run with the ctq venv interpreter:
+Run with a torch environment that has safetensors pinned as the goldens
+were made with:
 
     CUDA_VISIBLE_DEVICES=-1 ^
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe ^
-        tools\\probe_safe_open_keys.py
+    python tools\\probe_safe_open_keys.py
 """
 
 from __future__ import annotations

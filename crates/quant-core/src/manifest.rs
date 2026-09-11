@@ -80,7 +80,7 @@ impl Format {
     /// implementation owns the format's bias correction**:
     ///
     /// * `Int8` — bias correction comes from the quantui reference streaming
-    ///   path (`docs/ref/quantui/stream_quant.py::_build_torch_calibration_cache`),
+    ///   path (the reference stream_quant.py's `_build_torch_calibration_cache`),
     ///   which reads the header RAW (`read_safetensors_header`) and walks
     ///   `names` in **on-disk file order**.
     /// * `Fp8E4m3` / `Mxfp8` / `Nvfp4` — bias correction comes from ctq
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn config_hash_matches_python_reference() {
-        // Vector captured from docs/ref QuantConfig defaults via venv python:
+        // Vector captured from the reference QuantConfig defaults:
         //   QuantConfig().config_hash() == "56920c6553cfa241"
         let c = QuantConfig::default();
         assert_eq!(c.config_hash(), "56920c6553cfa241");

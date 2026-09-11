@@ -1,6 +1,6 @@
 //! quant-core: core library for the quantui-rs CLI.
 //!
-//! Module layout mirrors plan §3 (docs/plans/2026-08-25-quantui-rust-rewrite-plan.md).
+//! Module layout mirrors the rewrite plan §3 (local-only plan document).
 //! All phases have landed (master plan Phases 0-11 + the all-formats plan
 //! Phases A-E), so every module below is fully implemented — nothing is
 //! stubbed or gated behind a phase marker any more.

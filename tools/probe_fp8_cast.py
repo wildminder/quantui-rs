@@ -18,7 +18,10 @@ Coverage (>= 1000 random vectors requirement from plan 3.1):
   * explicit edge list            - +-448, +-464, +-480, +-inf, NaN, +-0,
                                     2^-6, 2^-9, halfway cases
 
-Run with the managed CPU torch interpreter:
+Run with the CPU torch environment (the same build the goldens were made
+with — needs Python 3.13+ math.fma semantics not required here, plain
+torch CPU is enough):
+
     python tools/probe_fp8_cast.py
 """
 

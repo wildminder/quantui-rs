@@ -34,9 +34,9 @@ E2M1 tie points and weight_scale_2 differs by 1 ulp. The CPU/eager goldens are
 the plan's parity target ("NVFP4: nvfp4_converter.py::_quantize_pytorch ...
 All bit-exact portable") and match the gen script's documented CPU intent.
 
-Run with the ctq venv interpreter:
+Run with the torch environment the goldens were made with:
     CUDA_VISIBLE_DEVICES=-1 \\
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/probe_nvfp4.py
+    python tools/probe_nvfp4.py
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ from comfy_kitchen.float_utils import (
     to_blocked,
 )
 
-ROOT = r"<REPO-DIR>\tests\golden"
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "tests", "golden")
 F8_E4M3_MAX = 448.0
 F4_E2M1_MAX = 6.0
 

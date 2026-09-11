@@ -32,10 +32,11 @@ Design notes (parity traps this fixture exercises):
 Determinism: pinned calib seed 233983427, device cpu (CUDA hidden so the
 format modules' hardcoded device fallback lands on CPU), simple mode, heur on.
 
-Run with the ctq venv interpreter, CUDA hidden:
+Run with a torch environment that has the reference package, QUANTUI_REF_DIR
+set to your reference quantui checkout, CUDA hidden:
 
     CUDA_VISIBLE_DEVICES=-1 \\
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/gen_golden_sharded.py
+    python tools/gen_golden_sharded.py
 """
 
 from __future__ import annotations
@@ -47,7 +48,11 @@ import sys
 import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REF_DIR = os.path.normpath(os.path.join(_HERE, os.pardir, "docs", "ref"))
+# The reference checkout lives outside the published repo — set
+# QUANTUI_REF_DIR to the folder containing the quantui package.
+_REF_DIR = os.environ.get("QUANTUI_REF_DIR")
+if not _REF_DIR:
+    raise SystemExit("set QUANTUI_REF_DIR to your reference quantui checkout")
 if _REF_DIR not in sys.path:
     sys.path.insert(0, _REF_DIR)
 

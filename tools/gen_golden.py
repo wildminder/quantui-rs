@@ -1,7 +1,8 @@
 """Golden fixture generator for quantui-rust byte-parity tests (Phase 0.2/0.3).
 
-Runs the REFERENCE Python streaming quantizer (docs/ref/quantui/stream_quant.py,
-torch path, simple mode) over tiny synthetic safetensors models and commits:
+Runs the REFERENCE Python streaming quantizer (the quantui reference
+package's stream_quant.py, torch path, simple mode) over tiny synthetic
+safetensors models and commits:
 
     tests/golden/<case>/input.safetensors
     tests/golden/<case>/output.safetensors
@@ -17,8 +18,10 @@ The script is idempotent (same seed -> same bytes), prints a summary table of
 cases + file sizes + sha256 of each golden output, and exits nonzero if any case
 fails. Cases that cannot run on this machine are recorded in a SKIPPED list.
 
-Run with the project venv interpreter:
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/gen_golden.py
+Run with a Python that has torch + safetensors + numpy installed, and
+QUANTUI_REF_DIR set to your reference quantui checkout:
+
+    python tools/gen_golden.py
 """
 
 from __future__ import annotations
@@ -29,8 +32,12 @@ import os
 import sys
 
 # --- make the reference package importable --------------------------------- #
+# The reference checkout lives outside the published repo — set
+# QUANTUI_REF_DIR to the folder containing the quantui package.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REF_DIR = os.path.normpath(os.path.join(_HERE, os.pardir, "docs", "ref"))
+_REF_DIR = os.environ.get("QUANTUI_REF_DIR")
+if not _REF_DIR:
+    raise SystemExit("set QUANTUI_REF_DIR to your reference quantui checkout")
 if _REF_DIR not in sys.path:
     sys.path.insert(0, _REF_DIR)
 

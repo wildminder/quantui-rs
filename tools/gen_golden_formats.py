@@ -35,13 +35,14 @@ were regenerated with CUDA hidden (``CUDA_VISIBLE_DEVICES=-1``) so the eager
 backend runs — matching this script's documented CPU intent and the plan's
 parity target ("All bit-exact portable" against the eager/PyTorch algorithm).
 
-Run with the ctq venv interpreter, CUDA hidden so the format modules'
+Run with a torch environment that has the reference package, CUDA hidden
+so the format modules'
 ``device = "cuda" if torch.cuda.is_available() else "cpu"`` fallback lands on
 CPU/eager (the modules ignore the ``device="cpu"`` we pass; see
 nvfp4_conversion.py:108):
 
     CUDA_VISIBLE_DEVICES=-1 \\
-    <DEV-TREE>\\Python\\<LOCAL-VENV>\\Scripts\\python.exe tools/gen_golden_formats.py
+    python tools/gen_golden_formats.py
 
 Optional ``--only <fmt> [fmt ...]`` restricts generation to a subset of
 FORMATS (e.g. ``--only nvfp4``).

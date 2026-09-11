@@ -1,5 +1,5 @@
 /* Debug harness: run llama.cpp's make_qkx3_quants + make_qp_quants
- * verbatim (copied from docs/ref/llama.cpp ggml-quants.c) on the same
+ * verbatim (copied from upstream llama.cpp ggml-quants.c) on the same
  * fixture data as the Rust parity test, and print the intermediate
  * scales/mins so the Rust port can be diffed against it.
  *

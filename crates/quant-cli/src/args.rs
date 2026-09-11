@@ -37,7 +37,7 @@ pub enum OrigDtypeArg {
 
 /// Target quantization format. `int8` is the shipped streaming path;
 /// `fp8_e4m3` / `mxfp8` / `nvfp4` are wired into the streaming
-/// orchestrator (plan docs/plans/2026-08-28-all-formats-wiring-plan.md).
+/// orchestrator (the all-formats wiring plan, local-only plan document).
 ///
 /// `int8_convrot` (plan Phase 7.1) is INT8 **row-wise** with a group-wise
 /// Hadamard rotation applied to the weight before quantization, at a FIXED

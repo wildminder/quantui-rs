@@ -1,7 +1,7 @@
 //! Byte-parity tests for the weighted K-quant port (plan Phase 4.3).
 //!
 //! Goldens in tests/golden/llamacpp/ were produced by the REAL
-//! `llama-quantize` (built from docs/ref/llama.cpp by
+//! `llama-quantize` (built from upstream llama.cpp by
 //! tools/build_llamacpp.sh) running Q4_K / Q2_K / Q3_K / Q5_K / Q6_K
 //! with `--imatrix` on a deterministic 2x256 F32 fixture and a matching
 //! imatrix (tools/gen_golden_llamacpp_weighted.py, seeds 42/7).

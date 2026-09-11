@@ -1,37 +1,53 @@
 #!/bin/bash
-# Build llama-quantize from the vendored docs/ref/llama.cpp with MSVC,
+# Build llama-quantize from the vendored upstream llama.cpp tree with MSVC,
 # driven from Git Bash without vcvars (cmd.exe is blocked in this env).
+#
+# The MSVC / Windows SDK locations are machine-specific. Either run from a
+# Visual Studio prompt (vcvarsall sets INCLUDE/LIB), or export these before
+# invoking the script:
+#   MSVC_BIN   path to the MSVC x64 bin dir (hosted cl.exe)
+#   MSVC_INC   path to the MSVC include dir
+#   MSVC_LIB   path to the MSVC x64 lib dir
+#   SDK_INC_UM / SDK_INC_UCRT / SDK_INC_SHARED  Windows Kit include dirs
+#   SDK_LIB_UCRT / SDK_LIB_UM                   Windows Kit lib dirs (x64)
+#   NINJA      ninja executable to drive the build (default: PATH lookup)
+#   CMAKE      cmake executable to configure the build (default: PATH lookup)
+#   SRC        llama.cpp checkout to build (required, e.g. your local
+#              llama.cpp source; the tree is not vendored in this repo)
+#   BUILD      build dir (default: <LOCAL-BUILD>)
 # Usage: bash build_llamacpp.sh [target]
 set -e
 
-MSVC_BIN="<LOCAL-TOOLS>/Dev/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64"
-MSVC_INC="<LOCAL-TOOLS>\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\include"
-SDK_INC_UM="C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\um"
-SDK_INC_UCRT="C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\ucrt"
-SDK_INC_SHARED="C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\shared"
-MSVC_LIB="<LOCAL-TOOLS>\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64"
-SDK_LIB_UCRT="C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\ucrt\\x64"
-SDK_LIB_UM="C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\um\\x64"
+SRC="${SRC:?set SRC to your llama.cpp checkout}"
+BUILD="${BUILD:-<LOCAL-BUILD>}"
+NINJA="${NINJA:-ninja}"
+CMAKE="${CMAKE:-cmake}"
 
-export INCLUDE="$MSVC_INC;$SDK_INC_UCRT;$SDK_INC_UM;$SDK_INC_SHARED"
-export LIB="$MSVC_LIB;$SDK_LIB_UCRT;$SDK_LIB_UM"
-export PATH="/c/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64:$MSVC_BIN:$PATH"
+MSVC_BIN="${MSVC_BIN:?set MSVC_BIN or run from a VS prompt}"
+MSVC_INC="${MSVC_INC:?set MSVC_INC or run from a VS prompt}"
+SDK_INC_UM="${SDK_INC_UM:?set SDK_INC_UM or run from a VS prompt}"
+SDK_INC_UCRT="${SDK_INC_UCRT:?set SDK_INC_UCRT or run from a VS prompt}"
+SDK_INC_SHARED="${SDK_INC_SHARED:?set SDK_INC_SHARED or run from a VS prompt}"
+MSVC_LIB="${MSVC_LIB:?set MSVC_LIB or run from a VS prompt}"
+SDK_LIB_UCRT="${SDK_LIB_UCRT:?set SDK_LIB_UCRT or run from a VS prompt}"
+SDK_LIB_UM="${SDK_LIB_UM:?set SDK_LIB_UM or run from a VS prompt}"
+
+# cl.exe wants Windows-style (backslash) include/lib path lists. Accept
+# either /c/... or C:/... style inputs and normalize to C:\...\;C:\...
+wpath() { sed -e 's|^/\([a-zA-Z]\)/|\1:/|' -e 's|/|\\|g' <<<"$1"; }
+export INCLUDE="$(wpath "$MSVC_INC");$(wpath "$SDK_INC_UCRT");$(wpath "$SDK_INC_UM");$(wpath "$SDK_INC_SHARED")"
+export LIB="$(wpath "$MSVC_LIB");$(wpath "$SDK_LIB_UCRT");$(wpath "$SDK_LIB_UM")"
+export PATH="$MSVC_BIN:$PATH"
 export CC=cl
 export CXX=cl
 export CMAKE_GENERATOR=Ninja
-
-SRC="<REPO-DIR>/docs/ref/llama.cpp"
-BUILD="<LOCAL-BUILD>"
-CMAKE="<LOCAL-TOOLS>/Dev/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
-NINJA="${NINJA:-ninja}"
-NINJA_W="${NINJA_W:-ninja}"
 
 mkdir -p "$BUILD"
 cd "$BUILD"
 
 if [ ! -f build.ninja ]; then
   "$CMAKE" "$SRC" -G Ninja \
-    -DCMAKE_MAKE_PROGRAM="$NINJA_W" \
+    -DCMAKE_MAKE_PROGRAM="$NINJA" \
     -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \

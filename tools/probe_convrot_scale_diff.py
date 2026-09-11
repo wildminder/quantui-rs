@@ -10,7 +10,7 @@ The parity test shows head.weight_scale differing at BOTH group sizes, and
 every corrected bias differing too. int8 weight payloads PASS everywhere.
 
 Run:
-    CUDA_VISIBLE_DEVICES=-1 <LOCAL-PYTHON> tools/probe_convrot_scale_diff.py
+    CUDA_VISIBLE_DEVICES=-1 python tools/probe_convrot_scale_diff.py
 """
 
 from __future__ import annotations

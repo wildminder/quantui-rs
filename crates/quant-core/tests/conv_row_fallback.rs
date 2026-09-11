@@ -10,7 +10,7 @@
 //! 4/7/8/10/16), none divisible by Q8_0's block size 32.
 //!
 //! The fix ports llama-quantize's `tensor_type_fallback`
-//! (`docs/ref/llama.cpp/src/llama-quant.cpp:372-425`), which upstream calls
+//! (llama.cpp llama-quant.cpp:372-425), which upstream calls
 //! from `llama_tensor_get_type` (:309) at TYPE-SELECTION time.
 //!
 //! These tests pin the observable contract:

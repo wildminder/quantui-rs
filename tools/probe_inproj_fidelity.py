@@ -2,6 +2,11 @@
 
 Load the original BF16 tensor, dequantize both GGUF encodings, compare
 per-block scales and reconstruction error vs source.
+
+Usage:
+    python tools/probe_inproj_fidelity.py <original.safetensors> <ours.gguf> <unsloth.gguf>
+
+(developed against a LFM2.5-VL-3B model; any q8_0 GGUF pair works)
 """
 import json, mmap, struct, sys
 import numpy as np
@@ -39,7 +44,9 @@ def gguf_all(path):
     data_start = (pos + 31) // 32 * 32
     return tensors, data_start, mm
 
-ST = "<LOCAL-MODELS>lfm/LFM2.5-VL-3B-original.safetensors"
+if len(sys.argv) != 4:
+    sys.exit("usage: probe_inproj_fidelity.py <src.safetensors> <ours.gguf> <unsloth.gguf>")
+ST, OURS, UNSLOTH = sys.argv[1], sys.argv[2], sys.argv[3]
 TNAME_HF = "model.language_model.layers.0.conv.in_proj.weight"
 
 # load source
@@ -63,8 +70,8 @@ def load_q80(path, tname):
     q = raw[:, 2:].astype(np.int8)
     return d, q, dims
 
-d_o, q_o, dims_o = load_q80("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q8_0-ours.gguf", "model.language_model.layers.0.conv.in_proj.weight")
-d_u, q_u, _ = load_q80("<LOCAL-MODELS>lfm/LFM2.5-VL-3B-Q8_0-unsloth.gguf", "blk.0.shortconv.in_proj.weight")
+d_o, q_o, dims_o = load_q80(OURS, "model.language_model.layers.0.conv.in_proj.weight")
+d_u, q_u, _ = load_q80(UNSLOTH, "blk.0.shortconv.in_proj.weight")
 
 nb = 6144 * 2048 // 32
 print(f"blocks: {nb}")

@@ -762,8 +762,9 @@ crates/quant-core/     library: safetensors IO, INT8/FP8/MXFP8/NVFP4 kernels,
                        gguf_verify (oracle report), gguf_recipe (per-tensor recipes)
 crates/quant-cli/      binary `quantui-rs`: clap CLI, progress, profiles
 tests/golden/          Python/torch-generated golden fixtures (byte-parity refs)
-tools/                 golden + benchmark generators, GGUF diagnostics (Python, ctq venv)
-docs/plans/            design plans + execution log (local-only, not git-tracked)
+tools/                 golden + benchmark generators, GGUF diagnostics
+                       (Python; needs torch + the reference quantizer)
+design docs           design plans + execution log (kept outside the published repo)
 ```
 
 ```sh

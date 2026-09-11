@@ -6,7 +6,8 @@ on an in-memory 4096x4096 weight — no file I/O, no manifest, no writer. This i
 the compute-only counterpart of the Rust ``quantize_int8_kernel`` criterion bench,
 isolating the CPU-bound quantization math the plan's >=5x target refers to.
 
-Run with the ctq venv:  python tools/bench_python_kernel.py [--runs N]
+Run with a torch environment that has the reference package:
+  python tools/bench_python_kernel.py [--runs N]
 """
 
 from __future__ import annotations
@@ -17,7 +18,13 @@ import statistics
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "docs", "ref"))
+# Make the reference package importable. The reference checkout lives
+# outside the published repo — set QUANTUI_REF_DIR to the folder containing
+# the quantui package before running.
+_REF_DIR = os.environ.get("QUANTUI_REF_DIR")
+if not _REF_DIR:
+    raise SystemExit("set QUANTUI_REF_DIR to your reference quantui checkout")
+sys.path.insert(0, _REF_DIR)
 
 import torch  # noqa: E402
 
