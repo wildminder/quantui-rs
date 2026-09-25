@@ -6,5 +6,6 @@
 *.safetensors binary
 *.gguf binary
 *.bin binary
+*.f32 binary
 *.pt binary
 *.npz binary

@@ -2,8 +2,11 @@
 name = "quant-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Core library: safetensors IO, INT8/FP8/MXFP8/NVFP4 quantization kernels, manifests"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [lints]
 workspace = true

@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Phase 11.3: full regression + golden byte-parity on Windows, Linux and
 # macOS (WP9 / NTH-002). The golden fixtures (tests/golden/**) are committed
 # and marked binary in .gitattributes so byte-compare parity tests are valid
@@ -19,7 +26,19 @@ on:
 #     mechanism; the core cancel path is covered in-process on every OS.
 #   - tests build paths with PathBuf::join, no hardcoded separators.
 jobs:
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+      - name: Check workspace against the declared MSRV
+        run: cargo check --workspace --all-targets --locked
+
   test:
+    needs: msrv
     strategy:
       fail-fast: false
       matrix:
@@ -33,11 +52,18 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test (incl. golden byte-parity)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Release build
-        run: cargo build --release
+        run: cargo build --release --locked
+      - name: GGUF end-to-end method sweep
+        # Converts a tiny generated fixture with EVERY usable GGUF method and
+        # validates each result (expected: passed: 49  failed: 0). The fixture
+        # generator is pure stdlib Python, so no extra setup is needed.
+        run: |
+          python tools/gen_sweep_fixture.py
+          bash tools/sweep_gguf_e2e.sh
       - name: Report release binary size
         shell: bash
         run: |

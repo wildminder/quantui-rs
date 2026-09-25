@@ -5,6 +5,10 @@ members = ["crates/quant-core", "crates/quant-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/wildminder/quantui-rs"
+homepage = "https://github.com/wildminder/quantui-rs"
 
 [profile.release]
 lto = true

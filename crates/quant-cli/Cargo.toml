@@ -2,8 +2,11 @@
 name = "quant-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "quantui-rs: standalone CLI for safetensors -> ComfyUI/GGUF quantization"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [lints]
 workspace = true
@@ -13,7 +16,7 @@ name = "quantui-rs"
 path = "src/main.rs"
 
 [dependencies]
-quant-core = { path = "../quant-core" }
+quant-core = { version = "0.1.0", path = "../quant-core" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 indicatif = "0.18.6"

@@ -20,6 +20,9 @@ on:
     - cron: "0 3 * * *" # 03:00 UTC daily
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -27,10 +30,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Bench (save nightly baseline)
-        run: cargo bench -p quant-core --bench stream_small -- --save-baseline nightly
+        run: cargo bench -p quant-core --bench stream_small --locked -- --save-baseline nightly
       - name: Bench (self-comparison against the baseline just saved)
         # Proves the baseline mechanism works; same-run variance must be ~0.
-        run: cargo bench -p quant-core --bench stream_small -- --baseline nightly
+        run: cargo bench -p quant-core --bench stream_small --locked -- --baseline nightly
       - name: Upload criterion report
         uses: actions/upload-artifact@v4
         with:

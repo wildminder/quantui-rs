@@ -732,6 +732,15 @@ conv kernels (row widths 4/7/8/10/16) are demoted to F16 with loud warnings
 - W4A4/W4A8 layouts are deferred to v2. mmproj extraction (separating the
   vision tower into its own GGUF) is not performed — multimodal tensors stay
   in the main file under their original names.
+- **The output is a weight-tensor container, not a standalone
+  inference-loadable model.** No `tokenizer.ggml.*` keys are written, so
+  `llama.cpp` cannot load these files directly — the consuming runtime
+  (e.g. a ComfyUI loader) supplies the vocabulary. This matches the
+  reference implementation's native writer; the Unsloth path gets tokenizer
+  metadata only because it delegates to llama.cpp's own converter.
+- `general.file_type` and `general.quantization_version` are not written.
+  Downstream tooling falls back to inferring the quantization from tensor
+  shapes.
 
 ---
 

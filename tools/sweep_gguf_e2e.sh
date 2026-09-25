@@ -13,7 +13,15 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-BIN="${BIN:-./target/release/quantui-rs.exe}"
+# Portable default: the release binary is `.exe` on Windows and extensionless
+# elsewhere. Callers can still override with BIN=... (see CONTRIBUTING.md).
+if [ -z "${BIN:-}" ]; then
+  if [ -x "./target/release/quantui-rs.exe" ]; then
+    BIN="./target/release/quantui-rs.exe"
+  else
+    BIN="./target/release/quantui-rs"
+  fi
+fi
 MODEL="tools/sweep_e2e/model"
 IMATRIX="tools/sweep_e2e/imatrix.dat"
 OUT="tools/sweep_e2e/out"
