@@ -1,0 +1,169 @@
+{
+  "schema": "t27-conformance/v0.1",
+  "format": "BFLOAT16",
+  "format_notes": "1s8e7m, bias 127, same exponent range as fp32 (top 16 bits of fp32). HAS inf and NaN. Decode exact into f64.",
+  "ssot": "https://github.com/gHashTag/t27/blob/master/conformance/FORMAT-SPEC-001.json",
+  "preprint": "https://arxiv.org/abs/2606.05017",
+  "anchor_identity": "phi^2 + 1/phi^2 = 3",
+  "anchor_check": {
+    "value": 3.0,
+    "expected": 3.0,
+    "ieee754_exact": true,
+    "bf16_bits_hex": "0x4040"
+  },
+  "issue_6252_note": "Rounding-error accumulation in depth-31 fused trees. The all-close gap comes from accumulation ORDER, not single-op rounding. The golden_accumulation section gives an f64 golden reference plus sequential vs pairwise bf16 reductions; pairwise reduces the accumulated error. A reproducible all-close test needs (a) a clamped deterministic input set and (b) an f64 golden, both supplied here.",
+  "round_trip_policy": "decode: bf16 bits -> f64 exact. encode: fp32->bf16 round-nearest-ties-even on the 16-bit truncation boundary. abs_error is nonzero only for inputs not representable in bf16 (e.g. 0.1) -- stated honestly, not hidden.",
+  "n_vectors": 8,
+  "vectors": [
+    {
+      "name": "pos_zero",
+      "input_f64": 0.0,
+      "input_f64_hex": "0x0000000000000000",
+      "bf16_bits_hex": "0x0000",
+      "bf16_bits_int": 0,
+      "decoded_f64": 0.0,
+      "decoded_f64_hex": "0x0000000000000000",
+      "abs_error": 0.0,
+      "category": "zero"
+    },
+    {
+      "name": "pos_one",
+      "input_f64": 1.0,
+      "input_f64_hex": "0x3FF0000000000000",
+      "bf16_bits_hex": "0x3F80",
+      "bf16_bits_int": 16256,
+      "decoded_f64": 1.0,
+      "decoded_f64_hex": "0x3FF0000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_one",
+      "input_f64": -1.0,
+      "input_f64_hex": "0xBFF0000000000000",
+      "bf16_bits_hex": "0xBF80",
+      "bf16_bits_int": 49024,
+      "decoded_f64": -1.0,
+      "decoded_f64_hex": "0xBFF0000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_two",
+      "input_f64": 2.0,
+      "input_f64_hex": "0x4000000000000000",
+      "bf16_bits_hex": "0x4000",
+      "bf16_bits_int": 16384,
+      "decoded_f64": 2.0,
+      "decoded_f64_hex": "0x4000000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_three",
+      "input_f64": 3.0,
+      "input_f64_hex": "0x4008000000000000",
+      "bf16_bits_hex": "0x4040",
+      "bf16_bits_int": 16448,
+      "decoded_f64": 3.0,
+      "decoded_f64_hex": "0x4008000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_half",
+      "input_f64": 0.5,
+      "input_f64_hex": "0x3FE0000000000000",
+      "bf16_bits_hex": "0x3F00",
+      "bf16_bits_int": 16128,
+      "decoded_f64": 0.5,
+      "decoded_f64_hex": "0x3FE0000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_quarter",
+      "input_f64": 0.25,
+      "input_f64_hex": "0x3FD0000000000000",
+      "bf16_bits_hex": "0x3E80",
+      "bf16_bits_int": 16000,
+      "decoded_f64": 0.25,
+      "decoded_f64_hex": "0x3FD0000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_0p1",
+      "input_f64": 0.1,
+      "input_f64_hex": "0x3FB999999999999A",
+      "bf16_bits_hex": "0x3DCD",
+      "bf16_bits_int": 15821,
+      "decoded_f64": 0.10009765625,
+      "decoded_f64_hex": "0x3FB9A00000000000",
+      "abs_error": 9.765624999999445e-05,
+      "category": "normal"
+    }
+  ],
+  "golden_accumulation": [
+    {
+      "element_f64": 0.1,
+      "element_f64_hex": "0x3FB999999999999A",
+      "element_bf16_hex": "0x3DCD",
+      "n_terms": 1024,
+      "golden_f64": 102.4,
+      "golden_f64_hex": "0x405999999999999A",
+      "sequential_bf16": 32.0,
+      "pairwise_bf16": 102.5,
+      "abs_err_sequential": 70.4,
+      "abs_err_pairwise": 0.09999999999999432,
+      "rel_err_sequential": 0.6875,
+      "rel_err_pairwise": 0.0009765624999999445,
+      "pairwise_better": true
+    },
+    {
+      "element_f64": 3.0,
+      "element_f64_hex": "0x4008000000000000",
+      "element_bf16_hex": "0x4040",
+      "n_terms": 1024,
+      "golden_f64": 3072.0,
+      "golden_f64_hex": "0x40A8000000000000",
+      "sequential_bf16": 1024.0,
+      "pairwise_bf16": 3072.0,
+      "abs_err_sequential": 2048.0,
+      "abs_err_pairwise": 0.0,
+      "rel_err_sequential": 0.6666666666666666,
+      "rel_err_pairwise": 0.0,
+      "pairwise_better": true
+    },
+    {
+      "element_f64": 0.1,
+      "element_f64_hex": "0x3FB999999999999A",
+      "element_bf16_hex": "0x3DCD",
+      "n_terms": 4096,
+      "golden_f64": 409.6,
+      "golden_f64_hex": "0x407999999999999A",
+      "sequential_bf16": 32.0,
+      "pairwise_bf16": 410.0,
+      "abs_err_sequential": 377.6,
+      "abs_err_pairwise": 0.39999999999997726,
+      "rel_err_sequential": 0.921875,
+      "rel_err_pairwise": 0.0009765624999999445,
+      "pairwise_better": true
+    },
+    {
+      "element_f64": 0.3333333333333333,
+      "element_f64_hex": "0x3FD5555555555555",
+      "element_bf16_hex": "0x3EAB",
+      "n_terms": 2048,
+      "golden_f64": 682.6666666666666,
+      "golden_f64_hex": "0x4085555555555555",
+      "sequential_bf16": 128.0,
+      "pairwise_bf16": 684.0,
+      "abs_err_sequential": 554.6666666666666,
+      "abs_err_pairwise": 1.3333333333333712,
+      "rel_err_sequential": 0.8125,
+      "rel_err_pairwise": 0.0019531250000000555,
+      "pairwise_better": true
+    }
+  ]
+}

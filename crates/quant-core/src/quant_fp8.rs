@@ -27,6 +27,48 @@ use rayon::prelude::*;
 use crate::dtype::{f32_to_fp8_e4m3_bits, fp8_e4m3_bits_to_f32};
 
 /// FP8 max finite value (torch.finfo(float8_e4m3fn).max).
+///
+/// OVERFLOW POLICY — `SatMax`, and it is a deliberate, pinned choice.
+///
+/// `float8_e4m3fn` has no infinity and reserves two codes for NaN, so *some*
+/// rule must decide what a finite value above the range becomes. We implement
+/// **`SatMax`**: any finite `|x| > 448.0` (and `±inf`) encodes as `0x7E` /
+/// `0xFE` = `±448.0`, the largest finite value. The alternative used by
+/// `ml_dtypes` (and therefore by JAX) is **`OvfNaN`**: overflow encodes as
+/// `0x7F` / `0xFF` = NaN, reserving `0x7E` for representable values only.
+///
+/// Both are legal under OCP MX v1.0, which specifies the field layout and
+/// block scale but leaves the overflow rule to the implementation. **Ours
+/// matches `float8_e4m3fn`**, which is what torch, comfy-kitchen and
+/// llama.cpp all use — so `SatMax` is the correct choice *for byte-exact
+/// parity with those references*, which is this crate's governing contract.
+/// Switching to `OvfNaN` to agree with JAX would be a behavioural change to
+/// every encode path, not a test fix.
+///
+/// The enforcing test is `golden_ruler_fp8_e4m3_overflow_policy_is_satmax`.
+///
+/// ⚠️ It is NOT the conformance pack. Every input the packs assert is IN RANGE
+/// — the `e4m3fn` pack's 14 vectors and the `mxfp8` pack's 254 shared codes
+/// both top out at exactly 448.0 — so the pack-derived tests are
+/// policy-INDEPENDENT and stay green under `OvfNaN`. Verified by mutation:
+/// flipping this encoder to `OvfNaN` leaves all 7 pack-derived tests passing.
+/// The overflow-policy test's inputs come from the `float8_e4m3fn` *spec*,
+/// not from the pack.
+///
+/// `golden_ruler_fp8_e4m3_vectors` and
+/// `golden_ruler_mxfp8_variant_codes_are_the_documented_exception` enforce the
+/// in-range encoding and the 2-code variant split respectively — a different
+/// (also load-bearing) claim.
+///
+/// The 2-code variant split is PINNED, not accidental. The 256-vector MXFP8
+/// conformance pack tabulates the *OCP MX element* E4M3 variant, which is
+/// finite-only (max finite 480.0, `0x7F` → `+480.0`, no NaN encoding at all).
+/// We implement `e4m3fn` (max finite 448.0, `0x7F` → NaN). Enumerating the
+/// full code space shows **exactly 2 of 256 codes differ** — `0x7F` and
+/// `0xFF`, precisely the two `e4m3fn` reserves for NaN. The other 254 agree
+/// bit-for-bit in both directions and are asserted exhaustively. That split is
+/// recorded as an asserted divergence so it cannot drift into an accident;
+/// see `docs/plans/2026-09-26-tier1-conformance-hardening.md` §2.1.
 pub const FP8_MAX: f32 = 448.0;
 /// clamp_min floor used by the reference before dividing.
 const CLAMP_MIN: f32 = 1e-12;

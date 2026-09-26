@@ -1,0 +1,196 @@
+{
+  "schema": "t27-conformance/v0.1",
+  "format": "MXFP4_E2M1",
+  "format_notes": "OCP Microscaling element format. 1s2e1m, bias 1, 16 codes, no inf, no NaN. Value grid +/-{0,0.5,1.0,1.5,2.0,3.0,4.0,6.0}. Max finite 6.0 at bits 0x7.",
+  "ssot": "https://github.com/gHashTag/t27/blob/master/conformance/FORMAT-SPEC-001.json",
+  "preprint": "https://arxiv.org/abs/2606.05017",
+  "anchor_identity": "phi^2 + 1/phi^2 = 3",
+  "anchor_check": {
+    "value": 3.0,
+    "expected": 3.0,
+    "ieee754_exact": true,
+    "mxfp4_bits_hex": "0x5"
+  },
+  "clamp_note": "tt-mlir#7085 clamps to +/-7. E2M1 max finite is 6.0; 7.0 is NOT a grid point. A clamp bound of 7 sits one step above the format max, so values in (6,7] still round to the 6.0 grid point under round-nearest. The clamp bound and the representable max are not the same number -- this enumeration makes that explicit.",
+  "round_trip_policy": "decode: exact bits->f64 (all 16 codes, abs_error 0). encode: round-nearest-ties-even onto the 8-magnitude grid; there is no inf/NaN, so out-of-range maps to nearest finite grid point (+/-6.0).",
+  "n_vectors": 16,
+  "max_finite": 6.0,
+  "vectors": [
+    {
+      "name": "pos_zero",
+      "input_f64": 0.0,
+      "input_f64_hex": "0x0000000000000000",
+      "mxfp4_bits_hex": "0x0",
+      "mxfp4_bits_int": 0,
+      "decoded_f64": 0.0,
+      "decoded_f64_hex": "0x0000000000000000",
+      "abs_error": 0.0,
+      "category": "zero"
+    },
+    {
+      "name": "pos_half",
+      "input_f64": 0.5,
+      "input_f64_hex": "0x3FE0000000000000",
+      "mxfp4_bits_hex": "0x1",
+      "mxfp4_bits_int": 1,
+      "decoded_f64": 0.5,
+      "decoded_f64_hex": "0x3FE0000000000000",
+      "abs_error": 0.0,
+      "category": "subnormal"
+    },
+    {
+      "name": "pos_one",
+      "input_f64": 1.0,
+      "input_f64_hex": "0x3FF0000000000000",
+      "mxfp4_bits_hex": "0x2",
+      "mxfp4_bits_int": 2,
+      "decoded_f64": 1.0,
+      "decoded_f64_hex": "0x3FF0000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_onehalf",
+      "input_f64": 1.5,
+      "input_f64_hex": "0x3FF8000000000000",
+      "mxfp4_bits_hex": "0x3",
+      "mxfp4_bits_int": 3,
+      "decoded_f64": 1.5,
+      "decoded_f64_hex": "0x3FF8000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_two",
+      "input_f64": 2.0,
+      "input_f64_hex": "0x4000000000000000",
+      "mxfp4_bits_hex": "0x4",
+      "mxfp4_bits_int": 4,
+      "decoded_f64": 2.0,
+      "decoded_f64_hex": "0x4000000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_three",
+      "input_f64": 3.0,
+      "input_f64_hex": "0x4008000000000000",
+      "mxfp4_bits_hex": "0x5",
+      "mxfp4_bits_int": 5,
+      "decoded_f64": 3.0,
+      "decoded_f64_hex": "0x4008000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_four",
+      "input_f64": 4.0,
+      "input_f64_hex": "0x4010000000000000",
+      "mxfp4_bits_hex": "0x6",
+      "mxfp4_bits_int": 6,
+      "decoded_f64": 4.0,
+      "decoded_f64_hex": "0x4010000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "pos_six",
+      "input_f64": 6.0,
+      "input_f64_hex": "0x4018000000000000",
+      "mxfp4_bits_hex": "0x7",
+      "mxfp4_bits_int": 7,
+      "decoded_f64": 6.0,
+      "decoded_f64_hex": "0x4018000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_zero",
+      "input_f64": -0.0,
+      "input_f64_hex": "0x8000000000000000",
+      "mxfp4_bits_hex": "0x8",
+      "mxfp4_bits_int": 8,
+      "decoded_f64": -0.0,
+      "decoded_f64_hex": "0x8000000000000000",
+      "abs_error": 0.0,
+      "category": "zero"
+    },
+    {
+      "name": "neg_half",
+      "input_f64": -0.5,
+      "input_f64_hex": "0xBFE0000000000000",
+      "mxfp4_bits_hex": "0x9",
+      "mxfp4_bits_int": 9,
+      "decoded_f64": -0.5,
+      "decoded_f64_hex": "0xBFE0000000000000",
+      "abs_error": 0.0,
+      "category": "subnormal"
+    },
+    {
+      "name": "neg_one",
+      "input_f64": -1.0,
+      "input_f64_hex": "0xBFF0000000000000",
+      "mxfp4_bits_hex": "0xA",
+      "mxfp4_bits_int": 10,
+      "decoded_f64": -1.0,
+      "decoded_f64_hex": "0xBFF0000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_onehalf",
+      "input_f64": -1.5,
+      "input_f64_hex": "0xBFF8000000000000",
+      "mxfp4_bits_hex": "0xB",
+      "mxfp4_bits_int": 11,
+      "decoded_f64": -1.5,
+      "decoded_f64_hex": "0xBFF8000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_two",
+      "input_f64": -2.0,
+      "input_f64_hex": "0xC000000000000000",
+      "mxfp4_bits_hex": "0xC",
+      "mxfp4_bits_int": 12,
+      "decoded_f64": -2.0,
+      "decoded_f64_hex": "0xC000000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_three",
+      "input_f64": -3.0,
+      "input_f64_hex": "0xC008000000000000",
+      "mxfp4_bits_hex": "0xD",
+      "mxfp4_bits_int": 13,
+      "decoded_f64": -3.0,
+      "decoded_f64_hex": "0xC008000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_four",
+      "input_f64": -4.0,
+      "input_f64_hex": "0xC010000000000000",
+      "mxfp4_bits_hex": "0xE",
+      "mxfp4_bits_int": 14,
+      "decoded_f64": -4.0,
+      "decoded_f64_hex": "0xC010000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    },
+    {
+      "name": "neg_six",
+      "input_f64": -6.0,
+      "input_f64_hex": "0xC018000000000000",
+      "mxfp4_bits_hex": "0xF",
+      "mxfp4_bits_int": 15,
+      "decoded_f64": -6.0,
+      "decoded_f64_hex": "0xC018000000000000",
+      "abs_error": 0.0,
+      "category": "normal"
+    }
+  ]
+}

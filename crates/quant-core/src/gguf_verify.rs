@@ -14,6 +14,10 @@
 //!    - [`DiffKind::ScaleRuleDiff`] — same idea, different block scale
 //!      (e.g. unsloth's MSE-tuned Q4_0 scale vs llama.cpp's max/-8).
 //!      Reconstruction error differs but stays bounded and small.
+//!    - [`DiffKind::FormatConformance`] — the two sides disagree only about
+//!      how a value OUT OF RANGE is represented (saturate vs NaN-encode),
+//!      which is a legal policy choice under the MX spec rather than a
+//!      math disagreement. Reconstruction stays within tolerance.
 //!    - [`DiffKind::GenuineDivergence`] — same scale, differing codes,
 //!      reconstruction differs beyond a tiny epsilon. The quantizers
 //!      DISAGREE on the math — this is a bug signal.
@@ -37,6 +41,16 @@ pub enum DiffKind {
     ScaleRuleDiff,
     /// Same scale, differing codes, reconstruction differs. Real divergence.
     GenuineDivergence,
+    /// The differing payload bytes are confined to codes that are
+    /// NaN-vs-finite representations of the same nominal value on the two
+    /// sides, and the reconstruction error stays within tolerance. This is a
+    /// *format policy* difference (e.g. E4M3 `SatMax` vs `OvfNaN` overflow),
+    /// not a math disagreement — so it must not be reported as a bug.
+    ///
+    /// Deliberately conservative: a mis-classification that hides a real bug is
+    /// worse than a false alarm, so every other case stays
+    /// [`GenuineDivergence`](Self::GenuineDivergence).
+    FormatConformance,
 }
 
 /// One differing tensor in the report.
@@ -331,8 +345,82 @@ fn classify(t: &rlx_gguf::GgufTensor, ob: &[u8], rb: &[u8], _diff_blocks: usize)
                 DiffKind::ScaleRuleDiff
             }
         }
+        // NVFP4 is the only dtype whose *block scale* is E4M3. MXFP4's block
+        // scale is E8M0 (pure exponent, no NaN-vs-saturated question), so an
+        // E4M3 overflow policy cannot arise there — it stays divergent.
+        GgmlType::NVFP4 => {
+            if is_nvfp4_e4m3_scale_policy_only(ob, rb) {
+                DiffKind::FormatConformance
+            } else {
+                DiffKind::GenuineDivergence
+            }
+        }
         _ => DiffKind::GenuineDivergence,
     }
+}
+
+/// NVFP4 block geometry (rlx-gguf 0.2.14 `mx_dequant.rs`):
+/// 16 elements per block, block bytes = `1 + 16/2` = **9**, where byte 0 is the
+/// E4M3 scale and bytes 1..9 are packed E2M1 nibbles.
+const NVFP4_BLOCK_BYTES: usize = 9;
+/// Byte offset of the E4M3 scale within an NVFP4 block.
+const NVFP4_SCALE_OFFSET: usize = 0;
+
+/// `true` iff the two NVFP4 payloads differ ONLY in E4M3 *scale* bytes, and
+/// every such difference is a NaN-vs-saturated-finite pair.
+///
+/// # Why this is narrow on purpose
+///
+/// `float8_e4m3fn` (what we implement) reserves `0x7F`/`0xFF` for NaN and
+/// saturates overflow to `0x7E`/`0xFE` (448.0). The OCP MX element variant is
+/// finite-only, so a reference using it emits `0x7E`/`0xFE` where we emit
+/// `0x7F`/`0xFF` for the same nominal value. Both are legal under OCP MX v1.0,
+/// so that difference is a *policy* mismatch, not a math disagreement.
+///
+/// The predicate therefore requires ALL of the following, and is strict in the
+/// safe direction — a mis-classification that hides a real bug is worse than a
+/// false alarm:
+///
+/// 1. **Equal, correctly-strided lengths.** A length mismatch is a real bug.
+/// 2. **Only scale positions may differ.** E2M1 nibble bytes are the actual
+///    *data*; a differing nibble is a math disagreement and must stay
+///    `GenuineDivergence`. Position is checked explicitly (`byte % 9 == 0`)
+///    rather than assumed, because an off-by-one in the block size would
+///    otherwise silently reclassify data bytes as scale bytes — the exact
+///    "over-capture" failure the plan names as this step's main risk.
+/// 3. **Every differing scale byte must be a NaN-vs-saturated pair.** Anything
+///    else (a genuinely different exponent, a sign flip) stays divergent.
+/// 4. **At least one scale byte must actually differ**, so an identical
+///    payload can never be reported as a conformance difference.
+fn is_nvfp4_e4m3_scale_policy_only(ob: &[u8], rb: &[u8]) -> bool {
+    if ob.len() != rb.len() || ob.len() % NVFP4_BLOCK_BYTES != 0 {
+        return false;
+    }
+    let mut saw_scale_diff = false;
+    for (i, (&a, &b)) in ob.iter().zip(rb.iter()).enumerate() {
+        if a == b {
+            continue;
+        }
+        // Differing byte outside a scale position ⇒ real data divergence.
+        if i % NVFP4_BLOCK_BYTES != NVFP4_SCALE_OFFSET {
+            return false;
+        }
+        if !is_nan_vs_saturated_pair(a, b) {
+            return false;
+        }
+        saw_scale_diff = true;
+    }
+    saw_scale_diff
+}
+
+/// `true` iff `(a, b)` is one of the two E4M3 overflow-policy pairs, in either
+/// direction: `0x7F` (NaN) against `0x7E` (448.0), or `0xFF` (NaN) against
+/// `0xFE` (-448.0).
+fn is_nan_vs_saturated_pair(a: u8, b: u8) -> bool {
+    matches!(
+        (a, b),
+        (0x7F, 0x7E) | (0x7E, 0x7F) | (0xFF, 0xFE) | (0xFE, 0xFF)
+    )
 }
 
 /// Read the f16 stored at `byte_off` inside a block.

@@ -1,0 +1,30 @@
+{
+  "schema": "t27-conformance/v0.1",
+  "format": "BLOCK_FP",
+  "format_name": "block floating point (BFP)",
+  "bitexact": false,
+  "format_notes": "block floating point (BFP) -- Wilkinson 1965; modern revivals",
+  "catalog": {
+    "id": "block_fp",
+    "bits": 0,
+    "s": 0,
+    "e": 0,
+    "m": 0,
+    "bias": 0,
+    "storage": "varies",
+    "cluster": "CompressionTrick",
+    "status": "Verified",
+    "standard": "Wilkinson 1965; modern revivals",
+    "use_case": "per-tile shared exponent",
+    "gf_relation": "ally",
+    "source": "Darvish-Rouhani 2020",
+    "phi_distance": -1.0
+  },
+  "ssot": "https://github.com/gHashTag/t27/blob/master/conformance/FORMAT-SPEC-001.json",
+  "preprint": "https://arxiv.org/abs/2606.05017",
+  "anchor_identity": "phi^2 + 1/phi^2 = 3",
+  "structural_reason": "This format has no single fixed bit layout (parametric / technique / variable-width). A bit-precise round-trip vector table is not well-defined; the catalog metadata and anchor note are recorded instead.",
+  "anchor_note": "Anchor identity phi^2 + 1/phi^2 = 3 recorded per shared schema.",
+  "n_vectors": 0,
+  "vectors": []
+}

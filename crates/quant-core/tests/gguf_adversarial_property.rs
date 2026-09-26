@@ -124,41 +124,116 @@ fn bytes_for(dtype: GgmlType, n: usize) -> usize {
     }
 }
 
+/// One tensor spec: `(name, dtype, shape)`.
+type Spec = (String, GgmlType, Vec<usize>);
+
+/// Write `specs` to a fresh GGUF file and assert every tensor that was
+/// ACTUALLY written comes back with an identical name, dtype and shape.
+///
+/// The expectation is derived from the writer's own output (`written`), not
+/// from the caller's input list. That is deliberate and load-bearing.
+///
+/// A GGUF tensor table cannot hold duplicate names, so duplicate names in
+/// `specs` are resolved FIRST-WINS: only the first spec for a given name is
+/// written. An earlier version of this harness recomputed the survivor set
+/// with `seen.contains(name)` in the verify loop. That predicate is true for
+/// *every* occurrence of a duplicated name, so the verifier did not skip the
+/// duplicates and asserted each losing spec's shape against the winner's
+/// tensor — a false failure whenever proptest happened to generate a repeated
+/// short name (e.g. `"_"`). Deriving the expectation from `written` makes
+/// that class of disagreement impossible by construction.
+///
+/// Returns the number of tensors written, so callers can assert on it.
+fn assert_round_trips(specs: &[Spec]) -> usize {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("rt.gguf");
+    let mut w = rlx_gguf::GgufWriter::new();
+    w.set_arch("llama");
+    // Dedupe names FIRST-WINS (a GGUF table cannot hold duplicates), and
+    // record exactly what we wrote so the verify loop uses the same set.
+    let mut seen = std::collections::HashSet::new();
+    let mut written: Vec<&Spec> = Vec::new();
+    let mut payload_seed = 7u8;
+    for spec in specs {
+        let (name, dtype, shape) = spec;
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let n: usize = shape.iter().product();
+        let bytes = vec![payload_seed; bytes_for(*dtype, n)];
+        payload_seed = payload_seed.wrapping_add(31);
+        w.add_tensor_bytes(name.clone(), shape.clone(), *dtype, bytes)
+            .unwrap();
+        written.push(spec);
+    }
+    w.write_to_path(&path).unwrap();
+
+    let f = rlx_gguf::GgufFile::from_path(&path).expect("own output must re-parse");
+    assert_eq!(
+        written.len(),
+        f.tensors.len(),
+        "every written tensor must reappear in the file"
+    );
+    for &(name, dtype, shape) in &written {
+        let t = f
+            .tensors
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        // `written` holds `&Spec`, so destructuring binds `dtype` as
+        // `&GgmlType`, while `t.dtype` is a `GgmlType` by value. Compare the
+        // pointees: `GgmlType: PartialEq`, but `&GgmlType: PartialEq<GgmlType>`
+        // is not implemented, so `assert_eq!(dtype, t.dtype)` does not compile.
+        assert_eq!(*dtype, t.dtype, "{name} dtype");
+        // rlx-gguf keeps shape VERBATIM (GGML order innermost first)
+        // and our writer wrote it in the same order.
+        assert_eq!(shape.as_slice(), t.shape.as_slice(), "{name} shape");
+    }
+    written.len()
+}
+
+/// REGRESSION (durable, not seed-based) for the first-wins verifier bug.
+///
+/// This is a plain `#[test]`, deliberately NOT a proptest seed entry. The
+/// defect was a logic error in the harness — the verify loop disagreed with
+/// the writer about which duplicate survives — so it reproduces on ANY input
+/// containing a repeated name. A seed entry only replays one RNG draw; if the
+/// strategy's shape or the RNG stream shifts, that draw no longer contains a
+/// duplicate and the entry silently stops covering anything. A literal
+/// regression input cannot rot that way.
+///
+/// Minimal failing case, captured from proptest before the fix:
+/// `specs = [("_", F32, [1]), ("_", F32, [2])]`, which reported
+/// `left: [2], right: [1]`.
+#[test]
+fn round_trip_duplicate_names_resolve_first_wins() {
+    let specs: Vec<Spec> = vec![
+        ("_".to_string(), GgmlType::F32, vec![1]),
+        ("_".to_string(), GgmlType::F32, vec![2]),
+    ];
+    // One tensor survives (the first), and it must be the `[1]` one.
+    assert_eq!(assert_round_trips(&specs), 1);
+}
+
+/// The same, with more duplicates and a non-F32 dtype, so the survivor
+/// choice is pinned across the dtype mix the strategy generates.
+#[test]
+fn round_trip_duplicate_names_first_wins_across_dtypes() {
+    let specs: Vec<Spec> = vec![
+        ("blk.0".to_string(), GgmlType::Q8_0, vec![32]),
+        ("blk.0".to_string(), GgmlType::F32, vec![64]), // loses: dup name
+        ("blk.1".to_string(), GgmlType::F16, vec![2]),
+        ("blk.1".to_string(), GgmlType::F16, vec![8]), // loses: dup name
+        ("blk.1".to_string(), GgmlType::F32, vec![3]), // loses: dup name
+    ];
+    assert_eq!(assert_round_trips(&specs), 2);
+}
+
 /// Writer → reader round-trip: names, dtypes and shapes survive
 /// byte-identically for ARBITRARY valid tensor sets (not just the fixed
 /// fixtures the phase tests use).
 #[test]
 fn writer_reader_round_trip() {
     proptest!(|(specs in proptest::collection::vec(tensor_spec_strategy(), 1..=8))| {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("rt.gguf");
-        let mut w = rlx_gguf::GgufWriter::new();
-        w.set_arch("llama");
-        // Dedupe names (a GGUF table cannot hold duplicates).
-        let mut seen = std::collections::HashSet::new();
-        let mut payload_seed = 7u8;
-        for (name, dtype, shape) in &specs {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let n: usize = shape.iter().product();
-            let bytes = vec![payload_seed; bytes_for(*dtype, n)];
-            payload_seed = payload_seed.wrapping_add(31);
-            w.add_tensor_bytes(name.clone(), shape.clone(), *dtype, bytes).unwrap();
-        }
-        w.write_to_path(&path).unwrap();
-
-        let f = rlx_gguf::GgufFile::from_path(&path).expect("own output must re-parse");
-        prop_assert_eq!(seen.len(), f.tensors.len());
-        for (name, dtype, shape) in &specs {
-            if !seen.contains(name) {
-                continue;
-            }
-            let t = f.tensors.get(name).unwrap_or_else(|| panic!("{name} missing"));
-            prop_assert_eq!(*dtype, t.dtype, "{} dtype", name);
-            // rlx-gguf keeps shape VERBATIM (GGML order innermost first)
-            // and our writer wrote it in the same order.
-            prop_assert_eq!(shape.as_slice(), t.shape.as_slice(), "{} shape", name);
-        }
+        assert_round_trips(&specs);
     });
 }

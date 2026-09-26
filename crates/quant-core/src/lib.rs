@@ -30,6 +30,8 @@ pub mod gguf_recipe;
 pub mod gguf_registry;
 pub mod gguf_verify;
 pub mod imatrix;
+// QuaRot Eq. 3 incoherence diagnostic (measurement only — nothing calls it yet).
+pub mod incoherence;
 pub mod llama_policy;
 pub mod st_io;
 pub mod torch_rng;

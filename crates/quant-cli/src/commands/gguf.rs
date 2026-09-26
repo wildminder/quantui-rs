@@ -540,6 +540,7 @@ fn kind_label(k: quant_core::gguf_verify::DiffKind) -> &'static str {
         quant_core::gguf_verify::DiffKind::DeadBlockCosmetic => "dead-block cosmetic",
         quant_core::gguf_verify::DiffKind::ScaleRuleDiff => "scale-rule diff",
         quant_core::gguf_verify::DiffKind::GenuineDivergence => "GENUINE DIVERGENCE",
+        quant_core::gguf_verify::DiffKind::FormatConformance => "format-conformance",
     }
 }
 
@@ -603,4 +604,69 @@ fn record_recent(method: &str, output: &std::path::Path, duration: std::time::Du
     let mut store = load_store(None);
     add_recent(&mut store, record);
     let _ = save_store(&store, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kind_label;
+    use quant_core::gguf_verify::DiffKind;
+
+    /// Every `DiffKind` variant must render a DISTINCT, non-empty label.
+    ///
+    /// Two things are being defended here:
+    ///
+    /// 1. **Reachability** — the new `FormatConformance` arm is actually
+    ///    wired in and spelled correctly, not just added to the enum.
+    /// 2. **Exhaustiveness** — this table must be extended when a variant is
+    ///    added. It cannot drift, because `DiffKind` gains a variant and this
+    ///    list stops compiling; and it cannot be satisfied by a catch-all `_`
+    ///    arm returning `""`, because the labels are asserted to be distinct
+    ///    and non-empty. A variant shipping with no label would print an empty
+    ///    string into `--verify-against` output.
+    ///
+    /// This lives as a unit test rather than in `crates/quant-cli/tests/`
+    /// because `quant-cli` is a BIN-only crate (no `[lib]` target), so an
+    /// integration test cannot import the private `kind_label` at all. A
+    /// `#[cfg(test)]` child module reaches it without widening visibility.
+    #[test]
+    fn kind_label_covers_every_variant() {
+        let cases = [
+            (DiffKind::DeadBlockCosmetic, "dead-block cosmetic"),
+            (DiffKind::ScaleRuleDiff, "scale-rule diff"),
+            (DiffKind::GenuineDivergence, "GENUINE DIVERGENCE"),
+            (DiffKind::FormatConformance, "format-conformance"),
+        ];
+
+        for (kind, want) in cases {
+            assert_eq!(kind_label(kind), want, "label for {kind:?}");
+        }
+
+        // Distinct and non-empty — a `_ => ""` arm would fail both.
+        let labels: Vec<&str> = cases.iter().map(|&(k, _)| kind_label(k)).collect();
+        for (i, l) in labels.iter().enumerate() {
+            assert!(!l.is_empty(), "label {i} must not be empty");
+            assert!(!l.trim().is_empty(), "label {i} must not be blank");
+            for (j, other) in labels.iter().enumerate() {
+                if i != j {
+                    assert_ne!(l, other, "labels {i} and {j} must be distinct");
+                }
+            }
+        }
+        assert_eq!(labels.len(), 4, "one label per DiffKind variant");
+    }
+
+    /// The genuine-divergence label is shouty on purpose; the conformance one
+    /// is not. A future edit that makes them visually identical would defeat
+    /// the purpose of the tier, so pin the distinction explicitly.
+    #[test]
+    fn format_conformance_is_not_labelled_as_a_bug() {
+        assert_ne!(
+            kind_label(DiffKind::FormatConformance),
+            kind_label(DiffKind::GenuineDivergence)
+        );
+        assert_eq!(
+            kind_label(DiffKind::FormatConformance),
+            "format-conformance"
+        );
+    }
 }
