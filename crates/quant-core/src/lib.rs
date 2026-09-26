@@ -32,7 +32,10 @@ pub mod gguf_verify;
 pub mod imatrix;
 // QuaRot Eq. 3 incoherence diagnostic (measurement only — nothing calls it yet).
 pub mod incoherence;
+// Tier 2: opt-in quality refinements. `Quality::Exact` is the zero value and
+// keeps every existing format byte-exact.
 pub mod llama_policy;
+pub mod quality;
 pub mod st_io;
 pub mod torch_rng;
 pub mod validator;

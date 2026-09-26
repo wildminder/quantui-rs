@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::quality::Quality;
+
 /// Scaling mode for the streaming quantizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalingMode {
@@ -149,6 +151,11 @@ pub struct QuantConfig {
     pub calib_seed: i64,
     /// Optional exclude-layers regex; None disables matching.
     pub exclude_layers: Option<String>,
+    /// Opt-in quality refinement (Tier 2). `Exact` — the default — keeps this
+    /// format byte-exact with the references; every other variant changes
+    /// output bytes on purpose and is only reachable through an explicit
+    /// opt-in format id. See [`crate::quality`].
+    pub quality: Quality,
 }
 
 impl Default for QuantConfig {
@@ -166,6 +173,7 @@ impl Default for QuantConfig {
             skip_inefficient: true,
             calib_seed: 233983427,
             exclude_layers: None,
+            quality: Quality::Exact,
         }
     }
 }
@@ -184,6 +192,25 @@ impl QuantConfig {
     /// have no external reference vector (the reference only ever ran INT8);
     /// they only need to be deterministic, distinct per effective config, and
     /// collision-free vs INT8 (guaranteed by distinct `target_format`).
+    ///
+    /// # Tier 2: the `quality_tuning` key is CONDITIONAL
+    ///
+    /// A 10th key, `quality_tuning`, is appended **only when
+    /// [`Quality::id()`] is `Some`** — i.e. never for
+    /// [`Quality::Exact`]. All four committed vectors were produced by the
+    /// 9-key payload, so an unconditional key would silently break every one
+    /// of them, including the Python-captured INT8 one. Do not "simplify" this
+    /// into an unconditional field.
+    ///
+    /// `sort_keys=True` ordering puts `quality_tuning` after
+    /// `no_learned_rounding` and before `scaling_mode`. That placement is
+    /// load-bearing for the digest, and is asserted by
+    /// `quality_key_sorts_between_no_learned_rounding_and_scaling_mode`.
+    ///
+    /// This key is also the **only** resume-safety guard: `load_manifest`
+    /// trusts a partial output if and only if the hash matches, so two
+    /// quality variants sharing a hash would let a re-run resume into an
+    /// artifact built by a different algorithm.
     pub fn config_hash(&self) -> String {
         let (target_format, int8, scaling_mode, block_size): (&str, bool, &str, u32) =
             match self.format {
@@ -197,10 +224,17 @@ impl QuantConfig {
                 Format::Mxfp8 => ("mxfp8", false, "block", 32),
                 Format::Nvfp4 => ("nvfp4", false, "block", 16),
             };
+        // `None` for `Quality::Exact` keeps the payload byte-identical to the
+        // pre-Tier-2 9-key form. See the doc comment above.
+        let quality_suffix = match self.quality.id() {
+            None => String::new(),
+            Some(id) => format!(r#""quality_tuning": "{id}", "#),
+        };
         let payload = format!(
             concat!(
                 r#"{{"block_size": {}, "calib_seed": {}, "convrot": {}, "#,
                 r#""convrot_group_size": {}, "int8": {}, "no_learned_rounding": {}, "#,
+                "{}",
                 r#""scaling_mode": "{}", "skip_inefficient": {}, "target_format": "{}"}}"#
             ),
             block_size,
@@ -209,6 +243,7 @@ impl QuantConfig {
             self.convrot_group_size,
             int8,
             self.no_learned_rounding,
+            quality_suffix,
             scaling_mode,
             self.skip_inefficient,
             target_format,
@@ -320,6 +355,7 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn format_enum_properties() {
@@ -439,6 +475,134 @@ mod tests {
                 assert_ne!(all[i], all[j], "formats {i} and {j} collide");
             }
         }
+    }
+
+    // ----------------------------------------------------------------- //
+    // Tier 2: the conditional `quality_tuning` key
+    // ----------------------------------------------------------------- //
+
+    /// Parity preservation — the most important test in this step.
+    ///
+    /// `Quality::default()` is `Exact`, and `Exact.id()` is `None`, so the
+    /// default payload is the original 9-key string byte-for-byte. All four
+    /// committed vectors must therefore reproduce exactly. **Do not edit these
+    /// expected values to make a change pass** — the INT8 one is captured from
+    /// the Python reference and is not ours to move.
+    #[test]
+    fn default_quality_is_exact_and_preserves_every_pinned_hash() {
+        assert_eq!(Quality::default(), Quality::Exact);
+
+        let mut c = QuantConfig::default();
+        assert_eq!(
+            c.config_hash(),
+            "56920c6553cfa241",
+            "INT8 (Python-captured)"
+        );
+
+        c.format = Format::Fp8E4m3;
+        c.target_format = "fp8".into();
+        c.int8 = false;
+        assert_eq!(c.config_hash(), "5f14780b1bcf30f2", "FP8 block");
+
+        c.format = Format::Mxfp8;
+        c.target_format = "mxfp8".into();
+        assert_eq!(c.config_hash(), "cff3b89365c9544d", "MXFP8");
+
+        c.format = Format::Nvfp4;
+        c.target_format = "nvfp4".into();
+        assert_eq!(c.config_hash(), "95ede677cf402b53", "NVFP4");
+    }
+
+    /// Resume safety. `load_manifest` trusts a partial output if and only if
+    /// the hash matches, and nothing else. Without distinct hashes per quality
+    /// variant, a plain NVFP4 run that is interrupted and re-run with
+    /// `nvfp4_l2` would resume into the byte-exact partial file and mix two
+    /// algorithms in one artifact — silently, with no error.
+    ///
+    /// # The expected digests here are SORTED-order, and that is deliberate
+    ///
+    /// The Tier 2 plan predicted `ab2267a626535821` / `4bb443c5e08167c6` /
+    /// `f0cb29848982c322` for these three variants. Those values are **wrong**:
+    /// they were computed with `quality_tuning` appended *last*, whereas the
+    /// payload is a `json.dumps(sort_keys=True)` mirror — the same rule under
+    /// which all four committed vectors above reproduce exactly. Sorted order
+    /// places the key between `no_learned_rounding` and `scaling_mode`.
+    ///
+    /// The plan's own text got this right and its own arithmetic did not: it
+    /// warned "verify the emitted string, do not assume", then verified against
+    /// the wrong string. Pairwise distinctness — the property this test exists
+    /// to protect — holds under either ordering, so the bug was invisible to
+    /// the property it was checking.
+    #[test]
+    fn quality_variants_get_pairwise_distinct_hashes() {
+        let mut c = QuantConfig::default();
+        c.format = Format::Nvfp4;
+        c.target_format = "nvfp4".into();
+        c.int8 = false;
+
+        let base = c.config_hash();
+        assert_eq!(base, "95ede677cf402b53");
+
+        c.quality = Quality::Nvfp4L2ScaleSearch;
+        let l2 = c.config_hash();
+        assert_eq!(l2, "85cf59c986e5d1a4");
+        assert_ne!(
+            base, l2,
+            "nvfp4_l2 must not resume into a plain nvfp4 partial"
+        );
+
+        c.quality = Quality::Nvfp4HessianScaleSearch;
+        let hess = c.config_hash();
+        assert_eq!(hess, "47437e5e8343725b");
+        assert_ne!(l2, hess);
+
+        let mut m = QuantConfig::default();
+        m.format = Format::Mxfp8;
+        m.target_format = "mxfp8".into();
+        m.int8 = false;
+        m.quality = Quality::Mxfp8E8m0Compensated;
+        assert_eq!(m.config_hash(), "ee7269a90020e9b5");
+    }
+
+    /// `sort_keys=True` places `quality_tuning` after `no_learned_rounding`
+    /// and before `scaling_mode`. The digest depends on that placement, so
+    /// assert the emitted string rather than trusting the ordering.
+    #[test]
+    fn quality_key_sorts_between_no_learned_rounding_and_scaling_mode() {
+        let mut c = QuantConfig::default();
+        c.quality = Quality::Nvfp4L2ScaleSearch;
+        // Mirror of the format! payload with the suffix spliced in, so a
+        // reordering of the format string is caught rather than silently
+        // changing every quality digest.
+        let expected = concat!(
+            r#"{"block_size": 128, "calib_seed": 233983427, "convrot": false, "#,
+            r#""convrot_group_size": 256, "int8": true, "no_learned_rounding": true, "#,
+            r#""quality_tuning": "nvfp4_l2", "#,
+            r#""scaling_mode": "block", "skip_inefficient": true, "target_format": "int8"}"#,
+        );
+        assert_eq!(
+            c.config_hash(),
+            super::hex(&Sha256::digest(expected.as_bytes()))[..16]
+        );
+    }
+
+    /// The converse of the fix, pinned: an *unconditional* key would move the
+    /// Python-captured INT8 vector. Shown here so a future "cleanup" cannot
+    /// reintroduce it believing the test suite was merely noisy.
+    #[test]
+    fn unconditional_quality_key_would_move_the_python_vector() {
+        // What the payload would hash to if the key were always emitted.
+        let with_key = concat!(
+            r#"{"block_size": 128, "calib_seed": 233983427, "convrot": false, "#,
+            r#""convrot_group_size": 256, "int8": true, "no_learned_rounding": true, "#,
+            r#""quality_tuning": "exact", "#,
+            r#""scaling_mode": "block", "skip_inefficient": true, "target_format": "int8"}"#,
+        );
+        let wrong = hex(&Sha256::digest(with_key.as_bytes()))[..16].to_string();
+        assert_ne!(
+            wrong, "56920c6553cfa241",
+            "this control is only meaningful while the unconditional form differs"
+        );
     }
 
     #[test]
