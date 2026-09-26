@@ -212,6 +212,178 @@ pub fn quantize_mxfp8_weight(w: &[f32], m: usize, n: usize) -> Mxfp8QuantResult 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tier 2 S04 — opt-in E8M0 4/3 compensation
+// ---------------------------------------------------------------------------
+
+/// The compensation factor applied to `scale_needed` before the E8M0
+/// `ceil(log2(...))` step: `4/3` (arXiv:2509.23202).
+///
+/// The one property this file depends on is `0 < log2(4/3) < 1`, i.e.
+/// `log2(4/3) = 0.4150375...`. That bounds the resulting `e8m0` delta to
+/// `{0, +1}`: `ceil` is monotone, and a shift of strictly less than one can
+/// advance the ceiling by at most one and never lower it.
+const E8M0_COMPENSATION: f32 = 4.0 / 3.0;
+
+/// E8M0 byte + f32 dequant scale from an already-clamped `scale_needed`.
+///
+/// This is the shared tail of [`block_scale`] and
+/// [`block_scale_compensated`] — the part that turns a scale into a byte.
+/// It is factored out for the COMPENSATED path only; [`block_scale`] keeps
+/// its own inline copy on purpose, so that no refactor of the parity kernel
+/// can perturb the bytes the references pinned. The two copies are
+/// cross-checked against an independent recomputation of the reference
+/// arithmetic by `e8m0_delta_is_zero_or_plus_one_only` in
+/// `tests/mxfp8_e8m0_compensated.rs`, which asserts BOTH paths' emitted bytes
+/// against a from-scratch `ceil(f32(f64::log2(x)))` evaluation.
+///
+/// The `ceil(f32(f64::log2(x)))` form is deliberate and must not become an
+/// exponent-field bit trick: f32 rounding of `log2` just above `2^E` can land
+/// exactly on `E`, so `E + (mantissa != 0)` is wrong for a real fraction of
+/// reachable inputs. See the module docs and `tests/mxfp8_log2_guard.rs`.
+#[inline]
+fn e8m0_and_scale_from_scale_needed(scale_needed: f32, block_max: f32) -> (u8, f32) {
+    // Exact emulation of torch.ceil(torch.log2(x)) — see module docs.
+    let log2_scale = (f64::from(scale_needed)).log2() as f32;
+    // f32→i32 cast saturates (NaN→0), matching torch `.to(int32)` for NaN;
+    // our inputs never produce inf here (bf16-derived maxima are finite).
+    let exp_biased = (log2_scale.ceil() as i32 + E8M0_BIAS).clamp(0, 254);
+    let e8m0 = exp_biased as u8;
+    // e8m0_to_f32: 2^(e-127), or 0.0 for e == 0.
+    let mut scale_f32 = if e8m0 == 0 {
+        0.0
+    } else {
+        f32::from_bits(u32::from(e8m0) << 23)
+    };
+    // Zero blocks get scale 1.0 (torch.where(zero_mask, ones, scales)).
+    if block_max == 0.0 {
+        scale_f32 = 1.0;
+    }
+    (e8m0, scale_f32)
+}
+
+/// E8M0 block scale for the opt-in 4/3-compensated quality mode.
+///
+/// Identical to [`block_scale`] except for the single multiplication by
+/// [`E8M0_COMPENSATION`]. Everything downstream — the `ceil(log2(...))` form,
+/// the `[0, 254]` clamp, the `e8m0 == 0 → 0.0` rule, and the zero-block
+/// rescue — is byte-for-byte the same arithmetic, which is what makes the
+/// `{0, +1}` delta provable rather than merely likely.
+///
+/// # Ordering: the clamp is applied BEFORE the multiplication
+///
+/// The `SCALE_MIN` floor is applied to the *uncompensated* `scale_needed`,
+/// then the result is multiplied. This matters only in the deep subnormal
+/// region, and it is the ordering that matches "multiply `scale_needed` by
+/// 4/3" literally. It also means the compensation is never itself clamped
+/// away: `SCALE_MIN * 4/3 > SCALE_MIN`, so once the floor has bound the base
+/// value the compensation always lifts the exponent off the floor. That is
+/// precisely what recovers `e8m0 == 1` at the Phase 1 `SCALE_MIN` witness,
+/// where the base path is pinned to `e8m0 == 0`.
+///
+/// # Direction: this trades resolution FOR headroom
+///
+/// Because `log2(4/3) = 0.415 < 1`, the exponent can only ever rise. This
+/// knob is not a refinement: the `+1` blocks get a scale twice as large, so
+/// their E4M3 codes halve. Anyone expecting "finer scales" has the direction
+/// backwards, and dividing by `4/3` instead would produce a `-1` delta.
+#[inline]
+fn block_scale_compensated(block_max: f32) -> (u8, f32) {
+    let scale_needed = (block_max / FP8_MAX).max(SCALE_MIN) * E8M0_COMPENSATION;
+    e8m0_and_scale_from_scale_needed(scale_needed, block_max)
+}
+
+/// Quantize a 2D weight tensor (row-major f32) to MXFP8 with the opt-in E8M0
+/// `4/3` compensation ([`Quality::Mxfp8E8m0Compensated`]).
+///
+/// Every step is identical to [`quantize_mxfp8_weight`] — the bf16 input
+/// rounding, the 32x padding, the per-block `amax`, the `v / scale` divide,
+/// the clamp, the E4M3 cast, the zero-block `+0.0` forcing, and the
+/// `to_blocked` scale layout. The ONLY difference is that each block's
+/// `scale_needed` is multiplied by `4/3` before the E8M0 `ceil(log2(...))`.
+/// Consequently this function is **not** byte-exact with the references, and
+/// it is reachable only by explicit opt-in; the default path is untouched.
+///
+/// [`Quality::Mxfp8E8m0Compensated`]: crate::quality::Quality::Mxfp8E8m0Compensated
+pub fn quantize_mxfp8_weight_compensated(w: &[f32], m: usize, n: usize) -> Mxfp8QuantResult {
+    quantize_mxfp8_weight_with(w, m, n, block_scale_compensated)
+}
+
+/// The shared MXFP8 pipeline, parameterised by its per-block scale rule.
+///
+/// `quantize_mxfp8_weight` deliberately does NOT call this — it keeps its own
+/// inlined body so that this step cannot perturb the parity path even
+/// syntactically. Only the compensated entry point routes through here, which
+/// is why the two paths are provably identical everywhere except the one
+/// multiplication.
+fn quantize_mxfp8_weight_with(
+    w: &[f32],
+    m: usize,
+    n: usize,
+    block_scale_fn: fn(f32) -> (u8, f32),
+) -> Mxfp8QuantResult {
+    debug_assert_eq!(w.len(), m * n);
+
+    // Pad to multiples of 32 (torch.nn.functional.pad, zero fill). Round each
+    // input value through bf16 first (simple-path F32→bf16 cast, then the
+    // eager kernel's bf16→f32 upcast for compute).
+    let m_pad = roundup(m, BLOCK_SIZE);
+    let n_pad = roundup(n, BLOCK_SIZE);
+    let num_blocks = n_pad / BLOCK_SIZE;
+    let mut wp = vec![0.0f32; m_pad * n_pad];
+    for r in 0..m {
+        for c in 0..n {
+            let v = w[r * n + c];
+            wp[r * n_pad + c] = bf16_bits_to_f32(f32_to_bf16_bits(v));
+        }
+    }
+
+    // Per row: block scales + quantized bytes (order-preserving parallel).
+    let rows_out: Vec<(Vec<u8>, Vec<u8>)> = (0..m_pad)
+        .into_par_iter()
+        .map(|r| {
+            let row = &wp[r * n_pad..(r + 1) * n_pad];
+            let mut row_e8m0 = Vec::with_capacity(num_blocks);
+            let mut row_q = Vec::with_capacity(n_pad);
+            for b in 0..num_blocks {
+                let block = &row[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+                let block_max = block.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let (e8m0, scale_f32) = block_scale_fn(block_max);
+                row_e8m0.push(e8m0);
+                if block_max == 0.0 {
+                    // torch.where(zero_mask, zeros_like, data_scaled) forces
+                    // +0.0 (cast(-0.0) would be 0x80, not 0x00).
+                    row_q.extend_from_slice(&[0u8; BLOCK_SIZE]);
+                } else {
+                    for &v in block {
+                        // tensor/tensor division = true IEEE division.
+                        let scaled = v / scale_f32;
+                        let clamped = scaled.clamp(-FP8_MAX, FP8_MAX);
+                        row_q.push(f32_to_fp8_e4m3_bits(clamped));
+                    }
+                }
+            }
+            (row_e8m0, row_q)
+        })
+        .collect();
+
+    let mut e8m0 = Vec::with_capacity(m_pad * num_blocks);
+    let mut qdata = Vec::with_capacity(m_pad * n_pad);
+    for (row_e, row_q) in rows_out {
+        e8m0.extend(row_e);
+        qdata.extend(row_q);
+    }
+
+    let (scale, scale_shape) = to_blocked_u8(&e8m0, m_pad, num_blocks);
+
+    Mxfp8QuantResult {
+        qdata,
+        qdata_shape: vec![m_pad as u64, n_pad as u64],
+        scale,
+        scale_shape,
+    }
+}
+
 /// E8M0 byte → f32 dequant scale: `2^(e-127)`, or 0.0 for `e == 0`.
 /// Verbatim port of `float_utils.e8m0_to_f32` (pure exponent format).
 #[inline]
