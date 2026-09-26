@@ -498,7 +498,27 @@ fn stream_quantize_source<S: TensorSource + ?Sized>(
     //      has no regular Hadamard to return (the reference's scipy
     //      Sylvester fallback for other powers of two is not ported).
     if config.convrot {
-        if config.format != Format::Int8 || config.scaling_mode != ScalingMode::Row {
+        // The reference gates the rotation on `self.convrot and
+        // self.scaling_mode == "row"` (learned_rounding.py:869), so every
+        // other INT8/FP8 combination is a misconfiguration, not a rotation.
+        //
+        // NVFP4 + block scaling is the ONE exemption: it is the `nvfp4_rot16`
+        // preset, which rotates at group size 16 == NVFP4's own block size.
+        // The exemption is deliberately narrow — it names `Nvfp4` AND `Block`
+        // explicitly rather than admitting "anything that is not INT8", so
+        // FP8/MXFP8 + convrot stay rejected (covered by
+        // `convrot_requires_int8_row_before_file_creation`) and NVFP4 in any
+        // other scaling mode stays rejected too.
+        //
+        // This is ADMISSION-ONLY: every config that was accepted before is
+        // unaffected, because the admission decision is the only thing that
+        // changed here.
+        let admitted = match config.format {
+            Format::Int8 => config.scaling_mode == ScalingMode::Row,
+            Format::Nvfp4 => config.scaling_mode == ScalingMode::Block,
+            Format::Fp8E4m3 | Format::Mxfp8 => false,
+        };
+        if !admitted {
             return Err(StreamError::ConvRotRequiresInt8Row {
                 format: config.format.as_str(),
                 scaling_mode: config.scaling_mode.as_str(),
@@ -1208,7 +1228,40 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
         }
 
         Format::Nvfp4 => {
-            let r = quantize_nvfp4_weight(&w_f32, m, n);
+            // ---- nvfp4_rot16: group-wise Hadamard rotation -------------- //
+            // The rotation group size EQUALS the quantizer block size (16) per
+            // DuQuant++ (arXiv:2604.17789) / The Great Inversion
+            // (arXiv:2608.25188). Decided PER TENSOR on the same divisibility
+            // rule as the INT8 arm: `in_features` not divisible by the group
+            // size stays UNROTATED with a warning.
+            //
+            // GATED ON `config.convrot`, which is false for every pre-existing
+            // config — so plain NVFP4 takes the `w_f32` path below unchanged
+            // and every pinned digest is preserved. `build_hadamard(16)` is
+            // valid (16 is on the power-of-4 ladder), so no new rotation
+            // numerics are needed — only this wiring.
+            let gs = config.convrot_group_size as usize;
+            let rotated = config.convrot && gs != 0 && n % gs == 0;
+            if config.convrot && !rotated {
+                eprintln!(
+                    "warning: skipping ConvRot for {name}: in_features {n} not divisible by group size {gs}"
+                );
+            }
+            // `Some` only when actually rotated; `None` keeps the generic
+            // (unrotated) bias-correction path and avoids cloning `w_f32`.
+            let rotated_w: Option<Vec<f32>> = if rotated {
+                let h = crate::convrot::build_hadamard(config.convrot_group_size)
+                    .expect("convrot group size validated at config time");
+                Some(
+                    crate::convrot::rotate_weight(&w_f32, &h, m, n, config.convrot_group_size)
+                        .expect("in_features divisibility checked above"),
+                )
+            } else {
+                None
+            };
+            let w_src: &[f32] = rotated_w.as_deref().unwrap_or(&w_f32);
+
+            let r = quantize_nvfp4_weight(w_src, m, n);
 
             // <name> U8 packed payload at (m_pad, n_pad/2); <base>.weight_scale
             // is the E4M3 tiled (to_blocked) bytes; <base>.weight_scale_2 is the
@@ -1241,7 +1294,10 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     input_scale: false,
                 },
                 w_dq,
-                None,
+                // `Some(rotated)` routes bias correction through the ConvRot
+                // path (both GEMMs on rotated operands). `None` for plain
+                // NVFP4 and for rotation-skipped tensors — unchanged behaviour.
+                rotated_w,
             )
         }
     };

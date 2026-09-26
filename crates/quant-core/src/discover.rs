@@ -364,7 +364,10 @@ pub fn ctq_quant_tags(
     heur: bool,
 ) -> Vec<String> {
     let mut tags = vec![fmt.to_string()];
-    if fmt == "int8_convrot" {
+    // Rotation group size is a property that CHANGES THE EMITTED BYTES, so it
+    // belongs in the filename. `int8_convrot` (gs 256) and `nvfp4_rot16`
+    // (gs 16) both route through here.
+    if fmt == "int8_convrot" || fmt == "nvfp4_rot16" {
         if let Some(gs) = convrot_group_size {
             if !gs.is_empty() {
                 tags.push(format!("gs{gs}"));

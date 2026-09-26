@@ -47,6 +47,9 @@ fn format_id(format: FormatArg, mode: ScalingModeArg) -> &'static str {
         FormatArg::Mxfp8 => "mxfp8",
         FormatArg::Nvfp4 => "nvfp4",
         FormatArg::Int8Convrot => "int8_convrot",
+        // Distinct id from `nvfp4`: it feeds `ctq_quant_tags`, so the
+        // auto-named artifact can never collide with a plain nvfp4 run.
+        FormatArg::Nvfp4Rot16 => "nvfp4_rot16",
     }
 }
 
@@ -92,13 +95,29 @@ fn build_config(args: &QuantizeArgs) -> QuantConfig {
         // would silently emit a plain, unrotated layer under a ConvRot name.
         // block_size is unused in row mode; 128 keeps the value canonical.
         FormatArg::Int8Convrot => (Format::Int8, "int8", true, ScalingMode::Row, 128),
+        // `nvfp4_rot16` is NVFP4 (fixed block scaling at 16) plus a
+        // group-wise Hadamard rotation at group size 16. The size is not a
+        // free parameter: the rotation group size should EQUAL the quantizer
+        // block size (DuQuant++ arXiv:2604.17789; The Great Inversion
+        // arXiv:2608.25188), and NVFP4's block size is 16. See the
+        // end-to-end verification warning on `FormatArg::Nvfp4Rot16`.
+        FormatArg::Nvfp4Rot16 => (Format::Nvfp4, "nvfp4", false, ScalingMode::Block, 16),
     };
-    // Phase 7.1: ConvRot is a property of the `int8_convrot` preset (there is
-    // no `--convrot` flag — the preset IS the flag). The group size is fixed
-    // at 256, the reference default (`convrot_group_size=256`,
-    // learned_rounding.py:868) and the only size the quantui UI offers for
-    // this path.
-    let convrot = matches!(args.format, FormatArg::Int8Convrot);
+    // Phase 7.1: ConvRot is a property of the rotation PRESETS (there is no
+    // `--convrot` flag — the preset IS the flag), and the group size is
+    // FIXED per preset, never a tunable.
+    //
+    // `int8_convrot`'s 256 is a PARITY CONTRACT with the reference default
+    // (`convrot_group_size=256`, learned_rounding.py:868) and the only size
+    // the quantui UI offers for that path. Changing it silently changes the
+    // bytes of every existing convrot artifact AND its `config_hash`, so it
+    // must never become a flag or be "tidied" — see
+    // `tests/nvfp4_rot16_parity.rs::int8_convrot_group_size_is_still_256`.
+    let (convrot, convrot_group_size) = match args.format {
+        FormatArg::Int8Convrot => (true, 256),
+        FormatArg::Nvfp4Rot16 => (true, 16),
+        _ => (false, 256),
+    };
     QuantConfig {
         format,
         target_format: target_format.into(),
@@ -107,7 +126,12 @@ fn build_config(args: &QuantizeArgs) -> QuantConfig {
         block_size,
         no_learned_rounding: args.simple,
         convrot,
-        convrot_group_size: 256,
+        convrot_group_size,
+        // Tier 2 quality refinement. This step introduces NO quality knob:
+        // `nvfp4_rot16` is a byte-exact rotation, distinct via
+        // convrot/convrot_group_size alone. `Exact` contributes no
+        // `quality_tuning` key, so every pinned hash is preserved.
+        quality: quant_core::quality::Quality::Exact,
         orig_dtype: orig_dtype(args.orig_dtype).into(),
         skip_inefficient,
         calib_seed: args.calib_seed,
@@ -135,12 +159,20 @@ fn resolve_output(args: &QuantizeArgs, config: &QuantConfig) -> Result<PathBuf, 
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Only the NEW preset passes a group size here. `int8_convrot` keeps
+    // passing `None` so its auto-named filename is byte-for-byte what it has
+    // always been — adding a `gs256` tag to it would silently rename every
+    // artifact users have already produced.
+    let gs_tag = match args.format {
+        FormatArg::Nvfp4Rot16 => Some(config.convrot_group_size.to_string()),
+        _ => None,
+    };
     let tags = ctq_quant_tags(
         format_id(
             args.format,
             args.scaling_mode.unwrap_or(ScalingModeArg::Block),
         ),
-        None,
+        gs_tag.as_deref(),
         config.no_learned_rounding,
         false,
         "",

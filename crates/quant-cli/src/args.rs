@@ -46,6 +46,35 @@ pub enum OrigDtypeArg {
 /// preset forces it instead of silently producing an unrotated layer.
 /// Layers whose `in_features` is not divisible by 256 stay plain row-wise
 /// INT8 (the reference warns and leaves them unrotated).
+///
+/// # `nvfp4_rot16` — UNVERIFIED END TO END, DO NOT SHIP BLIND
+///
+/// `nvfp4_rot16` applies the same group-wise Hadamard rotation to NVFP4
+/// weights at group size 16 -- chosen because the rotation group size should
+/// EQUAL the quantizer block size (DuQuant++, arXiv:2604.17789; The Great
+/// Inversion, arXiv:2608.25188) and NVFP4's block size is 16. The rotation
+/// is a parity-exact transform, so this step changes no pinned digest; the
+/// preset is distinguished by `convrot` / `convrot_group_size` in the
+/// `config_hash`, never by a `Quality` variant.
+///
+/// **The rotation is applied OFFLINE to the weights only.** For the result to
+/// be numerically usable, the consumer must apply the INVERSE rotation
+/// (`x @ H`, blockwise) ONLINE at inference. Whether ComfyUI does this is
+/// **UNKNOWN and untestable from this repository** -- no test here can retire
+/// that risk, because the failure is not in the artifact we write but in
+/// whether a downstream runtime honours it. If the consumer does NOT apply
+/// the inverse, every rotated layer is garbage: a valid-looking file with
+/// silently wrong numerics. Treat end-to-end correctness as UNVERIFIED until
+/// someone confirms the consumer path out of band.
+///
+/// A second, narrower gap: the family-B `comfy_quant` blob schema has no
+/// `convrot` / `convrot_groupsize` keys (only the INT8 family-A blob does), so
+/// the emitted metadata does not record that this tensor was rotated. A
+/// consumer therefore has no in-band signal to key off. See
+/// `stream.rs` (`Format::Nvfp4` arm) for the rotation site.
+///
+/// Like `nvfp4`, this preset has FIXED scaling (block scaling at 16), so
+/// `--scaling-mode` / `--block-size` remain usage errors.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatArg {
     Int8,
@@ -55,6 +84,10 @@ pub enum FormatArg {
     Nvfp4,
     #[value(name = "int8_convrot")]
     Int8Convrot,
+    /// NVFP4 + group-wise Hadamard rotation at group size 16 (== NVFP4's own
+    /// block size). See the module-level warning above before using it.
+    #[value(name = "nvfp4_rot16")]
+    Nvfp4Rot16,
 }
 
 impl FormatArg {
@@ -66,14 +99,21 @@ impl FormatArg {
             FormatArg::Mxfp8 => "mxfp8",
             FormatArg::Nvfp4 => "nvfp4",
             FormatArg::Int8Convrot => "int8_convrot",
+            FormatArg::Nvfp4Rot16 => "nvfp4_rot16",
         }
     }
 
     /// Formats with FIXED scaling parameters (block scaling at the format's
     /// own block size). Explicit `--scaling-mode` / `--block-size` for these
     /// is a usage error (exit 2).
+    ///
+    /// `Nvfp4Rot16` inherits NVFP4's fixed block scaling (it is NVFP4 plus a
+    /// rotation, not a different scaling scheme).
     pub fn has_fixed_scaling(&self) -> bool {
-        matches!(self, FormatArg::Mxfp8 | FormatArg::Nvfp4)
+        matches!(
+            self,
+            FormatArg::Mxfp8 | FormatArg::Nvfp4 | FormatArg::Nvfp4Rot16
+        )
     }
 }
 

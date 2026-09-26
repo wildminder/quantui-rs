@@ -172,7 +172,6 @@ fn quality_variant_never_changes_base_variant_bytes() {
 /// discriminating between formats.
 #[test]
 fn every_base_format_has_a_distinct_digest() {
-    let case = "linear_basic_bf16";
     let digests = [
         ("int8", INT8_DIGEST),
         ("fp8_e4m3", FP8_DIGEST),
