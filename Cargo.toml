@@ -3,7 +3,10 @@ resolver = "2"
 members = ["crates/quant-core", "crates/quant-cli"]
 
 [workspace.package]
-version = "0.1.0"
+# 0.2.0 — adds opt-in quality modes (--format nvfp4_l2) and the byte-exact
+# nvfp4_rot16 preset, plus third-party format conformance vectors. No existing
+# format's output bytes change; the default paths stay byte-exact.
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"

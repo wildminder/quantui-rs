@@ -1,7 +1,7 @@
 //! GENERATED FILE - do not edit by hand.
 //! Source: Golden Ruler conformance packs, gHashTag/t27
 //!        (arXiv:2606.09686v3, `conformance/vectors/*.json`)
-//! Regenerate with: python docs/theory/tools/gen_conformance_tests.py
+//! Regenerate with: python tools/gen_conformance_tests.py
 //!
 //! Conformance is asserted on the INTEGER BIT PATTERN, never on decoded-value
 //! closeness -- the source paper's stated criterion.

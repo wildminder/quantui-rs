@@ -4,7 +4,9 @@ Standalone, single-binary Rust CLI that quantizes Hugging Face `safetensors`
 models to **ComfyUI-compatible INT8 / FP8 / MXFP8 / NVFP4** and converts HF
 models to **GGUF** (34 usable llama.cpp-compatible methods) — with a hard
 contract: **outputs are byte-exact against the Python/torch and llama.cpp
-references** on all supported paths.
+references** on all default paths. The handful of opt-in formats that trade
+that guarantee for accuracy say so on every run
+([`parity:` marker](#conformance)).
 
 One static binary. No Python, no torch, no runtime dependencies.
 
@@ -25,19 +27,22 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
 1. [Building](#building)
 2. [Command overview](#command-overview)
 3. [Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)](#quantize)
-4. [Converting to GGUF (`gguf`)](#gguf)
-5. [Which GGUF method should I use?](#method-selection)
-6. [Per-tensor recipes — the open `UD-*`](#recipes)
-7. [`--verify-against` — oracle equivalence report](#verify-against)
-8. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
-9. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
-10. [Validating (`validate`) and inspecting (`info`)](#validate-info)
-11. [Exit codes](#exit-codes)
-12. [Shell completions](#completions)
-13. [Worked examples: real models](#worked-examples)
-14. [Parity contract & known boundaries](#parity)
-15. [Performance](#performance)
-16. [Repository layout & development](#development)
+4. [Quality modes — `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
+5. [Format conformance & the `parity:` marker](#conformance)
+6. [Tried, measured, rejected](#rejected)
+7. [Converting to GGUF (`gguf`)](#gguf)
+8. [Which GGUF method should I use?](#method-selection)
+9. [Per-tensor recipes — the open `UD-*`](#recipes)
+10. [`--verify-against` — oracle equivalence report](#verify-against)
+11. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
+12. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
+13. [Validating (`validate`) and inspecting (`info`)](#validate-info)
+14. [Exit codes](#exit-codes)
+15. [Shell completions](#completions)
+16. [Worked examples: real models](#worked-examples)
+17. [Parity contract & known boundaries](#parity)
+18. [Performance](#performance)
+19. [Repository layout & development](#development)
 
 ---
 
@@ -96,6 +101,16 @@ config blob describing its layout.
 | `fp8_e4m3` | 8 | Your loader supports FP8; block/row/tensor scaling available |
 | `mxfp8` | 8 | MXFP8 with fixed 32-element blocks (swizzled scales); AVOID_KEY_NAMES exclusions apply |
 | `nvfp4` | 4 | Maximum compression; NVFP4 with 16-element microblocks + per-tensor scale; AVOID_KEY_NAMES apply |
+| `nvfp4_l2` | 4 | **Quality mode.** Same 4-bit size, ~17.7% lower reconstruction error — but **NOT byte-exact**. See [Quality modes](#quality-modes) |
+| `nvfp4_rot16` | 4 | NVFP4 + Hadamard rotation at group size 16. **Byte-exact**, but see the inverse-rotation caveat before using it |
+| `int8_clip09` | ~8 | ⚠️ **A measured negative result, kept only so the result stays reproducible.** It regresses 31×–1.4e4× in weight-space L2. Do not use it — see [Tried and rejected](#rejected) |
+
+Everything down to `nvfp4` is byte-exact against the Python/torch reference.
+The last three are opt-in and differ in kind: `nvfp4_l2` trades the byte-exactness
+guarantee for accuracy, `nvfp4_rot16` keeps the guarantee (a rotation is a
+parity-exact transform) but carries an end-to-end caveat, and `int8_clip09` is
+an opt-in that is **known to be worse**. Every run states which kind it was on
+the [`parity:` line](#conformance).
 
 ### Full parameter reference
 
@@ -107,7 +122,11 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
                           (sharded); omitted = auto-named
 
       --format <FORMAT>   int8 | int8_convrot | fp8_e4m3 | mxfp8 |
-                          nvfp4                      [default: int8]
+                          nvfp4 | nvfp4_l2 | nvfp4_rot16 | int8_clip09
+                                             [default: int8]
+                          (nvfp4_l2 and int8_clip09 are NOT byte-exact —
+                           deliberate quality trades; nvfp4_rot16 IS
+                           byte-exact. See "Quality modes".)
   -m, --scaling-mode <M>  tensor | row | block            [default: block]
                           (INT8/FP8 only; MXFP8/NVFP4 are fixed-block —
                            passing it with those exits 2;
@@ -223,6 +242,171 @@ carries a per-tensor `weight_scale_2`. MXFP8/NVFP4 outputs carry a
 `__metadata__._quantization_metadata` JSON listing every quantized layer.
 Resume, Ctrl-C, sharded input, `validate`, and `info` work identically for
 all formats.
+
+---
+
+<a name="quality-modes"></a>
+## Quality modes — `nvfp4_l2` and `nvfp4_rot16`
+
+The byte-exactness contract is the crate's defining property, so nothing below
+is ever reached by default: these are opt-in `--format` values, and every other
+format is byte-for-byte unchanged. They are documented here because a user
+should be able to tell a byte-exact format from a quality-tuned one **without
+reading the source** — and because one of them carries a caveat that no test in
+this repository can retire.
+
+### `nvfp4_l2` — accuracy instead of byte-exactness
+
+```sh
+quantui-rs quantize mymodel.safetensors --format nvfp4_l2
+# parity: quality-tuned (nvfp4_l2: NVFP4 anchored alternating L2 scale search; NOT byte-exact vs torch/llama-quantize)
+```
+
+NVFP4 stores each weight as a 4-bit E2M1 code plus a per-block scale. The
+reference picks that scale pair by pure absmax, which is exact but leaves
+accuracy on the table. `nvfp4_l2` instead runs an **anchored alternating
+search** over the per-tensor/per-block scale pair, minimizing reconstruction
+error. Measured through the crate's own shipped dequantizer — so the number
+reflects real emitted bytes, not a model of them — this gives **17.7% lower
+relative L2 reconstruction error** in aggregate over 4 distributions × 4 shapes.
+
+That aggregate is not a guarantee. The gain is **21–26%** on uniform and
+Gaussian data, **6–11%** on heavy-tailed, and **1.5–31%** on spiky inputs —
+the search has less to work with when a few elements dominate the absmax.
+
+Everything else is inherited from `nvfp4`: same E2M1 codes, same fixed block
+scaling at 16, so `--scaling-mode` / `--block-size` remain usage errors. Only
+the *choice of scale grid point* differs.
+
+**Why the search must be _anchored_.** This is not a stylistic choice. The
+reconstruction is `X̂ = s_T · s_G · Q(X/(s_T·s_G))`, so rescaling `s_T → k·s_T`
+and `s_G → s_G/k` leaves the product invariant; and because the E2M1 element
+grid is `{2^j, 1.5·2^j}`, the 4-bit codes are *also* unchanged whenever `k` is a
+power of two. The error objective is therefore **exactly flat along powers of
+two**. A naive search here is not merely unconstrained, it is genuinely
+ambiguous — it drifts to an arbitrary and eventually E4M3-unrepresentable
+scale. The implementation instead searches a bounded window of ±4 E4M3 scale
+codes around the absmax anchor (±0.5 octave), and a test pins that it cannot
+drift.
+
+The alternating tensor-scale/block-scale formulation follows arXiv:2509.23202.
+
+### `nvfp4_rot16` — a byte-exact rotation preset
+
+```sh
+quantui-rs quantize mymodel.safetensors --format nvfp4_rot16
+# parity: exact (nvfp4_rot16; byte-exact vs torch/llama-quantize)
+```
+
+Applies a Hadamard (fast Walsh–Hadamard) rotation to NVFP4 weights at group
+size **16**, chosen so the rotation group size *equals* the quantizer block
+size. Unlike `nvfp4_l2` this one **is** byte-exact: a rotation is a parity-exact
+transformation, not an approximation. `int8_convrot` is unchanged at its
+original group size of 256.
+
+The rationale comes from two independent papers. **DuQuant++**
+(arXiv:2604.17789) shows that aligning the rotation block with the
+microscaling group eliminates cross-block variance and halves the online
+rotation cost; **The Great Inversion** (arXiv:2608.25188) reaches the same
+conclusion from a coding-theory angle, noting that MXFP4 "still rewards a
+rotation confined to that block". NVFP4's block size is 16. The Hadamard
+construction itself follows **ConvRot** (arXiv:2512.03673), whose Theorem 3.3
+proves all Kronecker powers `H_{4^k}` are *regular* (row and column sums equal
+±√n) — which is what avoids the degenerate all-ones column a naive Sylvester
+construction would give.
+
+> ⚠️ **The rotation is applied offline to the weights, so the consuming runtime
+> must apply the _inverse_ rotation online at inference.** Whether ComfyUI
+> actually does this **cannot be verified from inside this repository** — the
+> failure, if any, is not in the artifact written here but in whether a
+> downstream runtime honours it, and no test in this crate can settle that. If
+> the consumer does *not* apply the inverse, every rotated layer is garbage: a
+> valid-looking file with silently wrong numerics. Treat end-to-end correctness
+> as **unverified** until someone confirms the consumer path out of band.
+>
+> A narrower, separate gap: the NVFP4-family `comfy_quant` blob has no
+> `convrot` / `convrot_groupsize` keys (only the INT8 family-A blob does), so
+> the emitted metadata does not record that a tensor was rotated — a consumer
+> has no in-band signal to key off.
+
+---
+
+<a name="conformance"></a>
+## Format conformance & the `parity:` marker
+
+### The `parity:` line
+
+Every `quantize` run prints exactly one `parity:` line, on **every** run:
+
+```
+parity: exact (nvfp4; byte-exact vs torch/llama-quantize)
+parity: quality-tuned (nvfp4_l2: NVFP4 anchored alternating L2 scale search; NOT byte-exact vs torch/llama-quantize)
+```
+
+It prints unconditionally, *including on exact runs*. That is the point: a user
+who has seen the marker on an exact run has learned the tool makes the
+distinction at all, which is what gives its presence on a quality run its
+meaning. Printing it only when there is bad news would make it
+indistinguishable from "this build does not report parity".
+
+The line is derived from a single source of truth in the core
+(`Quality::is_parity_exact()` / `Quality::reason()`), not from per-format
+string matching — so a new format cannot be added without automatically getting
+a correct label.
+
+**Exit codes are deliberately unchanged.** `0` still means success, *including*
+for a quality-tuned run. A distinct exit code would read as failure and break
+every existing script; the greppable `parity:` line is the machine-detectable
+signal instead:
+
+```sh
+quantui-rs quantize m.safetensors --format nvfp4_l2 2>&1 | grep -q '^parity: quality-tuned' \
+  && echo "NOT byte-exact — do not compare against reference bytes"
+```
+
+### Conformance vectors
+
+Bit-exact conformance vectors are adopted from **Golden Ruler**
+(arXiv:2606.09686v3, upstream `gHashTag/t27`), vendored as test fixtures and
+asserted in **both the encode and the decode direction**. Conformance is
+asserted on the **integer bit pattern**, never on decoded-value closeness —
+the source paper's stated criterion.
+
+---
+
+<a name="rejected"></a>
+## Tried, measured, rejected
+
+Three techniques from the literature were implemented, measured on this crate's
+own metric, and deliberately **not** recommended. Recording them is a result,
+not a failure — a reader deciding whether to try one of these deserves to know
+it was already tried here:
+
+| Technique | Source | Measured outcome |
+|---|---|---|
+| MXFP8 E8M0 `4/3` scale compensation | arXiv:2509.23202 | **Bit-exact no-op.** `rel_l2` ratio `1.000000` — 0.00% change |
+| MXAttention `Qmax = 7.25` | arXiv:2607.24377 | **Inert.** No output byte changes |
+| INT8 absmax clip ratio 0.9 | QuaRot, arXiv:2404.00456 | **31×–1.4e4× worse** in weight-space L2; 0 of 4 distributions improved |
+
+The MXFP8 case is the sharpest: E4M3 halves exactly, so doubling the scale and
+halving every code reconstructs the identical `f32`, and this crate's scale
+rounds *up*, so it never clips in the first place — leaving nothing for the
+compensation to relieve. The paper's variant rounds down and does clip, so the
+premise holds there and simply does not apply to this kernel.
+
+`Qmax` is a clamp bound, and the encoder already saturates at 6.0 (the format's
+maximum), so no bound ≥ 6.0 can change an emitted byte. Clipping trades bounded
+rounding error for *unbounded* saturation error, and INT8's 127 levels leave
+only ~1.5e-5 of rounding error to recover; the published gain is a perplexity
+result on activations, and this crate quantizes weights and does not measure
+perplexity.
+
+**The transferable lesson:** the one technique that worked runs a real *search*
+and lets the data pick a point; the three that failed each nudged a hardcoded
+constant, which has no feedback signal. Each paper also assumed a kernel
+differing from this one in exactly one decisive respect — `floor` vs `ceil`
+scale rounding, a clamp below vs at saturation, activations vs weights — and
+that difference is what decides the outcome.
 
 ---
 
@@ -609,6 +793,11 @@ Parses only the header (no tensor payloads).
 | 3 | **gguf only**: `--verify-against` found spec violations in OUR output |
 | 130 | Cancelled by Ctrl-C (partial output is resumable) |
 
+**Exit codes are unaffected by the opt-in quality formats.** A `nvfp4_l2` run
+exits `0` on success like any other — a non-zero code would read as failure and
+break existing scripts. Scripts that need to know whether a run was byte-exact
+should grep the [`parity:` line](#conformance) instead.
+
 ---
 
 <a name="completions"></a>
@@ -708,6 +897,23 @@ conv kernels (row widths 4/7/8/10/16) are demoted to F16 with loud warnings
 - INT8 row scaling reproduces torch's exact float semantics — including
   `127.0/row_max` computed as `127.0 * reciprocal(row_max)` (torch's
   double-rounding quirk) — locked by the `int8_convrot` goldens.
+- Bit-exact format conformance vectors from **Golden Ruler**
+  (arXiv:2606.09686v3, upstream `gHashTag/t27`), vendored as fixtures and
+  asserted on integer bit patterns in both the encode and the decode
+  direction — see [Format conformance](#conformance).
+
+**Byte-exactness holds on every default path.** The only exceptions are the
+deliberate opt-ins, and every run declares which kind it was on the
+[`parity:` line](#conformance):
+- `nvfp4_l2` — **NOT byte-exact.** Trades the guarantee for ~17.7% lower
+  reconstruction error. See [Quality modes](#quality-modes).
+- `int8_clip09` — **NOT byte-exact**, and measured *worse*. Kept reachable only
+  so the negative result stays reproducible. See
+  [Tried, measured, rejected](#rejected).
+- `nvfp4_rot16` / `int8_convrot` — **byte-exact** (a rotation is a parity-exact
+  transform), but `nvfp4_rot16` carries an unverified end-to-end caveat: the
+  consumer must apply the inverse rotation online. See
+  [Quality modes](#quality-modes).
 
 **Correctness ladder for GGUF output** (what "correct" means here):
 

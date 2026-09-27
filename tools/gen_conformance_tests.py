@@ -11,8 +11,7 @@ It is emitted as a separate integration test (not inlined into dtype.rs) so it
 cannot perturb the byte-parity source files.
 
 Usage:
-    source C:/_Dev/Python/.venv/Scripts/activate
-    python docs/theory/tools/gen_conformance_tests.py
+    python tools/gen_conformance_tests.py
 """
 
 from __future__ import annotations
@@ -25,11 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]  # tools/ -> repo root
 # The packs are read from -- and embedded into the test via include_str! from --
 # the TRACKED fixtures dir alongside the test that consumes them.
 #
-# They used to live in docs/theory/data/conformance/, but .gitignore:16 ignores
-# `docs/` wholesale, so those copies were never tracked. The generated test's
-# include_str! therefore pointed at an untracked file: on a fresh clone the whole
-# test BINARY failed to compile, not just one test. These are third-party test
-# fixtures, not documentation, so they belong with the tests that depend on them.
+# An earlier revision kept them under the gitignored `docs/` tree, so those
+# copies were never tracked. The generated test's include_str! therefore pointed
+# at an untracked file: on a fresh clone the whole test BINARY failed to
+# compile, not just one test. These are third-party test fixtures, not
+# documentation, so they belong with the tests that depend on them.
 PACKS = ROOT / "crates" / "quant-core" / "tests" / "fixtures" / "conformance"
 OUT = ROOT / "crates" / "quant-core" / "tests" / "format_conformance_golden_ruler.rs"
 
@@ -69,7 +68,7 @@ def main() -> None:
     A("//! GENERATED FILE - do not edit by hand.")
     A("//! Source: Golden Ruler conformance packs, gHashTag/t27")
     A("//!        (arXiv:2606.09686v3, `conformance/vectors/*.json`)")
-    A("//! Regenerate with: python docs/theory/tools/gen_conformance_tests.py")
+    A("//! Regenerate with: python tools/gen_conformance_tests.py")
     A("//!")
     A("//! Conformance is asserted on the INTEGER BIT PATTERN, never on decoded-value")
     A("//! closeness -- the source paper's stated criterion.")

@@ -68,7 +68,8 @@ use crate::dtype::{f32_to_fp8_e4m3_bits, fp8_e4m3_bits_to_f32};
 /// `0xFF`, precisely the two `e4m3fn` reserves for NaN. The other 254 agree
 /// bit-for-bit in both directions and are asserted exhaustively. That split is
 /// recorded as an asserted divergence so it cannot drift into an accident;
-/// see `docs/plans/2026-09-26-tier1-conformance-hardening.md` §2.1.
+/// see the conformance-hardening plan of 2026-09-26, §2.1, and the assertion
+/// in `tests/format_conformance_golden_ruler.rs`.
 pub const FP8_MAX: f32 = 448.0;
 /// clamp_min floor used by the reference before dividing.
 const CLAMP_MIN: f32 = 1e-12;
