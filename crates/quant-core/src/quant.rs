@@ -189,6 +189,179 @@ pub fn quantize_int8_weight(
     }
 }
 
+/// The clip ratio [`Quality::Int8Clip09`](crate::quality::Quality::Int8Clip09)
+/// bakes into [`quantize_int8_weight_clipped`].
+///
+/// A named constant rather than a bare literal at the call site: the ratio is
+/// simultaneously the algorithm's identity and part of the user-facing format
+/// id (`int8_clip09`), so a magic `0.9` in three places is three chances to
+/// drift. It is deliberately NOT tunable — see the function's docs for why a
+/// ratio swept until the benchmark passed would not be a measurement.
+pub const INT8_CLIP_RATIO: f32 = 0.9;
+
+/// INT8 with **absmax clipping**: the quant scale is derived from
+/// `clip_ratio * row_max` instead of `row_max`, so the top
+/// `(1 - clip_ratio)` of the value range saturates and everything below it
+/// gets a correspondingly finer step.
+///
+/// This is the Tier 2 S07 quality mode, selected by `--format int8_clip09`
+/// ([`Quality::Int8Clip09`](crate::quality::Quality::Int8Clip09)). It is a NEW
+/// function beside [`quantize_int8_weight`], not a parameter on it:
+/// `quantize_int8_weight`'s bytes are pinned by `parity_fingerprint.rs` and by
+/// the Python reference, so it must keep its exact current arithmetic for ever.
+/// The two share the private helpers below, which is the only coupling.
+///
+/// # Why clipping at all
+///
+/// Absmax scaling spends the whole int8 range on the single largest element in
+/// the row. Clipping deliberately gives that element up: it saturates, and the
+/// freed range is redistributed as finer resolution across the many small
+/// elements that actually carry most of the weight tensor's energy. It is the
+/// standard MSE-vs-range trade and it is what QuaRot calls "clipping".
+///
+/// # The catch, stated plainly
+///
+/// The published justification for clipping is a **perplexity** improvement,
+/// and this crate cannot compute perplexity — it quantizes weights and never
+/// runs a model. Asserting a PPL number here would be asserting something the
+/// crate does not measure. So the benefit has to be argued on the crate's own
+/// metric, weight-space relative L2, through the shipped public dequantizer —
+/// and that is a strictly harder bar, because this path does not quantize
+/// activations at all, which is where clipping is usually said to help most.
+///
+/// Consequently the clip ratio is FIXED at [`INT8_CLIP_RATIO`] and is not
+/// exposed as a flag. A ratio swept until `rel_l2` improved would be a
+/// threshold fitted to the benchmark, not a measurement of a hypothesis; the
+/// pre-registered decision rule in `benches/quality_error.rs` is only meaningful
+/// if the configuration under test was fixed before the numbers were read.
+///
+/// # Float semantics
+///
+/// Identical to [`quantize_int8_weight`]: the row path keeps torch's
+/// `scalar * reciprocal(tensor)` two-rounding division rather than IEEE
+/// division (see the long note in `quantize_int8_weight`), because the pinned
+/// row-mode goldens were produced that way. Clipping changes the *clamped
+/// value*, never the order of the divisions, so a clipped row and an unclipped
+/// row are computed by identical arithmetic on different amax values.
+pub fn quantize_int8_weight_clipped(
+    w: &[f32],
+    m: usize,
+    n: usize,
+    mode: ScalingMode,
+    block_size: usize,
+    clip_ratio: f32,
+) -> Int8QuantResult {
+    debug_assert_eq!(w.len(), m * n);
+    assert!(
+        clip_ratio > 0.0 && clip_ratio <= 1.0,
+        "INT8 clip ratio must be in (0, 1]; got {clip_ratio}"
+    );
+
+    // All-zeros early return, mirroring `quantize_int8_weight`. Clipping a
+    // zero tensor is still zero, so this arm is unchanged by the ratio — which
+    // is why it is a plain shared helper and not a ratio-dependent branch.
+    if w.iter().all(|&v| v == 0.0) {
+        return Int8QuantResult {
+            qdata: vec![0i8; m * n],
+            scale: vec![1.0; int8_zero_scale_len(mode, m, n, block_size)],
+            scale_shape: int8_zero_scale_shape(mode, m, n, block_size),
+        };
+    }
+
+    match mode {
+        ScalingMode::Tensor => {
+            let w_max = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            // Clipped absmax. The `clamp_min` stays for the same reason it does
+            // in the base path: `clip_ratio` shrinks the value, so a tensor
+            // whose absmax is below the floor would otherwise divide by ~0.
+            let dequant_scale = (w_max * clip_ratio).max(1e-12) / 127.0;
+            let quant_scale = 1.0 / dequant_scale;
+            Int8QuantResult {
+                qdata: quantize_scaled(w, quant_scale),
+                scale: vec![dequant_scale],
+                scale_shape: vec![1],
+            }
+        }
+        ScalingMode::Row => {
+            let mut scale = Vec::with_capacity(m);
+            let mut qdata = Vec::with_capacity(m * n);
+            let rows: Vec<&[f32]> = w.chunks_exact(n).collect();
+            let out: Vec<(f32, Vec<i8>)> = rows
+                .par_iter()
+                .map(|row| {
+                    let row_max = row.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    let clipped = (row_max * clip_ratio).max(1e-12);
+                    // torch: 127.0 / clipped  →  127.0 * reciprocal(clipped)
+                    let quant_scale = 127.0f32 * (1.0f32 / clipped);
+                    // torch: 1.0 / quant_scale  →  1.0 * reciprocal(quant_scale)
+                    let dequant_scale = 1.0f32 / quant_scale;
+                    (dequant_scale, quantize_scaled(row, quant_scale))
+                })
+                .collect();
+            for (s, q) in out {
+                scale.push(s);
+                qdata.extend(q);
+            }
+            Int8QuantResult {
+                qdata,
+                scale,
+                scale_shape: vec![m as u64, 1],
+            }
+        }
+        ScalingMode::Block => {
+            assert!(
+                m.is_multiple_of(block_size) && n.is_multiple_of(block_size),
+                "INT8 block-wise requires dims divisible by block_size={block_size}, got ({m}, {n})"
+            );
+            let bm = m / block_size;
+            let bn = n / block_size;
+            // Per-block amax over the (bs, bs) tile, clipped, then the same
+            // `max(scale, 1e-8)` floor the base path applies.
+            let mut scale = vec![0.0f32; bm * bn];
+            scale
+                .par_chunks_mut(bn)
+                .enumerate()
+                .for_each(|(bi, scale_row)| {
+                    for bj in 0..bn {
+                        let mut amax = 0.0f32;
+                        for i in bi * block_size..(bi + 1) * block_size {
+                            let row = &w[i * n..(i + 1) * n];
+                            for &v in &row[bj * block_size..(bj + 1) * block_size] {
+                                amax = amax.max(v.abs());
+                            }
+                        }
+                        scale_row[bj] = (amax * clip_ratio / 127.0).max(1e-8);
+                    }
+                });
+            let n_blocks_row = bn;
+            let q_chunks: Vec<Vec<i8>> = (0..bm)
+                .into_par_iter()
+                .map(|bi| {
+                    let mut out = Vec::with_capacity(block_size * n);
+                    for i in bi * block_size..(bi + 1) * block_size {
+                        let row = &w[i * n..(i + 1) * n];
+                        for bj in 0..bn {
+                            let s = scale[bi * n_blocks_row + bj];
+                            let tile = &row[bj * block_size..(bj + 1) * block_size];
+                            out.extend(tile.iter().map(|&v| round_clamp_i8(v / s)));
+                        }
+                    }
+                    out
+                })
+                .collect();
+            let mut qdata = Vec::with_capacity(m * n);
+            for chunk in q_chunks {
+                qdata.extend(chunk);
+            }
+            Int8QuantResult {
+                qdata,
+                scale,
+                scale_shape: vec![bm as u64, bn as u64],
+            }
+        }
+    }
+}
+
 /// Dequantize back to f32 (for bias correction later; exposed for tests now).
 pub fn dequantize_int8(
     q: &[i8],
@@ -253,6 +426,35 @@ impl ExcludePattern {
 }
 
 // --- shared helpers -------------------------------------------------------- //
+
+/// Scale-tensor SHAPE for the all-zeros early return, per scaling mode.
+///
+/// Extracted so [`quantize_int8_weight_clipped`] gets the same arm without
+/// duplicating the match. `quantize_int8_weight` keeps its own inline copy of
+/// this logic on purpose: it is a parity-critical function whose text is pinned
+/// by review, and it should not be made to depend on a helper that a later edit
+/// could move underneath it. The two are asserted equal by
+/// `clipped_zero_tensor_matches_base_shapes`.
+fn int8_zero_scale_shape(mode: ScalingMode, m: usize, n: usize, block_size: usize) -> Vec<u64> {
+    match mode {
+        ScalingMode::Tensor => vec![1],
+        ScalingMode::Row => vec![m as u64, 1],
+        ScalingMode::Block => {
+            let bm = m / block_size;
+            let bn = n / block_size;
+            vec![bm as u64, bn as u64]
+        }
+    }
+}
+
+/// Element count of [`int8_zero_scale_shape`] — always the product of its dims.
+fn int8_zero_scale_len(mode: ScalingMode, m: usize, n: usize, block_size: usize) -> usize {
+    match mode {
+        ScalingMode::Tensor => 1,
+        ScalingMode::Row => m,
+        ScalingMode::Block => (m / block_size) * (n / block_size),
+    }
+}
 
 #[inline]
 fn round_clamp_i8(scaled: f32) -> i8 {
@@ -396,6 +598,158 @@ mod tests {
         }
         assert_eq!(par.qdata, seq_q);
         assert_eq!(par.scale, seq_s);
+    }
+
+    // --- quantize_int8_weight_clipped (Tier 2 S07) ------------------------- //
+
+    /// The single most important property: at `clip_ratio = 1.0` the clipped
+    /// kernel must be **bit-identical** to the base kernel, in every scaling
+    /// mode. This is what makes "the base function is unchanged" a checkable
+    /// claim rather than an assertion — the new code is a generalization of the
+    /// old one, and `ratio = 1.0` is the specialization that must reduce to it.
+    ///
+    /// If a future edit perturbs the shared float semantics (the
+    /// reciprocal-multiply quirk in particular), this fails immediately.
+    #[test]
+    fn clip_ratio_one_is_bit_identical_to_the_base_kernel() {
+        let (m, n, bs) = (256usize, 128usize, 128usize);
+        let mut w = vec![0.0f32; m * n];
+        let mut x: u64 = 0x243F6A8885A308D3;
+        for v in &mut w {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *v = ((x % 20_000) as f32 / 10_000.0) - 1.0;
+        }
+        for mode in [ScalingMode::Tensor, ScalingMode::Row, ScalingMode::Block] {
+            let base = quantize_int8_weight(&w, m, n, mode, bs);
+            let clipped = quantize_int8_weight_clipped(&w, m, n, mode, bs, 1.0);
+            assert_eq!(base.qdata, clipped.qdata, "qdata differs in {mode:?}");
+            assert_eq!(base.scale, clipped.scale, "scale differs in {mode:?}");
+            assert_eq!(
+                base.scale_shape, clipped.scale_shape,
+                "scale_shape differs in {mode:?}"
+            );
+        }
+    }
+
+    /// The zero-tensor early return must produce the SAME shape and scale as
+    /// the base path. Guards the extracted helpers against drifting away from
+    /// the inline match they were extracted from.
+    #[test]
+    fn clipped_zero_tensor_matches_base_shapes() {
+        for (m, n, bs) in [(256usize, 128usize, 128usize), (4usize, 4usize, 1usize)] {
+            let w = vec![0.0f32; m * n];
+            for mode in [ScalingMode::Tensor, ScalingMode::Row, ScalingMode::Block] {
+                let base = quantize_int8_weight(&w, m, n, mode, bs);
+                let clipped = quantize_int8_weight_clipped(&w, m, n, mode, bs, INT8_CLIP_RATIO);
+                assert_eq!(base.scale_shape, clipped.scale_shape, "{mode:?}");
+                assert_eq!(base.scale, clipped.scale, "{mode:?}");
+                assert!(clipped.qdata.iter().all(|&v| v == 0), "{mode:?}");
+            }
+        }
+    }
+
+    /// Hand-computed row-mode case: clipping must shrink the dequant scale by
+    /// exactly the ratio, and the row's max element must then SATURATE.
+    ///
+    /// Row = [8, -4, 1, 2], row_max = 8, ratio 0.9 → clipped amax 7.2 →
+    /// quant_scale = 127/7.2 → 8 maps to 8 * 17.638.. = 141.1 → clamps to 127.
+    /// The saturation is the entire mechanism: without it this function would
+    /// be a no-op rescale.
+    #[test]
+    fn clipped_row_saturates_the_max_element() {
+        let w = [8.0f32, -4.0, 1.0, 2.0, 100.0, 0.5];
+        let r = quantize_int8_weight_clipped(&w, 3, 2, ScalingMode::Row, 128, 0.9);
+
+        // Row 0: unclipped would give qdata[0] == 127 exactly. Clipped, the
+        // same element overflows and must clamp to the same 127 — which is why
+        // "did the max element change?" is NOT a valid saturation check.
+        assert_eq!(r.qdata[0], 127);
+        // Row 2 (amax 100) is where clipping is visible in the DATA: unclipped
+        // it also gives 127, but the small element beside it gets more codes.
+        assert_eq!(r.qdata[4], 127, "row 2 max still saturates at 127");
+
+        // The dequant scale is `clipped_amax / 127` (as a reciprocal chain).
+        let qs = 127.0f32 * (1.0f32 / (100.0f32 * 0.9));
+        assert_eq!(r.scale[2], 1.0f32 / qs, "scale must use the clipped amax");
+        // And it is strictly SMALLER than the unclipped scale — clipping trades
+        // range for precision, so the step must get finer, not coarser.
+        let base = quantize_int8_weight(&w, 3, 2, ScalingMode::Row, 128);
+        assert!(
+            r.scale[2] < base.scale[2],
+            "clipping must shrink the step: {} vs {}",
+            r.scale[2],
+            base.scale[2]
+        );
+    }
+
+    /// A non-saturating element must get genuinely FINER resolution — the
+    /// positive half of the trade, and the only reason clipping could ever be
+    /// worth shipping.
+    ///
+    /// The mechanism, stated carefully because it is easy to get backwards: a
+    /// smaller `row_max` means a SMALLER dequant step, so the same value maps
+    /// to a LARGER integer code. So the assertion is on the RECONSTRUCTION
+    /// (which is what "finer" means), not on the integer moving toward zero.
+    ///
+    /// Row [100, 0.5]: unclipped the step is 100/127 = 0.787, so `0.5` lands on
+    /// code 1 and reconstructs to 0.787. Clipped the step is 90/127 = 0.709, so
+    /// it still lands on code 1 but reconstructs to 0.709 — closer to 0.5.
+    #[test]
+    fn clipping_gives_small_elements_finer_resolution() {
+        let w = [100.0f32, 0.5];
+        let base = quantize_int8_weight(&w, 1, 2, ScalingMode::Row, 128);
+        let clipped = quantize_int8_weight_clipped(&w, 1, 2, ScalingMode::Row, 128, 0.9);
+
+        // Finer step: the dequant scale (which IS the step) shrinks by the ratio.
+        assert!(
+            clipped.scale[0] < base.scale[0],
+            "clipping must shrink the step: {} vs {}",
+            clipped.scale[0],
+            base.scale[0]
+        );
+
+        // The claim that matters: the small element reconstructs MORE closely.
+        let recon = |r: &Int8QuantResult| f32::from(r.qdata[1]) * r.scale[0];
+        let err = |v: f32| (v - 0.5f32).abs();
+        assert!(
+            err(recon(&clipped)) < err(recon(&base)),
+            "the unsaturated element must reconstruct more closely: clipped err {} vs base err {}",
+            err(recon(&clipped)),
+            err(recon(&base))
+        );
+        // The max still saturates at the top code in both arms — which is why
+        // "did the max element change?" is not a valid check that clipping ran.
+        assert_eq!(clipped.qdata[0], base.qdata[0]);
+    }
+
+    /// A ratio outside `(0, 1]` is a caller bug, not something to silently
+    /// clamp. A ratio of 0 would divide by ~0; a ratio > 1 would *expand* the
+    /// range and is the opposite of the intended trade, so both are rejected
+    /// loudly rather than producing a plausible-looking artifact.
+    #[test]
+    #[should_panic(expected = "clip ratio must be in (0, 1]")]
+    fn clip_ratio_out_of_range_is_rejected() {
+        let w = [1.0f32, 2.0];
+        quantize_int8_weight_clipped(&w, 1, 2, ScalingMode::Row, 128, 1.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "clip ratio must be in (0, 1]")]
+    fn clip_ratio_zero_is_rejected() {
+        let w = [1.0f32, 2.0];
+        quantize_int8_weight_clipped(&w, 1, 2, ScalingMode::Row, 128, 0.0);
+    }
+
+    /// The all-zeros arm must fire BEFORE the ratio assert would matter, i.e.
+    /// a valid zero tensor with any legal ratio is still a clean early return.
+    #[test]
+    fn clipped_zero_tensor_is_fine_at_the_shipped_ratio() {
+        let w = vec![0.0f32; 8 * 4];
+        let r = quantize_int8_weight_clipped(&w, 8, 4, ScalingMode::Row, 128, INT8_CLIP_RATIO);
+        assert_eq!(r.scale, vec![1.0; 8]);
+        assert_eq!(r.scale_shape, vec![8, 1]);
     }
 
     #[test]

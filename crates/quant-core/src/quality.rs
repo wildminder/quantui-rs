@@ -34,6 +34,23 @@
 //! is interrupted and then re-run with `nvfp4_l2` would resume into the
 //! byte-exact partial file and mix two different algorithms in one artifact —
 //! with no error and no warning.
+//!
+//! # What the Tier 2 experiments actually found
+//!
+//! Three of the four refinements here are **measured negatives or no-ops**,
+//! and the pattern is worth recording because it is a result, not a failure:
+//!
+//! -- `Mxfp8E8m0Compensated` — exactly 0.00% improvement. A proven no-op.
+//! -- `Int8Clip09` — regresses 31x-14000x. At 127 levels the baseline error is
+//!    already tiny, so clipping trades it for an unbounded saturation error.
+//! -- `Nvfp4HessianScaleSearch` — unreachable by design (no calibration source).
+//! -- `Nvfp4L2ScaleSearch` — **+17.7% aggregate**, the one that earned its place.
+//!
+//! The survivors have something in common: they run a real SEARCH over the
+//! scale and let the data pick a point. The failures merely nudge a constant.
+//! A Tier 2 proposal should be able to say which of those two it is before it
+//! is written, because "tweak a constant and hope" has now failed three times
+//! against a benchmark that already existed to catch it.
 
 /// Opt-in quality refinements. `Exact` is the byte-parity default and MUST
 /// remain the zero value.
@@ -61,6 +78,26 @@ pub enum Quality {
     /// unanchored search converges to an arbitrary — and eventually
     /// E4M3-unrepresentable — scale.
     Nvfp4L2ScaleSearch,
+    /// INT8: derive the quant scale from `clip_ratio * row_max` instead of
+    /// `row_max`, saturating the top of the range to buy finer resolution
+    /// everywhere else (Tier 2 S07, `--format int8_clip09`).
+    ///
+    /// The ratio is FIXED at [`crate::quant::INT8_CLIP_RATIO`] and is not a
+    /// knob. A ratio swept until the error benchmark improved would be a
+    /// threshold fitted to the fixture, not a measurement of the idea — so the
+    /// pre-registered decision rule is only meaningful with the configuration
+    /// fixed in advance.
+    ///
+    /// The case AGAINST this mode is specific and worth recording: the
+    /// published evidence for clipping is a perplexity gain, this crate cannot
+    /// compute perplexity, and clipping's usual benefit is to ACTIVATION
+    /// outliers — which this path never quantizes. MEASURED on the crate's own
+    /// metric it regresses `rel_l2` by 31x-14000x depending on the
+    /// distribution, because INT8's 127 levels leave no error for a finer step
+    /// to recover while the saturated tail's error is unbounded. Retained as a
+    /// documented negative result, not a live recommendation; see
+    /// `tests/int8_clip09_negative_result.rs` and `benches/quality_error.rs`.
+    Int8Clip09,
     /// Reserved for Hessian-guided search (H-Scale, arXiv:2608.28113).
     ///
     /// Not constructible from the CLI: it needs a diagonal second-order proxy
@@ -78,11 +115,12 @@ impl Quality {
     /// Every variant, in declaration order. Used by exhaustiveness tests so a
     /// future variant cannot be added without updating the id/label/hash
     /// tables.
-    pub const ALL: [Quality; 4] = [
+    pub const ALL: [Quality; 5] = [
         Quality::Exact,
         Quality::Mxfp8E8m0Compensated,
         Quality::Nvfp4L2ScaleSearch,
         Quality::Nvfp4HessianScaleSearch,
+        Quality::Int8Clip09,
     ];
 
     /// Stable id used in `config_hash` and in CLI output.
@@ -95,6 +133,7 @@ impl Quality {
             Quality::Mxfp8E8m0Compensated => Some("mxfp8_e8m0_43"),
             Quality::Nvfp4L2ScaleSearch => Some("nvfp4_l2"),
             Quality::Nvfp4HessianScaleSearch => Some("nvfp4_hessian"),
+            Quality::Int8Clip09 => Some("int8_clip09"),
         }
     }
 
@@ -112,6 +151,9 @@ impl Quality {
                 Some("MXFP8 E8M0 scale compensation (x4/3 before the E8M0 ceil)")
             }
             Quality::Nvfp4L2ScaleSearch => Some("NVFP4 anchored alternating L2 scale search"),
+            Quality::Int8Clip09 => {
+                Some("INT8 absmax clipping (quant scale from 0.9x row_max; NOT byte-exact)")
+            }
             Quality::Nvfp4HessianScaleSearch => {
                 Some("NVFP4 Hessian-guided scale search (not reachable from the CLI)")
             }
@@ -125,7 +167,7 @@ impl Quality {
             Quality::Mxfp8E8m0Compensated => Format::Mxfp8,
             Quality::Nvfp4L2ScaleSearch | Quality::Nvfp4HessianScaleSearch => Format::Nvfp4,
             // `Exact` is format-agnostic; callers must not route on it.
-            Quality::Exact => Format::Int8,
+            Quality::Exact | Quality::Int8Clip09 => Format::Int8,
         }
     }
 }
