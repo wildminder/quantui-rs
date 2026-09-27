@@ -28,6 +28,8 @@ use std::path::Path;
 use rlx_gguf::{GgmlType, GgufFile};
 
 use crate::gguf_names::hf_to_gguf_name;
+use crate::manifest::Format;
+use crate::quality::Quality;
 
 /// Classification of one differing tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,34 @@ pub enum DiffKind {
     /// worse than a false alarm, so every other case stays
     /// [`GenuineDivergence`](Self::GenuineDivergence).
     FormatConformance,
+    /// The two sides differ because OUR file was produced by an **opt-in
+    /// quality refinement** ([`crate::quality::Quality`]) — a deliberate,
+    /// documented departure from the reference algorithm, not a bug.
+    ///
+    /// This is the `--verify-against` self-identification mechanism: a user
+    /// who knowingly ran a quality mode should read `quality-tuned`, not
+    /// `GENUINE DIVERGENCE`, which is reserved for "the quantizers disagree
+    /// and we do not know why".
+    ///
+    /// Deliberately conservative in the same direction as
+    /// [`FormatConformance`](Self::FormatConformance): the label is applied
+    /// only when the caller has *declared* that our side is quality-tuned
+    /// (see [`verify_against_with_quality`]) **and** the quality variant
+    /// actually refines that tensor's format family
+    /// ([`Quality::applies_to`]). Nothing is inferred from the payload bytes,
+    /// because inferring "this looks like a quality difference" is exactly the
+    /// mis-classification that would hide a real bug. A byte-exact run can
+    /// therefore never receive this label.
+    ///
+    /// ⚠️ **GGUF PATH ONLY.** `--verify-against` is a `GgufArgs` flag. The
+    /// safetensors `quantize` path's `--verify-output` is a **header-only
+    /// re-parse** (`quantize.rs`, `verify_output_files`) with **no payload
+    /// comparison whatsoever**, so there is nothing there for this to
+    /// classify. The parity guarantee on that path is carried by the printed
+    /// `parity:` marker line and the self-documenting `--format` id — NOT by
+    /// payload verification. Do not read this variant as implying that
+    /// safetensors payload diffing exists.
+    QualityTuned,
 }
 
 /// One differing tensor in the report.
@@ -93,6 +123,13 @@ pub struct VerifyReport {
 
 impl VerifyReport {
     /// `X byte-exact, Y numerically-equivalent, Z divergent` summary counts.
+    ///
+    /// [`DiffKind::QualityTuned`] counts in `Y`, not `Z`: a declared quality
+    /// difference is an expected outcome, so folding it into `Z` would keep
+    /// reporting it as a bug, and giving it a fourth bucket would change this
+    /// function's public tuple arity for no gain in meaning. The per-tensor
+    /// lines still print the precise `kind_label`, so the distinction is
+    /// visible where it matters.
     pub fn summary(&self) -> (usize, usize, usize) {
         let y = self
             .diffs
@@ -191,10 +228,38 @@ pub fn audit_gguf(path: &Path) -> Result<GgufAudit, String> {
 }
 
 /// Compare OUR converted GGUF against a reference GGUF (e.g. produced by
-/// unsloth / llama-quantize). Both files are parsed with rlx-gguf; tensor
-/// payloads are read through the parser's own accessor so offsets and
-/// alignment are handled by the spec-compliant code path.
+/// unsloth / llama-quantize), assuming OUR side is byte-parity-exact.
+///
+/// This is the conservative entry point and delegates to
+/// [`verify_against_with_quality`] with [`Quality::Exact`], so every payload
+/// difference that is not otherwise explained is still reported as
+/// [`DiffKind::GenuineDivergence`] — exactly as before this tier. Callers that
+/// *know* they ran a quality mode must use the `_with_quality` form; there is
+/// no inference, because inferring "this looks like a quality difference" from
+/// the bytes would be exactly the mis-classification that hides a real bug.
 pub fn verify_against(ours: &Path, reference: &Path) -> Result<VerifyReport, String> {
+    verify_against_with_quality(ours, reference, Quality::Exact)
+}
+
+/// [`verify_against`], with the quality OUR file was produced under declared
+/// explicitly.
+///
+/// `ours_quality` is the *sole* justification for a
+/// [`DiffKind::QualityTuned`] verdict, and it is checked against
+/// [`Quality::applies_to`] per tensor family. Passing
+/// [`Quality::Exact`] — or passing a quality mode that refines a different
+/// format than the tensor under test — reproduces the previous behaviour
+/// exactly.
+///
+/// ⚠️ **GGUF path only.** This module is reachable solely from `--verify-against`,
+/// a `GgufArgs` flag. The safetensors `quantize` path's `--verify-output` is a
+/// **header-only re-parse** with **no payload comparison at all**, so no
+/// equivalent safetensors mechanism exists today; do not imply one does.
+pub fn verify_against_with_quality(
+    ours: &Path,
+    reference: &Path,
+    ours_quality: Quality,
+) -> Result<VerifyReport, String> {
     let fo = GgufFile::from_path(ours).map_err(|e| format!("parsing {}: {e}", ours.display()))?;
     let fr = GgufFile::from_path(reference)
         .map_err(|e| format!("parsing {}: {e}", reference.display()))?;
@@ -262,7 +327,7 @@ pub fn verify_against(ours: &Path, reference: &Path) -> Result<VerifyReport, Str
             .zip(vals_r.iter())
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0f64, f64::max);
-        let kind = classify(t, ob, rb, diff_blocks);
+        let kind = classify(t, ob, rb, diff_blocks, ours_quality);
         report.diffs.push(TensorDiff {
             name: gguf_name,
             our_dtype: t.dtype,
@@ -285,8 +350,21 @@ pub fn verify_against(ours: &Path, reference: &Path) -> Result<VerifyReport, Str
 /// Classification of one differing payload (probe_block_stats.py logic):
 /// - all differing blocks have d == 0 on BOTH sides → dead-block cosmetic;
 /// - differing scales but reconstruction within tolerance → scale-rule diff;
+/// - the caller declared our side quality-tuned for THIS format family and
+///   the difference is not more specifically explained → quality-tuned;
 /// - everything else → genuine divergence.
-fn classify(t: &rlx_gguf::GgufTensor, ob: &[u8], rb: &[u8], _diff_blocks: usize) -> DiffKind {
+///
+/// `ours_quality` must be the quality the caller actually ran with, never a
+/// guess. It is the *only* input that can produce
+/// [`DiffKind::QualityTuned`], so a byte-exact run can never receive that
+/// label — see the variant's docs for why that direction is the safe one.
+fn classify(
+    t: &rlx_gguf::GgufTensor,
+    ob: &[u8],
+    rb: &[u8],
+    _diff_blocks: usize,
+    ours_quality: Quality,
+) -> DiffKind {
     match t.dtype {
         GgmlType::Q8_0 => {
             // 34-byte blocks: f16 d + 32 i8.
@@ -351,12 +429,42 @@ fn classify(t: &rlx_gguf::GgufTensor, ob: &[u8], rb: &[u8], _diff_blocks: usize)
         GgmlType::NVFP4 => {
             if is_nvfp4_e4m3_scale_policy_only(ob, rb) {
                 DiffKind::FormatConformance
+            } else if quality_refines(ours_quality, Format::Nvfp4) {
+                // A declared NVFP4 quality mode (the anchored L2 scale search)
+                // changes the block scales, so the codes legitimately differ
+                // from a byte-exact reference. That is the mode working, not a
+                // bug — but ONLY because the caller declared it.
+                DiffKind::QualityTuned
+            } else {
+                DiffKind::GenuineDivergence
+            }
+        }
+        // MXFP4 is the GGUF-side counterpart of the MXFP8 family, so a
+        // declared MXFP8 quality mode explains a difference here for the same
+        // reason. No current quality variant is reachable from the CLI, so
+        // this arm is presently inert — it is wired so that adding a preset
+        // cannot silently start reporting `GENUINE DIVERGENCE` for output the
+        // tool itself deliberately produced differently.
+        GgmlType::MXFP4 => {
+            if quality_refines(ours_quality, Format::Mxfp8) {
+                DiffKind::QualityTuned
             } else {
                 DiffKind::GenuineDivergence
             }
         }
         _ => DiffKind::GenuineDivergence,
     }
+}
+
+/// `true` iff `quality` is a non-default refinement OF `family`.
+///
+/// Both halves matter. A non-`Exact` quality that refines a *different*
+/// family must not excuse a difference here: `applies_to()` is what stops a
+/// declared NVFP4 search from masking a genuine divergence in, say, a Q8_0
+/// tensor in the same file. And `Exact` must never match, so the default
+/// byte-exact path keeps reporting `GENUINE DIVERGENCE` exactly as before.
+fn quality_refines(quality: Quality, family: Format) -> bool {
+    !quality.is_parity_exact() && quality.applies_to() == family
 }
 
 /// NVFP4 block geometry (rlx-gguf 0.2.14 `mx_dequant.rs`):
@@ -494,5 +602,89 @@ fn type_name(t: GgmlType) -> &'static str {
         GgmlType::MXFP4 => "MXFP4",
         GgmlType::NVFP4 => "NVFP4",
         _ => "OTHER",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quality_refines, DiffKind};
+    use crate::manifest::Format;
+    use crate::quality::Quality;
+
+    /// `Exact` must NEVER excuse a difference.
+    ///
+    /// This is the load-bearing safety property: a byte-exact run that reports
+    /// `quality-tuned` instead of `GENUINE DIVERGENCE` would hide real bugs
+    /// behind a reassuring label. Every other test here is worthless if this
+    /// one fails.
+    #[test]
+    fn exact_never_refines_anything() {
+        for family in [Format::Int8, Format::Fp8E4m3, Format::Mxfp8, Format::Nvfp4] {
+            assert!(
+                !quality_refines(Quality::Exact, family),
+                "Exact must not excuse a difference in {family:?}"
+            );
+        }
+    }
+
+    /// A quality mode excuses a difference ONLY in the family it refines.
+    ///
+    /// Both directions are asserted. The forward case is the feature; the
+    /// reverse case is the guard — a declared NVFP4 scale search must not
+    /// launder a genuine divergence in some other format in the same file,
+    /// which is exactly what a `!is_parity_exact()`-only check would do.
+    #[test]
+    fn a_quality_mode_excuses_only_its_own_family() {
+        assert!(quality_refines(Quality::Nvfp4L2ScaleSearch, Format::Nvfp4));
+        assert!(quality_refines(
+            Quality::Mxfp8E8m0Compensated,
+            Format::Mxfp8
+        ));
+        // Cross-family: must NOT match.
+        assert!(!quality_refines(Quality::Nvfp4L2ScaleSearch, Format::Mxfp8));
+        assert!(!quality_refines(
+            Quality::Nvfp4HessianScaleSearch,
+            Format::Int8
+        ));
+    }
+
+    /// The label a quality difference carries must not read like a bug.
+    ///
+    /// Asserted structurally rather than by snapshotting the CLI's private
+    /// `kind_label` (a BIN-only crate cannot be imported here): what matters
+    /// in core is that the variant exists, is distinct from
+    /// `GenuineDivergence`, and is produced only under the narrow condition
+    /// `quality_refines` encodes.
+    #[test]
+    fn quality_tuned_is_a_distinct_variant_from_genuine_divergence() {
+        assert_ne!(
+            DiffKind::QualityTuned,
+            DiffKind::GenuineDivergence,
+            "a declared quality difference must be distinguishable from a bug"
+        );
+        // The classification is reachable at all (not a dead variant).
+        let kinds = [
+            DiffKind::DeadBlockCosmetic,
+            DiffKind::ScaleRuleDiff,
+            DiffKind::GenuineDivergence,
+            DiffKind::FormatConformance,
+            DiffKind::QualityTuned,
+        ];
+        let mut seen = kinds.to_vec();
+        seen.sort_by_key(|k| format!("{k:?}"));
+        seen.dedup();
+        assert_eq!(seen.len(), kinds.len(), "all five variants are distinct");
+    }
+
+    /// A quality mode for a DIFFERENT family must not be reachable through the
+    /// NVFP4 arm, even when declared. This is the concrete scenario the
+    /// `applies_to` check exists for: an MXFP8 run whose file also carries an
+    /// NVFP4 tensor must still report that tensor's divergence honestly.
+    #[test]
+    fn an_unrelated_quality_mode_does_not_excuse_nvfp4() {
+        assert!(
+            !quality_refines(Quality::Mxfp8E8m0Compensated, Format::Nvfp4),
+            "an MXFP8 quality mode must not excuse an NVFP4 difference"
+        );
     }
 }

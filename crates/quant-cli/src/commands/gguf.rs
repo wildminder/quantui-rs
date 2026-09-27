@@ -411,6 +411,13 @@ pub fn run(args: GgufArgs) -> ExitCode {
             // reference GGUF. Report tool: exit 0 regardless of diffs,
             // UNLESS our own file has spec violations (then exit 3).
             if let Some(ref_path) = &args.verify_against {
+                // `verify_against` (not `_with_quality`) on purpose: the GGUF
+                // conversion path has no quality refinement of its own, so our
+                // side is always byte-parity-exact and any unexplained payload
+                // difference really is a candidate bug. Passing a quality here
+                // would let `DiffKind::QualityTuned` excuse real divergences.
+                // When a GGUF-side quality mode is added, switch to
+                // `verify_against_with_quality` with the mode actually run.
                 match quant_core::gguf_verify::verify_against(&report.output, ref_path) {
                     Ok(vr) => {
                         let (exact, equiv, divergent) = vr.summary();
@@ -535,12 +542,20 @@ pub fn run(args: GgufArgs) -> ExitCode {
 }
 
 /// Short human label for a verify-against diff classification.
+///
+/// The match is deliberately exhaustive with no `_` arm: adding a
+/// [`DiffKind`] variant must break the build here rather than silently print
+/// an empty or wrong label into `--verify-against` output.
 fn kind_label(k: quant_core::gguf_verify::DiffKind) -> &'static str {
     match k {
         quant_core::gguf_verify::DiffKind::DeadBlockCosmetic => "dead-block cosmetic",
         quant_core::gguf_verify::DiffKind::ScaleRuleDiff => "scale-rule diff",
         quant_core::gguf_verify::DiffKind::GenuineDivergence => "GENUINE DIVERGENCE",
         quant_core::gguf_verify::DiffKind::FormatConformance => "format-conformance",
+        // Lowercase and unalarmed on purpose: this is an EXPECTED difference
+        // from a declared quality mode, not a failure. It must never read like
+        // `GENUINE DIVERGENCE`, and it is the reason that label is shouty.
+        quant_core::gguf_verify::DiffKind::QualityTuned => "quality-tuned",
     }
 }
 
@@ -635,6 +650,7 @@ mod tests {
             (DiffKind::ScaleRuleDiff, "scale-rule diff"),
             (DiffKind::GenuineDivergence, "GENUINE DIVERGENCE"),
             (DiffKind::FormatConformance, "format-conformance"),
+            (DiffKind::QualityTuned, "quality-tuned"),
         ];
 
         for (kind, want) in cases {
@@ -652,7 +668,30 @@ mod tests {
                 }
             }
         }
-        assert_eq!(labels.len(), 4, "one label per DiffKind variant");
+        assert_eq!(labels.len(), 5, "one label per DiffKind variant");
+    }
+
+    /// `quality-tuned` must not be mistakable for a bug report. It is the whole
+    /// point of the variant: a user who knowingly ran a quality mode should not
+    /// read `GENUINE DIVERGENCE`, which is reserved for "the quantizers
+    /// disagree and we do not know why".
+    #[test]
+    fn quality_tuned_is_not_labelled_as_a_bug() {
+        assert_ne!(
+            kind_label(DiffKind::QualityTuned),
+            kind_label(DiffKind::GenuineDivergence)
+        );
+        assert_eq!(kind_label(DiffKind::QualityTuned), "quality-tuned");
+        // Distinct from the other two "this is fine" labels too — a user must
+        // be able to tell a *policy* difference from a *quality* difference.
+        assert_ne!(
+            kind_label(DiffKind::QualityTuned),
+            kind_label(DiffKind::FormatConformance)
+        );
+        assert_ne!(
+            kind_label(DiffKind::QualityTuned),
+            kind_label(DiffKind::ScaleRuleDiff)
+        );
     }
 
     /// The genuine-divergence label is shouty on purpose; the conformance one

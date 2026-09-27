@@ -47,10 +47,13 @@ use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f
 use crate::manifest::{
     CalibOrder, Format, QuantConfig, ScalingMode, StreamState, MANIFEST_VERSION,
 };
-use crate::quant::{dequantize_int8, quantize_int8_weight, should_skip_shape};
+use crate::quality::Quality;
+use crate::quant::{
+    dequantize_int8, quantize_int8_weight, quantize_int8_weight_clipped, should_skip_shape,
+};
 use crate::quant_fp8::{dequantize_fp8, quantize_fp8_weight, Fp8ScalingMode};
 use crate::quant_mxfp8::{dequantize_mxfp8, quantize_mxfp8_weight};
-use crate::quant_nvfp4::{dequantize_nvfp4, quantize_nvfp4_weight};
+use crate::quant_nvfp4::{dequantize_nvfp4, quantize_nvfp4_weight, quantize_nvfp4_weight_quality};
 use crate::st_io::header::TensorInfo;
 use crate::st_io::reader::SafetensorsReader;
 use crate::st_io::writer::IncrementalWriter;
@@ -1085,7 +1088,26 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
                     Some(r.w_rot),
                 )
             } else {
-                let r = quantize_int8_weight(&w_f32, m, n, mode, config.block_size as usize);
+                // ---- quality dispatch (Tier 2 S07) ------------------------ //
+                // `Quality::Exact` — which is every pre-existing INT8
+                // configuration, because `Quality` is the zero value — takes
+                // the frozen `quantize_int8_weight` with the identical arguments
+                // it always got, so `int8` and `int8_convrot` emit
+                // byte-identical artifacts. The `_` arm is a catch-all for the
+                // same reason the NVFP4 site uses one: a quality variant that
+                // refines a DIFFERENT format family must land on the parity
+                // kernel rather than reaching for one that does not apply.
+                let r = match config.quality {
+                    Quality::Int8Clip09 => quantize_int8_weight_clipped(
+                        &w_f32,
+                        m,
+                        n,
+                        mode,
+                        config.block_size as usize,
+                        crate::quant::INT8_CLIP_RATIO,
+                    ),
+                    _ => quantize_int8_weight(&w_f32, m, n, mode, config.block_size as usize),
+                };
                 // <base>.weight_scale F32 with scalar squeeze for 1-element
                 // scales (normalize_tensorwise_scales parity: [1]/[1,1] → []).
                 let scale_shape: Vec<u64> = if r.scale.len() == 1 {
@@ -1261,7 +1283,25 @@ fn compute_weight_outputs<S: TensorSource + ?Sized>(
             };
             let w_src: &[f32] = rotated_w.as_deref().unwrap_or(&w_f32);
 
-            let r = quantize_nvfp4_weight(w_src, m, n);
+            // ---- quality dispatch (the ONLY behavioural branch here) ------- //
+            // `Quality::Exact` — which is every pre-existing configuration,
+            // because `Quality` is the zero value and `Exact.id()` is `None` —
+            // takes the frozen `quantize_nvfp4_weight` below with the identical
+            // arguments it always got, so the emitted bytes are unchanged. The
+            // `_` arm is deliberately a catch-all rather than an explicit
+            // `Quality::Exact`: it means a future quality variant defaults to
+            // the PARITY path instead of silently reaching for a kernel that
+            // may not apply to NVFP4 at all.
+            //
+            // `Mxfp8E8m0Compensated` lands here too, and correctly so — it
+            // refines MXFP8, is measured at exactly 0.00% improvement (a proven
+            // no-op), and is not constructible from the CLI. Pairing it with
+            // `Format::Nvfp4` is a caller error, and the right behaviour for a
+            // no-op is the byte-exact path.
+            let r = match config.quality {
+                Quality::Nvfp4L2ScaleSearch => quantize_nvfp4_weight_quality(w_src, m, n),
+                _ => quantize_nvfp4_weight(w_src, m, n),
+            };
 
             // <name> U8 packed payload at (m_pad, n_pad/2); <base>.weight_scale
             // is the E4M3 tiled (to_blocked) bytes; <base>.weight_scale_2 is the

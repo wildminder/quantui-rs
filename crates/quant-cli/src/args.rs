@@ -39,6 +39,37 @@ pub enum OrigDtypeArg {
 /// `fp8_e4m3` / `mxfp8` / `nvfp4` are wired into the streaming
 /// orchestrator (the all-formats wiring plan, local-only plan document).
 ///
+/// # `--help` is a user-facing contract: how to read these variants
+///
+/// Every variant's help text states, explicitly, whether it is **byte-exact**
+/// against the Python/torch reference and `llama-quantize`. That is the point
+/// of this enum: a user must be able to tell a byte-exact format from a
+/// quality-tuned one **without reading the source**.
+///
+/// Two distinct kinds of non-plain id exist, and they must never be conflated:
+///
+/// (a) **Rotation presets** (`int8_convrot`, `nvfp4_rot16`) change the emitted
+/// bytes, but the rotation is a *parity-exact transform* — a different
+/// algorithm, not a lower-fidelity one. Labelled **byte-exact**.
+/// (b) **Quality modes** are labelled **NOT byte-exact**. `nvfp4_l2` and
+/// `int8_clip09` are the ones reachable from `--format`; the rule is encoded
+/// here and in the `parity:` marker line, which is sourced from
+/// `quant_core::quality::Quality` rather than from any string in this file.
+///
+/// ⚠️ **`nvfp4_l2` is NOT byte-exact, on purpose.** It routes
+/// `stream.rs`'s NVFP4 site to `quantize_nvfp4_weight_quality` (the anchored
+/// alternating L2 scale search, measured at 17.7% aggregate relative-L2
+/// improvement) instead of the frozen `quantize_nvfp4_weight`. It is gated on
+/// `config.quality`, which is `Exact` for every other variant, so no existing
+/// format moves a single byte. Its `Quality::id()` is non-`None`, so it also
+/// gets a distinct `config_hash` — which is what stops a quality run from
+/// resuming into a byte-exact partial file, since
+/// `StreamState::load_manifest` trusts that hash alone.
+///
+/// `Quality::Mxfp8E8m0Compensated` is deliberately **not** reachable: it is
+/// measured at exactly 0.00% improvement (a proven no-op), so wiring it would
+/// offer a "quality" mode that changes nothing but the filename.
+///
 /// `int8_convrot` (plan Phase 7.1) is INT8 **row-wise** with a group-wise
 /// Hadamard rotation applied to the weight before quantization, at a FIXED
 /// group size of 256. `--scaling-mode` / `--block-size` do not apply: the
@@ -77,20 +108,131 @@ pub enum OrigDtypeArg {
 /// `--scaling-mode` / `--block-size` remain usage errors.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatArg {
+    /// `int8` — byte-exact vs the Python/torch reference.
     Int8,
+    /// `fp8_e4m3` — byte-exact vs the Python/torch reference. Scaling mode and
+    /// block size are selectable.
     #[value(name = "fp8_e4m3")]
     Fp8E4m3,
+    /// `mxfp8` — byte-exact vs the Python/torch reference. Fixed block scaling
+    /// at 32, so `--scaling-mode` / `--block-size` are usage errors.
     Mxfp8,
+    /// `nvfp4` — byte-exact vs the Python/torch reference. Fixed block scaling
+    /// at 16, so `--scaling-mode` / `--block-size` are usage errors.
     Nvfp4,
+    /// `int8_convrot` — INT8 row-wise + group-wise Hadamard rotation at group
+    /// size 256. **Byte-exact**, but a different algorithm from plain `int8`.
+    /// The rotation is a parity-exact transform, not a quality trade, so this
+    /// is NOT a quality-tuned format.
     #[value(name = "int8_convrot")]
     Int8Convrot,
-    /// NVFP4 + group-wise Hadamard rotation at group size 16 (== NVFP4's own
-    /// block size). See the module-level warning above before using it.
+    /// `nvfp4_rot16` — NVFP4 + group-wise Hadamard rotation at group size 16
+    /// (== NVFP4's own block size). **Byte-exact**, for the same reason as
+    /// `int8_convrot`: the rotation is parity-exact, so this is NOT a
+    /// quality-tuned format. See the end-to-end warning above before using it.
     #[value(name = "nvfp4_rot16")]
     Nvfp4Rot16,
+    /// `nvfp4_l2` — NVFP4 with the anchored alternating L2 scale search over
+    /// the per-tensor / block scale pair. **NOT byte-exact**: this is the one
+    /// `--format` value that selects a non-`Exact`
+    /// [`quant_core::quality::Quality`], and it exists to buy reconstruction
+    /// accuracy (measured 17.7% aggregate / 21-26% typical relative-L2
+    /// improvement) at the cost of the parity guarantee.
+    ///
+    /// Everything else about it is inherited from `nvfp4`: same E2M1 codes,
+    /// same fixed block scaling at 16, so `--scaling-mode` / `--block-size`
+    /// remain usage errors. Only the *choice of scale grid point* differs.
+    ///
+    /// Reachability is gated on `config.quality` in `stream.rs`; because
+    /// `Quality::Exact` is every other variant's quality, the `nvfp4` path
+    /// there is byte-for-byte unchanged.
+    #[value(name = "nvfp4_l2")]
+    Nvfp4L2,
+    /// `int8_clip09` — INT8 with absmax clipping: the quant scale is derived
+    /// from `0.9 * row_max` instead of `row_max`, so the top 10% of the range
+    /// saturates and everything below it gets a finer step. **NOT byte-exact**
+    /// ([`quant_core::quality::Quality::Int8Clip09`]) — it deliberately
+    /// abandons the reference's absmax scale.
+    ///
+    /// Unlike plain `int8`, this preset takes `--scaling-mode` /
+    /// `--block-size` in all three modes (tensor / row / block): the clip is
+    /// applied to whichever amax the chosen mode already computes, so there is
+    /// no reason to constrain it.
+    ///
+    /// ⚠️ **MEASURED, AND THE MEASUREMENT IS NEGATIVE.** This preset is
+    /// retained as a **documented negative result**, not as a recommended
+    /// mode. Clipping's published benefit is a perplexity gain; this crate
+    /// cannot compute perplexity, and clipping is usually said to help
+    /// ACTIVATION outliers — which this weight-only path never quantizes.
+    ///
+    /// On the crate's own metric (weight-space `rel_l2` through the shipped
+    /// dequantizer) it is not merely unimproved but **catastrophically worse**:
+    /// 31x-14000x the error of plain INT8 depending on the distribution, 0 of 4
+    /// improved. The reason is structural rather than a tuning failure — INT8's
+    /// 127 levels already leave almost no rounding error for a finer step to
+    /// recover, while the saturated tail's error is unbounded. The ratio is
+    /// fixed at 0.9 and is NOT tunable: sweeping it until the benchmark passed
+    /// would be fitting a threshold to the fixture rather than measuring the
+    /// idea. See `tests/int8_clip09_negative_result.rs` and
+    /// `benches/quality_error.rs`.
+    #[value(name = "int8_clip09")]
+    Int8Clip09,
 }
 
 impl FormatArg {
+    /// Every variant, in declaration order.
+    ///
+    /// Read by the `#[cfg(test)]` modules in this crate (a BIN-only crate
+    /// cannot export it to `tests/`) to assert pairwise-distinct `format_id`s,
+    /// distinct auto-names, and a correct parity label for every variant — so a
+    /// new variant cannot be added without also getting all three. `#[cfg_attr]`
+    /// rather than a bare `#[allow]` because the constant IS used, just only
+    /// under test; `dead_code` cannot see across the cfg boundary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const ALL: [FormatArg; 8] = [
+        FormatArg::Int8,
+        FormatArg::Fp8E4m3,
+        FormatArg::Mxfp8,
+        FormatArg::Nvfp4,
+        FormatArg::Int8Convrot,
+        FormatArg::Nvfp4Rot16,
+        FormatArg::Nvfp4L2,
+        FormatArg::Int8Clip09,
+    ];
+
+    /// The `Quality` refinement this `--format` value selects.
+    ///
+    /// This is the **single source of truth** for the `parity:` marker line:
+    /// `quantize::parity_line` reads it rather than matching on [`FormatArg`]
+    /// a second time, so a new preset cannot print an `exact` label it does
+    /// not deserve.
+    ///
+    /// Six of the eight variants are [`Quality::Exact`]. The two rotation
+    /// presets are byte-exact *despite* changing the emitted bytes, because a
+    /// Hadamard rotation is an orthogonal transform: it changes which numbers
+    /// land in which bucket, not the arithmetic. That distinction is exactly
+    /// what a `Quality`-keyed accessor preserves and a "does the id look
+    /// fancy" heuristic would not — the rotation presets are precisely the
+    /// case that would be mislabelled `quality-tuned` by such a heuristic.
+    ///
+    /// Only `Nvfp4L2` and `Int8Clip09` are non-`Exact`. They are deliberately
+    /// routed here and not from a per-format branch inside `stream.rs`,
+    /// because the same table also feeds `config_hash` — so a quality run
+    /// cannot share a resume guard with a parity run.
+    pub fn quality(&self) -> quant_core::quality::Quality {
+        use quant_core::quality::Quality;
+        match self {
+            FormatArg::Int8
+            | FormatArg::Fp8E4m3
+            | FormatArg::Mxfp8
+            | FormatArg::Nvfp4
+            | FormatArg::Int8Convrot
+            | FormatArg::Nvfp4Rot16 => Quality::Exact,
+            FormatArg::Nvfp4L2 => Quality::Nvfp4L2ScaleSearch,
+            FormatArg::Int8Clip09 => Quality::Int8Clip09,
+        }
+    }
+
     /// The CLI value name (used in error messages).
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -100,6 +242,8 @@ impl FormatArg {
             FormatArg::Nvfp4 => "nvfp4",
             FormatArg::Int8Convrot => "int8_convrot",
             FormatArg::Nvfp4Rot16 => "nvfp4_rot16",
+            FormatArg::Nvfp4L2 => "nvfp4_l2",
+            FormatArg::Int8Clip09 => "int8_clip09",
         }
     }
 
@@ -108,11 +252,13 @@ impl FormatArg {
     /// is a usage error (exit 2).
     ///
     /// `Nvfp4Rot16` inherits NVFP4's fixed block scaling (it is NVFP4 plus a
-    /// rotation, not a different scaling scheme).
+    /// rotation, not a different scaling scheme), and so does `Nvfp4L2` (it
+    /// is NVFP4 plus a scale *search*, not a different scaling scheme — the
+    /// search only picks which E4M3 grid point the same block scale lands on).
     pub fn has_fixed_scaling(&self) -> bool {
         matches!(
             self,
-            FormatArg::Mxfp8 | FormatArg::Nvfp4 | FormatArg::Nvfp4Rot16
+            FormatArg::Mxfp8 | FormatArg::Nvfp4 | FormatArg::Nvfp4Rot16 | FormatArg::Nvfp4L2
         )
     }
 }
@@ -128,7 +274,8 @@ pub struct QuantizeArgs {
     /// suggested automatically (`<base>-int8-simple-heur.safetensors` etc.).
     pub output: Option<PathBuf>,
 
-    /// Target format (`int8`, `fp8_e4m3`, `mxfp8`, `nvfp4`).
+    /// Target format (`int8`, `fp8_e4m3`, `mxfp8`, `nvfp4`, `int8_convrot`,
+    /// `nvfp4_rot16`, `nvfp4_l2`).
     #[arg(long, value_enum, default_value_t = FormatArg::Int8)]
     pub format: FormatArg,
 
