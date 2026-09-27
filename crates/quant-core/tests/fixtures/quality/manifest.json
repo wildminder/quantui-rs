@@ -1,0 +1,199 @@
+{
+  "blob_bytes": 205728,
+  "blob_file": "weights.f32",
+  "blob_format": "f32le-rowmajor-c-contiguous",
+  "blob_sha256": "2f3ee7da0495f0cdcd15f33c0e03e32a930c022882b4566ab4435c2baa39d149",
+  "cases": [
+    {
+      "cols": 64,
+      "distribution": "uniform",
+      "id": "uniform/aligned_64x64",
+      "length_elements": 4096,
+      "offset_elements": 0,
+      "rows": 64,
+      "seed": 1592590336,
+      "shape_name": "aligned_64x64"
+    },
+    {
+      "cols": 96,
+      "distribution": "uniform",
+      "id": "uniform/aligned_48x96",
+      "length_elements": 4608,
+      "offset_elements": 4096,
+      "rows": 48,
+      "seed": 1592590337,
+      "shape_name": "aligned_48x96"
+    },
+    {
+      "cols": 53,
+      "distribution": "uniform",
+      "id": "uniform/ragged_37x53",
+      "length_elements": 1961,
+      "offset_elements": 8704,
+      "rows": 37,
+      "seed": 1592590338,
+      "shape_name": "ragged_37x53"
+    },
+    {
+      "cols": 129,
+      "distribution": "uniform",
+      "id": "uniform/ragged_17x129",
+      "length_elements": 2193,
+      "offset_elements": 10665,
+      "rows": 17,
+      "seed": 1592590339,
+      "shape_name": "ragged_17x129"
+    },
+    {
+      "cols": 64,
+      "distribution": "gaussian",
+      "id": "gaussian/aligned_64x64",
+      "length_elements": 4096,
+      "offset_elements": 12858,
+      "rows": 64,
+      "seed": 1592591336,
+      "shape_name": "aligned_64x64"
+    },
+    {
+      "cols": 96,
+      "distribution": "gaussian",
+      "id": "gaussian/aligned_48x96",
+      "length_elements": 4608,
+      "offset_elements": 16954,
+      "rows": 48,
+      "seed": 1592591337,
+      "shape_name": "aligned_48x96"
+    },
+    {
+      "cols": 53,
+      "distribution": "gaussian",
+      "id": "gaussian/ragged_37x53",
+      "length_elements": 1961,
+      "offset_elements": 21562,
+      "rows": 37,
+      "seed": 1592591338,
+      "shape_name": "ragged_37x53"
+    },
+    {
+      "cols": 129,
+      "distribution": "gaussian",
+      "id": "gaussian/ragged_17x129",
+      "length_elements": 2193,
+      "offset_elements": 23523,
+      "rows": 17,
+      "seed": 1592591339,
+      "shape_name": "ragged_17x129"
+    },
+    {
+      "cols": 64,
+      "distribution": "heavy_tail",
+      "id": "heavy_tail/aligned_64x64",
+      "length_elements": 4096,
+      "offset_elements": 25716,
+      "rows": 64,
+      "seed": 1592592336,
+      "shape_name": "aligned_64x64"
+    },
+    {
+      "cols": 96,
+      "distribution": "heavy_tail",
+      "id": "heavy_tail/aligned_48x96",
+      "length_elements": 4608,
+      "offset_elements": 29812,
+      "rows": 48,
+      "seed": 1592592337,
+      "shape_name": "aligned_48x96"
+    },
+    {
+      "cols": 53,
+      "distribution": "heavy_tail",
+      "id": "heavy_tail/ragged_37x53",
+      "length_elements": 1961,
+      "offset_elements": 34420,
+      "rows": 37,
+      "seed": 1592592338,
+      "shape_name": "ragged_37x53"
+    },
+    {
+      "cols": 129,
+      "distribution": "heavy_tail",
+      "id": "heavy_tail/ragged_17x129",
+      "length_elements": 2193,
+      "offset_elements": 36381,
+      "rows": 17,
+      "seed": 1592592339,
+      "shape_name": "ragged_17x129"
+    },
+    {
+      "cols": 64,
+      "distribution": "single_spike",
+      "id": "single_spike/aligned_64x64",
+      "length_elements": 4096,
+      "offset_elements": 38574,
+      "rows": 64,
+      "seed": 1592593336,
+      "shape_name": "aligned_64x64"
+    },
+    {
+      "cols": 96,
+      "distribution": "single_spike",
+      "id": "single_spike/aligned_48x96",
+      "length_elements": 4608,
+      "offset_elements": 42670,
+      "rows": 48,
+      "seed": 1592593337,
+      "shape_name": "aligned_48x96"
+    },
+    {
+      "cols": 53,
+      "distribution": "single_spike",
+      "id": "single_spike/ragged_37x53",
+      "length_elements": 1961,
+      "offset_elements": 47278,
+      "rows": 37,
+      "seed": 1592593338,
+      "shape_name": "ragged_37x53"
+    },
+    {
+      "cols": 129,
+      "distribution": "single_spike",
+      "id": "single_spike/ragged_17x129",
+      "length_elements": 2193,
+      "offset_elements": 49239,
+      "rows": 17,
+      "seed": 1592593339,
+      "shape_name": "ragged_17x129"
+    }
+  ],
+  "distributions": [
+    "uniform",
+    "gaussian",
+    "heavy_tail",
+    "single_spike"
+  ],
+  "generator": "tools/gen_quality_bench.py",
+  "note": "Committed under crates/ on purpose: .gitignore:16 ignores docs/ wholesale, and this file is a build input for benches/quality_error.rs via include_bytes!. See the generator's module docstring.",
+  "schema": "quantui.quality_bench.fixture.v1",
+  "shapes": [
+    {
+      "cols": 64,
+      "name": "aligned_64x64",
+      "rows": 64
+    },
+    {
+      "cols": 96,
+      "name": "aligned_48x96",
+      "rows": 48
+    },
+    {
+      "cols": 53,
+      "name": "ragged_37x53",
+      "rows": 37
+    },
+    {
+      "cols": 129,
+      "name": "ragged_17x129",
+      "rows": 17
+    }
+  ]
+}

@@ -43,3 +43,11 @@ harness = false
 [[bench]]
 name = "stream_small"
 harness = false
+
+# Tier 2 S06: reconstruction-error table for the opt-in quality modes. Prints
+# base-vs-quality rel_l2 per (format, distribution) and applies the
+# pre-registered decision rule. Measurement only — NOT a pass/fail gate
+# (benches do not run in `cargo test`).
+[[bench]]
+name = "quality_error"
+harness = false
