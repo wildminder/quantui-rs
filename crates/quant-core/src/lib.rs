@@ -6,6 +6,9 @@
 //! stubbed or gated behind a phase marker any more.
 
 pub mod comfy_schema;
+// dtype casting for the `cast` subcommand. NOT a quantizer: no scaling, no
+// metadata, and it writes no quantization markers.
+pub mod cast;
 pub mod convrot;
 pub mod dtype;
 pub mod manifest;

@@ -11,7 +11,7 @@ mod progress;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, shells::Shell as CompletableShell};
 
-use args::{GgufArgs, InfoArgs, QuantizeArgs, ValidateArgs};
+use args::{CastArgs, GgufArgs, InfoArgs, QuantizeArgs, ValidateArgs};
 
 /// Standalone, dependency-free-at-runtime CLI for ComfyUI/GGUF model quantization.
 #[derive(Parser, Debug)]
@@ -37,6 +37,11 @@ enum Commands {
     Validate(ValidateArgs),
     /// Inspect a safetensors header without loading tensors.
     Info(InfoArgs),
+    /// Cast a model's float tensors to bf16/f16/f32 in a single output file.
+    ///
+    /// Writes NO quantization metadata: the result is a plain safetensors file,
+    /// not a ComfyUI-quantized one.
+    Cast(CastArgs),
     /// Emit a shell completion script (hidden from --help; documented in
     /// the README's "Shell completions" section). WP8 / NTH-005.
     #[command(hide = true)]
@@ -54,6 +59,7 @@ fn main() -> std::process::ExitCode {
         Commands::Gguf(args) => commands::gguf::run(*args),
         Commands::Validate(args) => commands::validate::run(args),
         Commands::Info(args) => commands::info::run(args),
+        Commands::Cast(args) => commands::cast::run(args),
         Commands::Completions { shell } => {
             // `generate` writes the script to stdout; a broken pipe
             // (quantui-rs completions bash | head) must not panic.

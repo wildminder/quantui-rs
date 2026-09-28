@@ -365,6 +365,41 @@ pub struct InfoArgs {
 }
 
 // --------------------------------------------------------------------------- //
+// cast
+// --------------------------------------------------------------------------- //
+
+/// Target float dtype for the `cast` subcommand.
+///
+/// Deliberately narrower than [`ScalingModeArg`]'s "everything" feel: `cast`
+/// only ever produces one of these three, and mapping them to
+/// [`quant_core::dtype::DType`] is the whole job.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastToArg {
+    /// bfloat16 — 16-bit, 8 exponent bits. The VibeVoice target.
+    Bf16,
+    /// float16 — 16-bit, 5 exponent bits (max finite 65504).
+    F16,
+    /// float32 — 32-bit.
+    F32,
+}
+
+#[derive(Args, Debug)]
+pub struct CastArgs {
+    /// Input: a single `.safetensors` file OR a sharded HF model folder
+    /// (containing `model.safetensors.index.json`). A folder is merged into a
+    /// single output file.
+    pub input: PathBuf,
+
+    /// Output `.safetensors` path. Defaults to `<base>-<tag>.safetensors`
+    /// beside the input, where `<tag>` is the target dtype.
+    pub output: Option<PathBuf>,
+
+    /// Target float dtype for every float tensor in the model.
+    #[arg(long = "to", value_enum)]
+    pub to: CastToArg,
+}
+
+// --------------------------------------------------------------------------- //
 // gguf
 // --------------------------------------------------------------------------- //
 

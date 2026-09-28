@@ -1,0 +1,269 @@
+//! `cast` subcommand — dtype-cast a model into a single-file
+//! bf16/fp16/fp32 `.safetensors`.
+//!
+//! # Why this exists separately from `quantize`
+//!
+//! `quantize`'s output contract REQUIRES ComfyUI quantization metadata: the
+//! `.comfy_quant` blob, `weight_scale` tensors, and
+//! `__metadata__._quantization_metadata`. A plain bf16 file must **not** carry
+//! those — a file that advertises itself as ComfyUI-quantized while containing
+//! nothing quantized loads as a broken model. So this command has its own
+//! contract, and the single most important invariant it maintains is:
+//!
+//! > The output contains **no quantization metadata whatsoever**.
+//!
+//! The only metadata written is `{"format": "pt"}`, which is what
+//! `safetensors.torch.save_file` writes and what the ComfyUI/transformers
+//! loaders expect. It is a format tag, not a quantization marker.
+//!
+//! # Reporting
+//!
+//! This command prints a `cast:` summary and **never** a `parity:` line. In
+//! this repo `parity:` is a load-bearing marker with a fixed meaning
+//! (`Quality::is_parity_exact()` on `quantize` runs — either `exact` or
+//! `quality-tuned`). A cast is neither: f32→bf16 is not reversible, so
+//! claiming byte-exact parity would be false. Emitting `parity:` here would
+//! dilute the marker that makes it meaningful everywhere else.
+//!
+//! # Exit codes
+//!
+//! | code | meaning |
+//! |---|---|
+//! | 0 | success |
+//! | 1 | data error — bf16/f16 overflow refusal, f64 source, unreadable input |
+//! | 2 | usage error — input is neither a file nor a sharded folder |
+//! | 130 | SIGINT |
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use quant_core::cast::{cast_tensor, output_dtype_for, CastError, CastOutcome};
+use quant_core::discover::{self, InputKind};
+use quant_core::dtype::DType;
+use quant_core::st_io::reader::SafetensorsReader;
+use quant_core::st_io::writer::IncrementalWriter;
+use serde_json::{Map, Value};
+
+use crate::args::{CastArgs, CastToArg};
+
+/// Bytes to reserve for the header slot up front.
+///
+/// The reference model is 1204 tensors; each entry costs roughly 100 bytes of
+/// JSON, so ~256 KiB covers it with room to spare. The writer grows the slot
+/// automatically if this is too small (`writer.rs:211`), so this is purely an
+/// optimization that avoids a full-file rewrite mid-run.
+const HEADER_SLOT_HINT: usize = 1 << 18;
+
+/// Map the `--to` flag onto a [`DType`].
+fn target_dtype(to: CastToArg) -> DType {
+    match to {
+        CastToArg::Bf16 => DType::Bf16,
+        CastToArg::F16 => DType::F16,
+        CastToArg::F32 => DType::F32,
+    }
+}
+
+/// Short tag used in the default output filename.
+fn target_tag(to: CastToArg) -> &'static str {
+    match to {
+        CastToArg::Bf16 => "bf16",
+        CastToArg::F16 => "f16",
+        CastToArg::F32 => "f32",
+    }
+}
+
+/// Derive the output path: `<base>-<tag>.safetensors` beside the input.
+///
+/// Mirrors the `suggest_comfy_output` convention (`discover.rs:401`). The base
+/// comes from `classify_input`, which already handles both the single-file
+/// stem and the sharded-folder name.
+fn derive_output(input: &Path, to: CastToArg) -> Result<PathBuf, String> {
+    let base = discover::classify_input(input).1.ok_or_else(|| {
+        format!(
+            "{} is neither a .safetensors file nor a sharded model folder",
+            input.display()
+        )
+    })?;
+    let dir = if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    Ok(dir.join(format!("{base}-{}.safetensors", target_tag(to))))
+}
+
+/// The only metadata this command is allowed to write.
+///
+/// Deliberately a fixed, minimal map. Adding a quantization key here would make
+/// every cast output claim to be a quantized model.
+fn output_metadata() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("format".into(), Value::String("pt".into()));
+    m
+}
+
+/// Print the `cast:` summary (never a `parity:` line).
+fn report(total: usize, verbatim: usize, converted: usize, src_desc: &str, dst: DType) {
+    if converted == 0 {
+        println!("cast: {total} tensors, lossless (verbatim copy)");
+    } else if verbatim == 0 {
+        println!(
+            "cast: {total} tensors, {converted} converted \
+             ({src_desc} -> {dst}, round-to-nearest-even)"
+        );
+    } else {
+        println!(
+            "cast: {total} tensors, {verbatim} verbatim, {converted} converted \
+             ({src_desc} -> {dst}, round-to-nearest-even)"
+        );
+    }
+}
+
+pub fn run(args: CastArgs) -> ExitCode {
+    match run_inner(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_inner(args: CastArgs) -> Result<ExitCode, String> {
+    let started = Instant::now();
+    let target = target_dtype(args.to);
+
+    // --- Input classification (reuses discover; never reimplemented) --------
+    let (kind, base) = discover::classify_input(&args.input);
+    let kind = kind.ok_or_else(|| {
+        format!(
+            "{} is neither a .safetensors file nor a sharded model folder",
+            args.input.display()
+        )
+    })?;
+    let _ = base; // only needed for the default output name, computed below
+
+    let out_path = match &args.output {
+        Some(p) => p.clone(),
+        None => derive_output(&args.input, args.to)?,
+    };
+
+    // --- Build the tensor-name -> shard map --------------------------------
+    // For a single file this is one shard holding everything. For a sharded
+    // folder we use the union header so names map to the right shard, and the
+    // ORDER is the union's first-appearance order (stable across runs, which
+    // is what makes the output byte-deterministic).
+    let shard_paths: Vec<PathBuf> = match kind {
+        InputKind::SingleFile => vec![args.input.clone()],
+        InputKind::ShardedFolder => {
+            let model = discover::discover_shards(&args.input).map_err(|e| e.to_string())?;
+            model.shard_paths()
+        }
+    };
+    if shard_paths.is_empty() {
+        return Err(format!("no .safetensors shards found in {}", args.input.display()));
+    }
+
+    let union = discover::resolve_union(&shard_paths).map_err(|e| e.to_string())?;
+    let name_to_shard: HashMap<&str, usize> = union
+        .name_to_shard
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+
+    // --- Write -------------------------------------------------------------
+    let mut writer = IncrementalWriter::open_new_with(
+        &out_path,
+        HEADER_SLOT_HINT,
+        Some(output_metadata()),
+    )
+    .map_err(|e| format!("creating {}: {e}", out_path.display()))?;
+
+    let mut total = 0usize;
+    let mut verbatim = 0usize;
+    let mut converted = 0usize;
+    let mut saw_non_bf16_source = false;
+
+    // One reader per shard, held open. `iter_tensors` yields BORROWED slices
+    // into each mmap, so a tensor's payload is converted straight into the
+    // output buffer and never all held in memory at once. Peak RSS is
+    // therefore bounded by the largest single tensor (445 MiB for the target
+    // model), not by the 5.04 GiB model size.
+    let mut readers: Vec<SafetensorsReader> = Vec::with_capacity(shard_paths.len());
+    for sp in &shard_paths {
+        readers.push(
+            SafetensorsReader::open(sp)
+                .map_err(|e| format!("opening {}: {e}", sp.display()))?,
+        );
+    }
+
+    for (name, info) in &union.entries {
+        let src = name_to_shard
+            .get(name.as_str())
+            .copied()
+            .ok_or_else(|| format!("internal: no shard for tensor {name:?}"))?;
+        let reader = &readers[src];
+
+        let payload = reader
+            .tensor_bytes(name)
+            .map_err(|e| format!("reading {name}: {e}"))?;
+
+        if !matches!(info.dtype, DType::F32 | DType::F16 | DType::Bf16) {
+            saw_non_bf16_source = true;
+        }
+
+        let (bytes, outcome) = cast_tensor(name, payload, info.dtype, target, &info.shape)
+            .map_err(|e| cast_error_exit(e))?;
+
+        // Non-float tensors keep their ORIGINAL header spelling (the numpy
+        // "U16"-for-bf16 quirk means the source string is not always
+        // derivable from the enum). Float tensors are written under the
+        // target's canonical spelling.
+        let (out_dtype, raw_override) = if matches!(
+            info.dtype,
+            DType::F32 | DType::F16 | DType::Bf16
+        ) {
+            (output_dtype_for(info.dtype, target), None)
+        } else {
+            (info.dtype, Some(info.dtype_raw.as_str()))
+        };
+
+        writer
+            .add_tensor(name, out_dtype, raw_override, &info.shape, &bytes)
+            .map_err(|e| format!("writing {name}: {e}"))?;
+
+        total += 1;
+        match outcome {
+            CastOutcome::Verbatim => verbatim += 1,
+            CastOutcome::Converted => converted += 1,
+        }
+    }
+
+    writer
+        .finalize()
+        .map_err(|e| format!("finalizing {}: {e}", out_path.display()))?;
+
+    // --- Report ------------------------------------------------------------
+    let src_desc = if saw_non_bf16_source {
+        "mixed"
+    } else {
+        "float"
+    };
+    report(total, verbatim, converted, src_desc, target);
+    let _ = started;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Map a conversion error onto the right exit code and message.
+///
+/// Overflow and f64 rejection are **data** errors (exit 1): the command line was
+/// well-formed, the model just cannot be represented. They are NOT usage
+/// errors, so they must not be reported as exit 2.
+fn cast_error_exit(e: CastError) -> String {
+    e.to_string()
+}
