@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use quant_core::cast::{cast_tensor, output_dtype_for, CastError, CastOutcome};
+use quant_core::cast::{cast_tensor, output_dtype_for, CastOutcome};
 use quant_core::discover::{self, InputKind};
 use quant_core::dtype::DType;
 use quant_core::st_io::reader::SafetensorsReader;
@@ -124,6 +124,28 @@ fn report(total: usize, verbatim: usize, converted: usize, src_desc: &str, dst: 
     }
 }
 
+/// Temporary sibling path that the real output is renamed from.
+///
+/// `IncrementalWriter::open_new_with` calls `File::create` immediately, so the
+/// destination path exists from the first moment. If the cast then fails
+/// (e.g. the f16 overflow refusal), the writer is dropped WITHOUT `finalize()`
+/// and a half-built file survives at the destination: a `.safetensors` whose
+/// header parses as valid JSON but which contains zero tensors. To a loader
+/// that is worse than no file at all.
+///
+/// So the writer is pointed at a temporary path and renamed into place only
+/// after `finalize()` succeeds. Same directory as the destination so the
+/// rename is atomic (a cross-device rename would not be, and would silently
+/// degrade to copy+delete).
+fn temp_path_for(out: &Path) -> PathBuf {
+    let stem = out
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out.safetensors".to_string());
+    let dir = out.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".{stem}.cast-tmp"))
+}
+
 pub fn run(args: CastArgs) -> ExitCode {
     match run_inner(args) {
         Ok(code) => code,
@@ -176,94 +198,130 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, String> {
         .map(|(k, v)| (k.as_str(), *v))
         .collect();
 
-    // --- Write -------------------------------------------------------------
-    let mut writer = IncrementalWriter::open_new_with(
-        &out_path,
-        HEADER_SLOT_HINT,
-        Some(output_metadata()),
-    )
-    .map_err(|e| format!("creating {}: {e}", out_path.display()))?;
+    // --- Write (to a temp path, renamed into place only on success) --------
+    //
+    // The closure owns every fallible step after the temp file is created, so
+    // ANY error (overflow refusal, IO failure, missing tensor) removes the
+    // temp file and leaves no output at all. On success the temp file is
+    // renamed over the destination, which is atomic within a directory.
+    let tmp_path = temp_path_for(&out_path);
 
-    let mut total = 0usize;
-    let mut verbatim = 0usize;
-    let mut converted = 0usize;
-    let mut saw_non_bf16_source = false;
+    let write_result = (|| -> Result<(usize, usize, usize, Vec<DType>), String> {
+        let mut writer = IncrementalWriter::open_new_with(
+            &tmp_path,
+            HEADER_SLOT_HINT,
+            Some(output_metadata()),
+        )
+        .map_err(|e| format!("creating {}: {e}", tmp_path.display()))?;
 
-    // One reader per shard, held open. `iter_tensors` yields BORROWED slices
-    // into each mmap, so a tensor's payload is converted straight into the
-    // output buffer and never all held in memory at once. Peak RSS is
-    // therefore bounded by the largest single tensor (445 MiB for the target
-    // model), not by the 5.04 GiB model size.
-    let mut readers: Vec<SafetensorsReader> = Vec::with_capacity(shard_paths.len());
-    for sp in &shard_paths {
-        readers.push(
-            SafetensorsReader::open(sp)
-                .map_err(|e| format!("opening {}: {e}", sp.display()))?,
-        );
-    }
+        let mut total = 0usize;
+        let mut verbatim = 0usize;
+        let mut converted = 0usize;
+        // Distinct FLOAT source dtypes actually seen, in first-appearance
+        // order. A Vec rather than a BTreeSet because `DType` derives
+        // PartialEq but not Ord, and `dtype.rs` is not a file this change may
+        // touch. First-appearance order is also the more useful report order.
+        let mut src_dtypes: Vec<DType> = Vec::new();
 
-    for (name, info) in &union.entries {
-        let src = name_to_shard
-            .get(name.as_str())
-            .copied()
-            .ok_or_else(|| format!("internal: no shard for tensor {name:?}"))?;
-        let reader = &readers[src];
-
-        let payload = reader
-            .tensor_bytes(name)
-            .map_err(|e| format!("reading {name}: {e}"))?;
-
-        if !matches!(info.dtype, DType::F32 | DType::F16 | DType::Bf16) {
-            saw_non_bf16_source = true;
+        // One reader per shard, held open. `tensor_bytes` yields BORROWED
+        // slices into each mmap, so a tensor's payload is converted straight
+        // into the output buffer and never all held in memory at once. Peak RSS
+        // is therefore bounded by the largest single tensor (445 MiB for the
+        // target model), not by the 5.04 GiB model size.
+        let mut readers: Vec<SafetensorsReader> = Vec::with_capacity(shard_paths.len());
+        for sp in &shard_paths {
+            readers.push(
+                SafetensorsReader::open(sp)
+                    .map_err(|e| format!("opening {}: {e}", sp.display()))?,
+            );
         }
 
-        let (bytes, outcome) = cast_tensor(name, payload, info.dtype, target, &info.shape)
-            .map_err(|e| cast_error_exit(e))?;
+        for (name, info) in &union.entries {
+            let src = name_to_shard
+                .get(name.as_str())
+                .copied()
+                .ok_or_else(|| format!("internal: no shard for tensor {name:?}"))?;
+            let reader = &readers[src];
 
-        // Non-float tensors keep their ORIGINAL header spelling (the numpy
-        // "U16"-for-bf16 quirk means the source string is not always
-        // derivable from the enum). Float tensors are written under the
-        // target's canonical spelling.
-        let (out_dtype, raw_override) = if matches!(
-            info.dtype,
-            DType::F32 | DType::F16 | DType::Bf16
-        ) {
-            (output_dtype_for(info.dtype, target), None)
-        } else {
-            (info.dtype, Some(info.dtype_raw.as_str()))
-        };
+            let payload = reader
+                .tensor_bytes(name)
+                .map_err(|e| format!("reading {name}: {e}"))?;
+
+            let is_float = matches!(info.dtype, DType::F32 | DType::F16 | DType::Bf16);
+            if is_float {
+                if !src_dtypes.contains(&info.dtype) {
+                    src_dtypes.push(info.dtype);
+                }
+            }
+
+            let (bytes, outcome) = cast_tensor(name, payload, info.dtype, target, &info.shape)
+                .map_err(|e| e.to_string())?;
+
+            // Non-float tensors keep their ORIGINAL header spelling (the numpy
+            // "U16"-for-bf16 quirk means the source string is not always
+            // derivable from the enum). Float tensors are written under the
+            // target's canonical spelling.
+            let (out_dtype, raw_override) = if is_float {
+                (output_dtype_for(info.dtype, target), None)
+            } else {
+                (info.dtype, Some(info.dtype_raw.as_str()))
+            };
+
+            writer
+                .add_tensor(name, out_dtype, raw_override, &info.shape, &bytes)
+                .map_err(|e| format!("writing {name}: {e}"))?;
+
+            total += 1;
+            match outcome {
+                CastOutcome::Verbatim => verbatim += 1,
+                CastOutcome::Converted => converted += 1,
+            }
+        }
 
         writer
-            .add_tensor(name, out_dtype, raw_override, &info.shape, &bytes)
-            .map_err(|e| format!("writing {name}: {e}"))?;
+            .finalize()
+            .map_err(|e| format!("finalizing {}: {e}", tmp_path.display()))?;
+        Ok((total, verbatim, converted, src_dtypes))
+    })();
 
-        total += 1;
-        match outcome {
-            CastOutcome::Verbatim => verbatim += 1,
-            CastOutcome::Converted => converted += 1,
+    let (total, verbatim, converted, src_dtypes) = match write_result {
+        Ok(stats) => stats,
+        Err(e) => {
+            // Remove the half-built temp file. Best-effort: if removal itself
+            // fails there is nothing better to do, and the destination path is
+            // still untouched (which is the property that actually matters).
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
         }
+    };
+
+    // Publish atomically. Same directory as the destination, so this is a
+    // rename and not a cross-device copy.
+    if out_path != tmp_path {
+        std::fs::rename(&tmp_path, &out_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!(
+                "publishing {} -> {}: {e}",
+                tmp_path.display(),
+                out_path.display()
+            )
+        })?;
     }
 
-    writer
-        .finalize()
-        .map_err(|e| format!("finalizing {}: {e}", out_path.display()))?;
-
     // --- Report ------------------------------------------------------------
-    let src_desc = if saw_non_bf16_source {
-        "mixed"
-    } else {
-        "float"
+    // Name the source dtype(s) we actually saw. A bf16 -> f32 run printing
+    // "(float -> F32)" tells the user nothing about where the data came from;
+    // "BF16 -> F32" does. A model with mixed float sources is reported as
+    // such rather than guessed at.
+    let src_desc = match src_dtypes.as_slice() {
+        [] => "non-float".to_string(),
+        [only] => only.to_string(),
+        many => {
+            let joined: Vec<String> = many.iter().map(|d| d.to_string()).collect();
+            format!("mixed({})", joined.join("+"))
+        }
     };
-    report(total, verbatim, converted, src_desc, target);
+    report(total, verbatim, converted, &src_desc, target);
     let _ = started;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Map a conversion error onto the right exit code and message.
-///
-/// Overflow and f64 rejection are **data** errors (exit 1): the command line was
-/// well-formed, the model just cannot be represented. They are NOT usage
-/// errors, so they must not be reported as exit 2.
-fn cast_error_exit(e: CastError) -> String {
-    e.to_string()
 }
