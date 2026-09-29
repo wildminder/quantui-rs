@@ -1,15 +1,24 @@
-# quantui-rs
+<div id="readme-top"></div>
 
-Standalone, single-binary Rust CLI that quantizes Hugging Face `safetensors`
-models to **ComfyUI-compatible INT8 / FP8 / MXFP8 / NVFP4**, converts HF
-models to **GGUF** (34 usable llama.cpp-compatible methods), and **casts**
-models to a single-file **bf16 / fp16 / fp32** `.safetensors` — with a hard
-contract: **outputs are byte-exact against the Python/torch and llama.cpp
-references** on all default paths. The handful of opt-in formats that trade
-that guarantee for accuracy say so on every run
-([`parity:` marker](#conformance)).
+# ⟪ quantui-rs ⟫
+
+**A single-binary Rust CLI that quantizes, converts, and casts Hugging Face
+`safetensors` models** — to ComfyUI-compatible INT8/FP8/MXFP8/NVFP4, to GGUF for
+the llama.cpp ecosystem, or to a single-file bf16/fp16/fp32 `.safetensors`.
 
 One static binary. No Python, no torch, no runtime dependencies.
+
+**The contract:** outputs are **byte-exact against the Python/torch and
+llama.cpp references** on all default paths. The handful of opt-in formats that
+trade that guarantee for accuracy say so on every run
+([`parity:` marker](#conformance)).
+
+[![Rust](https://img.shields.io/badge/Rust-1.89%2B-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![License MIT](https://img.shields.io/badge/License-MIT-8957e5?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-000000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wildminder/quantui-rs#-building)
+[![Parity](https://img.shields.io/badge/parity-exact%20on%20default%20paths-8957e5?style=for-the-badge&logo=shield&logoColor=white)](#conformance)
+[![Stars](https://img.shields.io/github/stars/wildminder/quantui-rs?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wildminder/quantui-rs/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/wildminder/quantui-rs?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wildminder/quantui-rs/commits/main)
 
 ```sh
 # Quantize a model to INT8 for ComfyUI
@@ -26,7 +35,7 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
     --recipe-from unsloth-Q8_0.gguf --verify-against unsloth-Q8_0.gguf
 ```
 
-## Table of contents
+## ❯ Table of contents
 
 1. [Building](#building)
 2. [Command overview](#command-overview)
@@ -34,25 +43,25 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
 4. [Format & parameter matrix](#format-matrix)
 5. [Quality modes — `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
 6. [Format conformance & the `parity:` marker](#conformance)
-7. [Tried, measured, rejected](#rejected)
-8. [Converting to GGUF (`gguf`)](#gguf)
-9. [Which GGUF method should I use?](#method-selection)
-10. [Per-tensor recipes — the open `UD-*`](#recipes)
-11. [`--verify-against` — oracle equivalence report](#verify-against)
-12. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
-13. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
-14. [Validating (`validate`) and inspecting (`info`)](#validate-info)
-15. [Casting to a single-file bf16/fp16 model (`cast`)](#cast)
-16. [Exit codes](#exit-codes)
-17. [Shell completions](#completions)
-18. [Worked examples: real models](#worked-examples)
-19. [Parity contract & known boundaries](#parity)
-20. [Performance](#performance)
-21. [Repository layout & development](#development)
+7. [Converting to GGUF (`gguf`)](#gguf)
+8. [Which GGUF method should I use?](#method-selection)
+9. [Per-tensor recipes — the open `UD-*`](#recipes)
+10. [`--verify-against` — oracle equivalence report](#verify-against)
+11. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
+12. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
+13. [Validating (`validate`) and inspecting (`info`)](#validate-info)
+14. [Casting to a single-file bf16/fp16 model (`cast`)](#cast)
+15. [Exit codes](#exit-codes)
+16. [Shell completions](#completions)
+17. [Worked examples: real models](#worked-examples)
+18. [Parity contract & known boundaries](#parity)
+19. [Performance](#performance)
+20. [Development, benchmarks & tooling](DEVELOPMENT.md)
+21. [License](#license)
 
 ---
 
-## Building
+## ❯ Building
 
 Requires Rust (stable, ≥ 1.89):
 
@@ -61,7 +70,7 @@ cargo build --release
 # binary: target/release/quantui-rs(.exe)  (~2.6 MB, LTO + stripped)
 ```
 
-## Command overview
+## ❯ Command overview
 
 | Command | Purpose |
 |---|---|
@@ -77,9 +86,9 @@ sharded HF model folder (containing `model.safetensors.index.json`).
 ---
 
 <a name="quantize"></a>
-## Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)
+## ❯ Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)
 
-### Quick start
+### ▸ Quick start
 
 ```sh
 # 1. Quantize (defaults: INT8, block scaling, block size 128, heuristics on).
@@ -99,7 +108,7 @@ The output is a standard `.safetensors` file that ComfyUI's quantized-model
 loaders consume directly: every quantized layer carries a `.comfy_quant`
 config blob describing its layout.
 
-### Which format to pick
+### ▸ Which format to pick
 
 | `--format` | Bits/weight | Use when |
 |---|---|---|
@@ -110,7 +119,7 @@ config blob describing its layout.
 | `nvfp4` | 4 | Maximum compression; NVFP4 with 16-element microblocks + per-tensor scale; AVOID_KEY_NAMES apply |
 | `nvfp4_l2` | 4 | **Quality mode.** Same 4-bit size, ~17.7% lower reconstruction error — but **NOT byte-exact**. See [Quality modes](#quality-modes) |
 | `nvfp4_rot16` | 4 | NVFP4 + Hadamard rotation at group size 16. **Byte-exact**, but see the inverse-rotation caveat before using it |
-| `int8_clip09` | ~8 | ⚠️ **A measured negative result, kept only so the result stays reproducible.** It regresses 31×–1.4e4× in weight-space L2. Do not use it — see [Tried and rejected](#rejected) |
+| `int8_clip09` | ~8 | ⚠️ **A measured negative result, kept only so the result stays reproducible.** It regresses 31×–1.4e4× in weight-space L2. Do not use it — see [Tried, measured, rejected](DEVELOPMENT.md#rejected) |
 
 Everything down to `nvfp4` is byte-exact against the Python/torch reference.
 The last three are opt-in and differ in kind: `nvfp4_l2` trades the byte-exactness
@@ -120,7 +129,7 @@ an opt-in that is **known to be worse**. Every run states which kind it was on
 the [`parity:` line](#conformance).
 
 <a name="format-matrix"></a>
-### Format & parameter matrix
+### ▸ Format & parameter matrix
 
 Every combination the CLI accepts, and exactly what it emits. `bpw` is the
 **measured** on-disk cost including scales, computed for a 4096×4096 layer —
@@ -161,7 +170,7 @@ size are quantized; everything else is copied at `--orig-dtype`. `mxfp8` and
 model is partly full-precision in practice — run `info` on the output to see
 the real quantized share.
 
-### Full parameter reference
+### ▸ Full parameter reference
 
 ```
 quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
@@ -216,7 +225,7 @@ quantui-rs quantize [OPTIONS] <INPUT> [OUTPUT]
   the run exits 1 (`error: output verification failed: …`). Off by
   default — on a 10 GB output the header read is cheap but not free.
 
-### What gets quantized
+### ▸ What gets quantized
 
 | Tensor | Treatment |
 |---|---|
@@ -229,19 +238,7 @@ Each quantized layer `X` produces four tensors: `X.weight` (quantized),
 `X.weight_scale` (dequant scales), `X.comfy_quant` (JSON layout blob for
 ComfyUI), and `X.input_scale` (scalar 1.0, INT8 only).
 
-### Resume & Ctrl-C
-
-After **every tensor** the writer flushes the header and a checkpoint file
-`<output>.quant-manifest.json`:
-
-- **Kill the process or press Ctrl-C at any time** → exit code 130, and the
-  partial output remains valid and loadable.
-- **Re-run the same command** → already-done tensors are skipped; the final
-  file is byte-identical to an uninterrupted run.
-- **Change the config** → the `config_hash` no longer matches and the run
-  restarts cleanly (prevents corrupt mixed-config files).
-
-### Sharded HF models
+### ▸ Sharded HF models
 
 ```sh
 # One output shard per input shard (sharding preserved) — default
@@ -251,7 +248,7 @@ quantui-rs quantize ./my-hf-model ./my-hf-model-int8
 quantui-rs quantize ./my-hf-model --output-mode single
 ```
 
-### INT8 details (scaling modes, convrot)
+### ▸ INT8 details (scaling modes, convrot)
 
 `-m/--scaling-mode` controls scale granularity:
 
@@ -267,7 +264,7 @@ are rotated (blob carries `{"convrot": true, "convrot_groupsize": 256,
 "per_row": true}`); others fall back to plain row INT8. Byte-exact vs the
 reference's batch path (8 golden cases at group sizes 256 and 64).
 
-### FP8 / MXFP8 / NVFP4 differences
+### ▸ FP8 / MXFP8 / NVFP4 differences
 
 ```sh
 quantui-rs quantize mymodel.safetensors --format fp8_e4m3
@@ -292,10 +289,12 @@ carries a per-tensor `weight_scale_2`. MXFP8/NVFP4 outputs carry a
 Resume, Ctrl-C, sharded input, `validate`, and `info` work identically for
 all formats.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="quality-modes"></a>
-## Quality modes — `nvfp4_l2` and `nvfp4_rot16`
+## ❯ Quality modes — `nvfp4_l2` and `nvfp4_rot16`
 
 The byte-exactness contract is the crate's defining property, so nothing below
 is ever reached by default: these are opt-in `--format` values, and every other
@@ -304,86 +303,65 @@ should be able to tell a byte-exact format from a quality-tuned one **without
 reading the source** — and because one of them carries a caveat that no test in
 this repository can retire.
 
-### `nvfp4_l2` — accuracy instead of byte-exactness
+| | `nvfp4_l2` | `nvfp4_rot16` |
+|---|---|---|
+| What it does | NVFP4 with an **anchored alternating L2 scale search** over the per-tensor / per-block scale pair | NVFP4 + **Hadamard (fast Walsh–Hadamard) rotation** at group size **16** |
+| `parity:` | `quality-tuned` — **NOT byte-exact** | `exact` — **byte-exact** |
+| Why | The reference picks each scale pair by pure absmax, which is exact but leaves accuracy on the table; this searches instead | A rotation is a parity-exact transform, not an approximation |
+| Measured | **17.7% lower relative L2** in aggregate over 4 distributions × 4 shapes | No accuracy cost; identical bytes to the reference |
+| Inherited | Everything else from `nvfp4`: same E2M1 codes, fixed block scaling at 16, so `--scaling-mode` / `--block-size` remain usage errors. Only the *choice of scale grid point* differs. | Group size 16 == NVFP4's own block size. `int8_convrot` is unchanged at its original group size of 256 |
 
 ```sh
 quantui-rs quantize mymodel.safetensors --format nvfp4_l2
 # parity: quality-tuned (nvfp4_l2: NVFP4 anchored alternating L2 scale search; NOT byte-exact vs torch/llama-quantize)
-```
 
-NVFP4 stores each weight as a 4-bit E2M1 code plus a per-block scale. The
-reference picks that scale pair by pure absmax, which is exact but leaves
-accuracy on the table. `nvfp4_l2` instead runs an **anchored alternating
-search** over the per-tensor/per-block scale pair, minimizing reconstruction
-error. Measured through the crate's own shipped dequantizer — so the number
-reflects real emitted bytes, not a model of them — this gives **17.7% lower
-relative L2 reconstruction error** in aggregate over 4 distributions × 4 shapes.
-
-That aggregate is not a guarantee. The gain is **21–26%** on uniform and
-Gaussian data, **6–11%** on heavy-tailed, and **1.5–31%** on spiky inputs —
-the search has less to work with when a few elements dominate the absmax.
-
-Everything else is inherited from `nvfp4`: same E2M1 codes, same fixed block
-scaling at 16, so `--scaling-mode` / `--block-size` remain usage errors. Only
-the *choice of scale grid point* differs.
-
-**Why the search must be _anchored_.** This is not a stylistic choice. The
-reconstruction is `X̂ = s_T · s_G · Q(X/(s_T·s_G))`, so rescaling `s_T → k·s_T`
-and `s_G → s_G/k` leaves the product invariant; and because the E2M1 element
-grid is `{2^j, 1.5·2^j}`, the 4-bit codes are *also* unchanged whenever `k` is a
-power of two. The error objective is therefore **exactly flat along powers of
-two**. A naive search here is not merely unconstrained, it is genuinely
-ambiguous — it drifts to an arbitrary and eventually E4M3-unrepresentable
-scale. The implementation instead searches a bounded window of ±4 E4M3 scale
-codes around the absmax anchor (±0.5 octave), and a test pins that it cannot
-drift.
-
-The alternating tensor-scale/block-scale formulation follows arXiv:2509.23202.
-
-### `nvfp4_rot16` — a byte-exact rotation preset
-
-```sh
 quantui-rs quantize mymodel.safetensors --format nvfp4_rot16
 # parity: exact (nvfp4_rot16; byte-exact vs torch/llama-quantize)
 ```
 
-Applies a Hadamard (fast Walsh–Hadamard) rotation to NVFP4 weights at group
-size **16**, chosen so the rotation group size *equals* the quantizer block
-size. Unlike `nvfp4_l2` this one **is** byte-exact: a rotation is a parity-exact
-transformation, not an approximation. `int8_convrot` is unchanged at its
-original group size of 256.
+**The 17.7% aggregate is not a guarantee.** The gain is **21–26%** on uniform and
+Gaussian data, **6–11%** on heavy-tailed, and **1.5–31%** on spiky inputs — the
+search has less to work with when a few elements dominate the absmax.
 
-The rationale comes from two independent papers. **DuQuant++**
-(arXiv:2604.17789) shows that aligning the rotation block with the
+**Why the search must be _anchored_.** The reconstruction is
+`X̂ = s_T · s_G · Q(X/(s_T·s_G))`, so rescaling `s_T → k·s_T, s_G → s_G/k` leaves
+the product invariant; and because the E2M1 grid is `{2^j, 1.5·2^j}`, the 4-bit
+codes are *also* unchanged whenever `k` is a power of two. The objective is
+therefore **exactly flat along powers of two** — a naive search is not merely
+unconstrained but genuinely ambiguous, and drifts to an arbitrary,
+eventually-unrepresentable scale. The implementation searches a bounded ±4 E4M3
+code window around the absmax anchor (±0.5 octave); a test pins that it cannot
+drift. Formulation follows arXiv:2509.23202.
+
+**Why rotation at group size 16.** Aligning the rotation block with the
 microscaling group eliminates cross-block variance and halves the online
-rotation cost; **The Great Inversion** (arXiv:2608.25188) reaches the same
-conclusion from a coding-theory angle, noting that MXFP4 "still rewards a
-rotation confined to that block". NVFP4's block size is 16. The Hadamard
-construction itself follows **ConvRot** (arXiv:2512.03673), whose Theorem 3.3
-proves all Kronecker powers `H_{4^k}` are *regular* (row and column sums equal
-±√n) — which is what avoids the degenerate all-ones column a naive Sylvester
-construction would give.
+rotation cost (**DuQuant++**, arXiv:2604.17789), reached independently from a
+coding-theory angle by **The Great Inversion** (arXiv:2608.25188). The Hadamard
+construction follows **ConvRot** (arXiv:2512.03673), whose Theorem 3.3 proves
+all Kronecker powers `H_{4^k}` are *regular* (row/column sums ±√n) — which
+avoids the degenerate all-ones column a naive Sylvester construction gives.
 
-> ⚠️ **The rotation is applied offline to the weights, so the consuming runtime
-> must apply the _inverse_ rotation online at inference.** Whether ComfyUI
-> actually does this **cannot be verified from inside this repository** — the
-> failure, if any, is not in the artifact written here but in whether a
-> downstream runtime honours it, and no test in this crate can settle that. If
-> the consumer does *not* apply the inverse, every rotated layer is garbage: a
+> ⚠️ **The rotation is applied offline, so the consuming runtime must apply the
+> _inverse_ rotation online at inference.** Whether ComfyUI does this **cannot be
+> verified from inside this repository** — the failure, if any, is not in the
+> artifact written here but in whether a downstream runtime honours it. If the
+> consumer does *not* apply the inverse, every rotated layer is garbage: a
 > valid-looking file with silently wrong numerics. Treat end-to-end correctness
-> as **unverified** until someone confirms the consumer path out of band.
+> as **unverified** until the consumer path is confirmed out of band.
 >
-> A narrower, separate gap: the NVFP4-family `comfy_quant` blob has no
-> `convrot` / `convrot_groupsize` keys (only the INT8 family-A blob does), so
-> the emitted metadata does not record that a tensor was rotated — a consumer
-> has no in-band signal to key off.
+> A narrower gap: the NVFP4-family `comfy_quant` blob has no `convrot` /
+> `convrot_groupsize` keys (only the INT8 family-A blob does), so the emitted
+> metadata does not record that a tensor was rotated — a consumer has no
+> in-band signal to key off.
+
+([back to top](#readme-top))
 
 ---
 
 <a name="conformance"></a>
-## Format conformance & the `parity:` marker
+## ❯ Format conformance & the `parity:` marker
 
-### The `parity:` line
+### ▸ The `parity:` line
 
 Every `quantize` run prints exactly one `parity:` line, on **every** run:
 
@@ -413,7 +391,7 @@ quantui-rs quantize m.safetensors --format nvfp4_l2 2>&1 | grep -q '^parity: qua
   && echo "NOT byte-exact — do not compare against reference bytes"
 ```
 
-### Conformance vectors
+### ▸ Conformance vectors
 
 Bit-exact conformance vectors are adopted from **Golden Ruler**
 (arXiv:2606.09686v3, upstream `gHashTag/t27`), vendored as test fixtures and
@@ -423,46 +401,10 @@ the source paper's stated criterion.
 
 ---
 
-<a name="rejected"></a>
-## Tried, measured, rejected
-
-Three techniques from the literature were implemented, measured on this crate's
-own metric, and deliberately **not** recommended. Recording them is a result,
-not a failure — a reader deciding whether to try one of these deserves to know
-it was already tried here:
-
-| Technique | Source | Measured outcome |
-|---|---|---|
-| MXFP8 E8M0 `4/3` scale compensation | arXiv:2509.23202 | **Bit-exact no-op.** `rel_l2` ratio `1.000000` — 0.00% change |
-| MXAttention `Qmax = 7.25` | arXiv:2607.24377 | **Inert.** No output byte changes |
-| INT8 absmax clip ratio 0.9 | QuaRot, arXiv:2404.00456 | **31×–1.4e4× worse** in weight-space L2; 0 of 4 distributions improved |
-
-The MXFP8 case is the sharpest: E4M3 halves exactly, so doubling the scale and
-halving every code reconstructs the identical `f32`, and this crate's scale
-rounds *up*, so it never clips in the first place — leaving nothing for the
-compensation to relieve. The paper's variant rounds down and does clip, so the
-premise holds there and simply does not apply to this kernel.
-
-`Qmax` is a clamp bound, and the encoder already saturates at 6.0 (the format's
-maximum), so no bound ≥ 6.0 can change an emitted byte. Clipping trades bounded
-rounding error for *unbounded* saturation error, and INT8's 127 levels leave
-only ~1.5e-5 of rounding error to recover; the published gain is a perplexity
-result on activations, and this crate quantizes weights and does not measure
-perplexity.
-
-**The transferable lesson:** the one technique that worked runs a real *search*
-and lets the data pick a point; the three that failed each nudged a hardcoded
-constant, which has no feedback signal. Each paper also assumed a kernel
-differing from this one in exactly one decisive respect — `floor` vs `ceil`
-scale rounding, a clamp below vs at saturation, activations vs weights — and
-that difference is what decides the outcome.
-
----
-
 <a name="gguf"></a>
-## Converting to GGUF (`gguf`)
+## ❯ Converting to GGUF (`gguf`)
 
-### Quick start
+### ▸ Quick start
 
 ```sh
 quantui-rs gguf mymodel.safetensors                 # q4_k_m (default)
@@ -475,7 +417,7 @@ Output is auto-named `<base>-<method>.gguf` next to the input when `[OUTPUT]`
 is omitted. **Both paths are positional** — there are no `--input`/`--output`
 flags.
 
-### Full parameter reference
+### ▸ Full parameter reference
 
 ```
 quantui-rs gguf [OPTIONS] [INPUT] [OUTPUT]
@@ -502,7 +444,7 @@ quantui-rs gguf [OPTIONS] [INPUT] [OUTPUT]
       --no-progress              Plain, CI-friendly output
 ```
 
-### Auditing an existing GGUF (`--audit`)
+### ▸ Auditing an existing GGUF (`--audit`)
 
 Check any GGUF — a downloaded unsloth file, a llama-quantize output, or your
 own — without converting anything:
@@ -523,7 +465,7 @@ Exit code `3` flags a spec-violating file, so it scripts cleanly as a gate:
 quantui-rs gguf --audit "$f" || echo "$f is spec-violating"
 ```
 
-### What the converter does
+### ▸ What the converter does
 
 - **Architecture metadata**: detected from `config.json`
   (`model_type`/`architectures`) and written as GGUF
@@ -560,7 +502,7 @@ quantui-rs gguf --audit "$f" || echo "$f is spec-violating"
   report accounting and progress — stays sequential, so the output is
   **byte-identical** regardless of thread count.
 
-### `QUANTUI_RS_GGUF_JOBS` — encode thread count
+### ▸ `QUANTUI_RS_GGUF_JOBS` — encode thread count
 
 ```sh
 QUANTUI_RS_GGUF_JOBS=1 quantui-rs gguf model.safetensors -m q8_0   # sequential
@@ -582,7 +524,7 @@ Parallelism does **not** change the file: both runs above produce the same
 bytes, the same stderr and the same report. It only changes how fast they
 are produced.
 
-### Method capability matrix
+### ▸ Method capability matrix
 
 All 38 registry methods (Unsloth's list plus llama.cpp-only `q1_0`/`q2_0`):
 
@@ -600,10 +542,12 @@ Without it, quantization produces garbage — the same conversion
 llama-quantize refuses. K-quants consume one when supplied (optional for
 them). Files load in GGUF or llama-quantize's legacy binary format.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="method-selection"></a>
-## Which GGUF method should I use?
+## ❯ Which GGUF method should I use?
 
 | Goal | Method | Notes |
 |---|---|---|
@@ -621,14 +565,14 @@ formats load.
 ---
 
 <a name="recipes"></a>
-## Per-tensor recipes — the open `UD-*`
+## ❯ Per-tensor recipes — the open `UD-*`
 
 Unsloth's Dynamic 2.0 presets (`UD-Q4_K_XL` etc.) are a proprietary
 per-layer bit-width heuristic and are rejected with exit 2. `--tensor-type-file`
 is the open equivalent: any per-tensor assignment expressible as a
 first-match-wins regex list, with your choices explicit and inspectable.
 
-### Recipe file format (`--tensor-type-file <PATH>`)
+### ▸ Recipe file format (`--tensor-type-file <PATH>`)
 
 ```text
 # lines starting with '#' are comments; blank lines are ignored
@@ -652,7 +596,7 @@ q4_k_m
   `f16`/`f32`/`bf16` method ignores the recipe entirely (upstream parity).
 - The row-width demotion guard still applies **on top** of any recipe rule.
 
-### Dumping the effective assignment
+### ▸ Dumping the effective assignment
 
 ```sh
 quantui-rs gguf model.safetensors out.gguf -m q4_k_m \
@@ -666,7 +610,7 @@ exactly.
 ---
 
 <a name="verify-against"></a>
-## `--verify-against` — oracle equivalence report
+## ❯ `--verify-against` — oracle equivalence report
 
 Compare your freshly converted GGUF against a reference GGUF (unsloth
 output, llama-quantize output, or a previous run of your own):
@@ -706,10 +650,12 @@ The report also runs a **spec-conformance scan of YOUR file** (the
 **Exit codes**: `0` normal report (diffs allowed), `3` your file has spec
 violations, `1` the reference can't be parsed.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="recipe-from"></a>
-## `--recipe-from` — quantize aligned with a reference
+## ❯ `--recipe-from` — quantize aligned with a reference
 
 Extract the per-tensor dtype assignment from any existing GGUF and apply it
 to your conversion:
@@ -740,7 +686,7 @@ shared quantized tensor is byte-exact or dead-block-cosmetic, 0 divergent,
 ---
 
 <a name="universal-models"></a>
-## Universal model support (multimodal / wrapped checkpoints)
+## ❯ Universal model support (multimodal / wrapped checkpoints)
 
 The naming layer is **generic**, not per-model: it handles the two layouts
 multimodal checkpoints actually use, verified against real models
@@ -791,12 +737,14 @@ Pass `--arch lfm2` explicitly.
 > split you'd extract the mmproj separately (as unsloth does) — the
 > converter's contract is spec-conformant GGUF output, not mmproj splitting.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="validate-info"></a>
-## `validate` and `info`
+## ❯ `validate` and `info`
 
-### validate — check a quantized output
+### ▸ validate — check a quantized output
 
 ```sh
 quantui-rs validate out.safetensors            # structural checks (headers only)
@@ -820,7 +768,7 @@ formats found           : int8_blockwise
 PASS
 ```
 
-### info — inspect a header
+### ▸ info — inspect a header
 
 ```sh
 quantui-rs info model.safetensors         # per-tensor table + format detection
@@ -832,7 +780,7 @@ Parses only the header (no tensor payloads).
 ---
 
 <a name="cast"></a>
-## Casting to a single-file bf16/fp16 model (`cast`)
+## ❯ Casting to a single-file bf16/fp16 model (`cast`)
 
 `gguf -m bf16` already converts losslessly **to GGUF**. `cast` is the same
 operation for the other direction: producing a **single-file
@@ -877,7 +825,7 @@ paths, so a message is never garbled by a live bar.
 There is nothing else to tune: the target dtype is the only decision, and
 every other parameter is fixed by the format.
 
-### This is a cast, not a quantization
+### ▸ This is a cast, not a quantization
 
 The output carries **no quantization metadata at all** — no `.comfy_quant`
 blob, no `weight_scale` tensors, no `__metadata__._quantization_metadata`. The
@@ -892,7 +840,7 @@ line — that marker means `exact` vs `quality-tuned` for `quantize` runs, and a
 cast is neither. f32→bf16 is not reversible, so claiming byte-exact parity
 would be false.
 
-### Conversion rules
+### ▸ Conversion rules
 
 | Source → target | Behaviour |
 |---|---|
@@ -924,7 +872,7 @@ Subnormal collapse to `±0.0` is *not* treated as an error — that is ordinary,
 expected f16 narrowing. An `Inf` **input** is also not an error: f16 has a real
 infinity, so `Inf → Inf` is exact.
 
-### Safety
+### ▸ Safety
 
 The output is written to a temporary path and renamed into place only after
 the final header flush succeeds. A refused or interrupted run therefore leaves
@@ -932,7 +880,7 @@ the final header flush succeeds. A refused or interrupted run therefore leaves
 The source folder — including `model.safetensors.index.json` — is only ever
 read, never modified.
 
-### Determinism
+### ▸ Determinism
 
 Two runs over the same input produce byte-identical output: tensors are
 emitted in the union header's first-appearance order, and nothing in the path
@@ -943,10 +891,12 @@ duration and no path-dependent text, so it can be grepped and diffed like the
 `quantize` and `gguf` summaries. Elapsed time appears in the progress bar
 during the run, not in the final line.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="exit-codes"></a>
-## Exit codes (all commands)
+## ❯ Exit codes (all commands)
 
 | Code | Meaning |
 |---|---|
@@ -968,7 +918,7 @@ should grep the [`parity:` line](#conformance) instead.
 ---
 
 <a name="completions"></a>
-## Shell completions
+## ❯ Shell completions
 
 The `completions` subcommand emits a completion script for your shell
 (hidden from `--help` to keep the surface clean):
@@ -999,9 +949,9 @@ reloading your shell, `quantui-rs <TAB>` completes subcommands and flags.
 ---
 
 <a name="worked-examples"></a>
-## Worked examples: real models
+## ❯ Worked examples: real models
 
-### LFM2.5-VL-3B → Q8_0, aligned with unsloth
+### ▸ LFM2.5-VL-3B → Q8_0, aligned with unsloth
 
 ```sh
 # The source is a bare multimodal safetensors (no config.json in the folder):
@@ -1022,7 +972,7 @@ The odd-shaped LFM2 shortconv kernels (`ne[0] = 3`) are demoted to F16
 loudly — llama-quantize's own behavior for rows no quantized block can
 describe.
 
-### VibeVoice-1.5B → Q8_0
+### ▸ VibeVoice-1.5B → Q8_0
 
 ```sh
 quantui-rs gguf VibeVoice-1.5B-bf16.safetensors VibeVoice-1.5B-q8_0.gguf -m q8_0
@@ -1034,7 +984,7 @@ heads and prediction head pass through under their original names. The 102
 conv kernels (row widths 4/7/8/10/16) are demoted to F16 with loud warnings
 — the output is always spec-conformant.
 
-### VibeVoice-1.5B → single-file bf16 (`cast`)
+### ▸ VibeVoice-1.5B → single-file bf16 (`cast`)
 
 The shipped repo is 3 shards; ComfyUI and transformers want one file:
 
@@ -1053,10 +1003,12 @@ Note the difference from the GGUF example above: that one *converts* to a
 different container, this one only *merges* — hence `lossless (verbatim copy)`
 rather than a `parity:` line.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="parity"></a>
-## Parity contract & known boundaries
+## ❯ Parity contract & known boundaries
 
 **Byte-exact (golden-verified):**
 
@@ -1091,11 +1043,12 @@ rather than a `parity:` line.
 **Byte-exactness holds on every default path.** The only exceptions are the
 deliberate opt-ins, and every run declares which kind it was on the
 [`parity:` line](#conformance):
+
 - `nvfp4_l2` — **NOT byte-exact.** Trades the guarantee for ~17.7% lower
   reconstruction error. See [Quality modes](#quality-modes).
 - `int8_clip09` — **NOT byte-exact**, and measured *worse*. Kept reachable only
   so the negative result stays reproducible. See
-  [Tried, measured, rejected](#rejected).
+  [Tried, measured, rejected](DEVELOPMENT.md#rejected).
 - `nvfp4_rot16` / `int8_convrot` — **byte-exact** (a rotation is a parity-exact
   transform), but `nvfp4_rot16` carries an unverified end-to-end caveat: the
   consumer must apply the inverse rotation online. See
@@ -1134,10 +1087,12 @@ deliberate opt-ins, and every run declares which kind it was on the
   Downstream tooling falls back to inferring the quantization from tensor
   shapes.
 
+([back to top](#readme-top))
+
 ---
 
 <a name="performance"></a>
-## Performance
+## ❯ Performance
 
 Measured on a 24-core Windows box, 1.004 GiB fixture (32×4096×4096 bf16),
 vs the Python reference streaming path:
@@ -1153,65 +1108,18 @@ gap — parity was prioritized over raw speed. Reproduce with
 
 ---
 
-<a name="development"></a>
-## Repository layout & development
+## ❯ Development, benchmarks & tooling
 
-```
-crates/quant-core/     library: safetensors IO, INT8/FP8/MXFP8/NVFP4 kernels,
-                       streaming orchestrator, bias correction, torch-RNG port,
-                       comfy_quant schema, validator, GGUF registry + converter,
-                       gguf_verify (oracle report), gguf_recipe (per-tensor recipes)
-crates/quant-cli/      binary `quantui-rs`: clap CLI, progress, profiles
-tests/golden/          Python/torch-generated golden fixtures (byte-parity refs)
-tools/                 golden + benchmark generators, GGUF diagnostics
-                       (Python; needs torch + the reference quantizer)
-design docs           design plans + execution log (kept outside the published repo)
-```
+Repository layout, the test/bench commands, the nightly benchmark report, the
+GGUF tooling scripts, and the measured-negative results that were
+deliberately not recommended — all moved to
+**[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
-```sh
-cargo test --workspace                 # 512 tests incl. golden byte-parity
-cargo clippy --workspace --all-targets # clean with -D warnings
-cargo fmt --check
-cargo bench -p quant-core              # throughput benchmarks (needs fixture)
-```
+---
 
-CI (`.github/workflows/ci.yml`) runs fmt + clippy + full test suite + release
-build on Windows, Linux and macOS. Golden fixtures are committed and marked
-binary so byte-compare tests are valid on every OS.
+## ❯ License
 
-### Benchmarks & the nightly report
-
-- `cargo bench -p quant-core --bench stream_throughput` — GB/s on a ~1 GB
-  generated fixture (`python tools/gen_bench_fixture.py` first).
-- `cargo bench -p quant-core --bench stream_small` — the same full
-  `stream_quantize` path on the **committed** 8 MB fixture
-  (`tests/bench/bench_small.safetensors`, reproducible via
-  `tools/gen_bench_small.py`, SHA-256 self-checked).
-
-A nightly workflow (`.github/workflows/bench.yml`) runs `stream_small` on
-ubuntu, saves a criterion baseline and uploads the full report to the
-`criterion-nightly` workflow artifact (30-day retention). It is an
-**awareness signal, not a merge gate** — shared-runner timing is noisy. To
-read the artifact: download it, open `report/index.html`, and compare
-`change` columns against the previous night's artifact. Local A/B:
-
-```sh
-cargo bench -p quant-core --bench stream_small -- --save-baseline mine
-# ... change code ...
-cargo bench -p quant-core --bench stream_small -- --baseline mine
-```
-
-### GGUF tooling scripts (`tools/`)
-
-| Script | Purpose |
-|---|---|
-| `cmp_ours_vs_unsloth.py` | Byte-compare our GGUF vs unsloth's (the logic now productized as `--verify-against`) |
-| `diag_vibevoice_q8.py` | Spec-violation scanner (`ne[0] % blck` audit; now built into `--verify-against`) |
-| `probe_block_stats.py` | Per-block Q8_0 scale/code diff analysis |
-| `inspect_lfm.py` | Inventory a model's safetensors + GGUFs |
-| `gen_golden_gguf.py` / `gen_golden_llamacpp_weighted.py` | Golden fixture generation |
-| `sweep_gguf_e2e.sh` | Convert + validate a fixture with EVERY usable GGUF method (49 checks) |
-
-## License
-
-MIT
+MIT — see [LICENSE](LICENSE). Third-party notices:
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributions:
+[CONTRIBUTING.md](CONTRIBUTING.md). Security reports:
+[SECURITY.md](SECURITY.md).
