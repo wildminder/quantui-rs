@@ -858,11 +858,24 @@ quantui-rs cast [OPTIONS] <INPUT> [OUTPUT]
   [OUTPUT]                .safetensors path; omitted = auto-named
                           <base>-<tag>.safetensors beside the input
       --to <TO>           bf16 | f16 | f32            [required]
+      --no-progress       Plain, CI-friendly output (no progress bar)
 ```
 
-`cast` has no progress bar and no extra flags — it prints one `cast:` summary
-line on success. There is nothing to tune: the target dtype is the only
-decision, and every other parameter is fixed by the format.
+A live progress bar is shown while casting, exactly as for `quantize` and
+`gguf` — position, elapsed time, and the target dtype. The bar renders on
+**stderr**; the `cast:` summary goes to **stdout**, so piping stdout stays
+machine-readable. indicatif auto-suppresses the bar when stderr is not a
+terminal, and `--no-progress` disables it unconditionally.
+
+`cast` knows the total tensor count up front (it comes from the merged header),
+so the bar is accurate from the first tick — `quantize` and `gguf` only learn
+their total as they go. The position advances only after a tensor is durably
+written, so it never claims progress the file does not have. The bar is
+cleared before anything is printed, including on the overflow and I/O error
+paths, so a message is never garbled by a live bar.
+
+There is nothing else to tune: the target dtype is the only decision, and
+every other parameter is fixed by the format.
 
 ### This is a cast, not a quantization
 
@@ -924,6 +937,11 @@ read, never modified.
 Two runs over the same input produce byte-identical output: tensors are
 emitted in the union header's first-appearance order, and nothing in the path
 is time- or hash-dependent.
+
+The `cast:` summary line is **byte-stable too** — it carries no timestamp, no
+duration and no path-dependent text, so it can be grepped and diffed like the
+`quantize` and `gguf` summaries. Elapsed time appears in the progress bar
+during the run, not in the final line.
 
 ---
 
