@@ -1,4 +1,4 @@
-<div id="readme-top"></div>
+<a id="readme-top"></a>
 
 # ⟪ quantui-rs ⟫
 
@@ -13,12 +13,12 @@ llama.cpp references** on all default paths. The handful of opt-in formats that
 trade that guarantee for accuracy say so on every run
 ([`parity:` marker](#conformance)).
 
-[![Rust](https://img.shields.io/badge/Rust-1.89%2B-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![License MIT](https://img.shields.io/badge/License-MIT-8957e5?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-000000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wildminder/quantui-rs#-building)
-[![Parity](https://img.shields.io/badge/parity-exact%20on%20default%20paths-8957e5?style=for-the-badge&logo=shield&logoColor=white)](#conformance)
-[![Stars](https://img.shields.io/github/stars/wildminder/quantui-rs?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wildminder/quantui-rs/stargazers)
-[![Last commit](https://img.shields.io/github/last-commit/wildminder/quantui-rs?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wildminder/quantui-rs/commits/main)
+[![Rust][rust-shield]][rust-url]
+[![License MIT][mit-shield]][license-url]
+[![Platform][platform-shield]][building-url]
+[![Parity][parity-shield]][conformance]
+[![Stars][stars-shield]][stars-url]
+[![Last commit][commit-shield]][commit-url]
 
 ```sh
 # Quantize a model to INT8 for ComfyUI
@@ -35,31 +35,34 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
     --recipe-from unsloth-Q8_0.gguf --verify-against unsloth-Q8_0.gguf
 ```
 
-## ❯ Table of contents
+<details>
+<summary><b>Table of Contents</b></summary>
 
-1. [Building](#building)
-2. [Command overview](#command-overview)
-3. [Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)](#quantize)
-4. [Format & parameter matrix](#format-matrix)
-5. [Quality modes — `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
-6. [Format conformance & the `parity:` marker](#conformance)
-7. [Converting to GGUF (`gguf`)](#gguf)
-8. [Which GGUF method should I use?](#method-selection)
-9. [Per-tensor recipes — the open `UD-*`](#recipes)
-10. [`--verify-against` — oracle equivalence report](#verify-against)
-11. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
-12. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
-13. [Validating (`validate`) and inspecting (`info`)](#validate-info)
-14. [Casting to a single-file bf16/fp16 model (`cast`)](#cast)
-15. [Exit codes](#exit-codes)
-16. [Shell completions](#completions)
-17. [Worked examples: real models](#worked-examples)
-18. [Parity contract & known boundaries](#parity)
-19. [Performance](#performance)
-20. [Development, benchmarks & tooling](DEVELOPMENT.md)
-21. [License](#license)
+- [Building](#building)
+- [Command overview](#command-overview)
+- [Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)](#quantize)
+- [Format &amp; parameter matrix](#format-matrix)
+- [Quality modes — `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
+- [Format conformance &amp; the `parity:` marker](#conformance)
+- [Converting to GGUF (`gguf`)](#gguf)
+- [Which GGUF method should I use?](#method-selection)
+- [Per-tensor recipes — the open `UD-*`](#recipes)
+- [`--verify-against` — oracle equivalence report](#verify-against)
+- [`--recipe-from` — quantize aligned with a reference](#recipe-from)
+- [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
+- [Validating (`validate`) and inspecting (`info`)](#validate-info)
+- [Casting to a single-file bf16/fp16 model (`cast`)](#cast)
+- [Exit codes](#exit-codes)
+- [Shell completions](#completions)
+- [Worked examples: real models](#worked-examples)
+- [Parity contract &amp; known boundaries](#parity)
+- [Performance](#performance)
+- [Development, benchmarks &amp; tooling](#development) — see [DEVELOPMENT.md](DEVELOPMENT.md)
+- [License](#license)
 
----
+</details>
+
+<p id="building" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
 ## ❯ Building
 
@@ -69,6 +72,8 @@ Requires Rust (stable, ≥ 1.89):
 cargo build --release
 # binary: target/release/quantui-rs(.exe)  (~2.6 MB, LTO + stripped)
 ```
+
+<p id="command-overview" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
 ## ❯ Command overview
 
@@ -83,9 +88,8 @@ cargo build --release
 `quantize`, `gguf` and `cast` accept a single `.safetensors` file **or** a
 sharded HF model folder (containing `model.safetensors.index.json`).
 
----
+<p id="quantize" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
-<a name="quantize"></a>
 ## ❯ Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)
 
 ### ▸ Quick start
@@ -128,7 +132,14 @@ parity-exact transform) but carries an end-to-end caveat, and `int8_clip09` is
 an opt-in that is **known to be worse**. Every run states which kind it was on
 the [`parity:` line](#conformance).
 
-<a name="format-matrix"></a>
+> [!WARNING]
+> **`int8_clip09` is known to be worse, not better.** It regresses 31×–1.4e4×
+> in weight-space L2. It is kept only so the measured negative result stays
+> reproducible — do not use it in production. Details in
+> [Tried, measured, rejected](DEVELOPMENT.md#rejected).
+
+<a id="format-matrix"></a>
+
 ### ▸ Format & parameter matrix
 
 Every combination the CLI accepts, and exactly what it emits. `bpw` is the
@@ -291,9 +302,8 @@ all formats.
 
 ([back to top](#readme-top))
 
----
+<p id="quality-modes" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
-<a name="quality-modes"></a>
 ## ❯ Quality modes — `nvfp4_l2` and `nvfp4_rot16`
 
 The byte-exactness contract is the crate's defining property, so nothing below
@@ -341,7 +351,8 @@ construction follows **ConvRot** (arXiv:2512.03673), whose Theorem 3.3 proves
 all Kronecker powers `H_{4^k}` are *regular* (row/column sums ±√n) — which
 avoids the degenerate all-ones column a naive Sylvester construction gives.
 
-> ⚠️ **The rotation is applied offline, so the consuming runtime must apply the
+> [!CAUTION]
+> **The rotation is applied offline, so the consuming runtime must apply the
 > _inverse_ rotation online at inference.** Whether ComfyUI does this **cannot be
 > verified from inside this repository** — the failure, if any, is not in the
 > artifact written here but in whether a downstream runtime honours it. If the
@@ -356,9 +367,8 @@ avoids the degenerate all-ones column a naive Sylvester construction gives.
 
 ([back to top](#readme-top))
 
----
+<p id="conformance" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
-<a name="conformance"></a>
 ## ❯ Format conformance & the `parity:` marker
 
 ### ▸ The `parity:` line
@@ -399,9 +409,7 @@ asserted in **both the encode and the decode direction**. Conformance is
 asserted on the **integer bit pattern**, never on decoded-value closeness —
 the source paper's stated criterion.
 
----
-
-<a name="gguf"></a>
+<p id="gguf" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Converting to GGUF (`gguf`)
 
 ### ▸ Quick start
@@ -544,9 +552,7 @@ them). Files load in GGUF or llama-quantize's legacy binary format.
 
 ([back to top](#readme-top))
 
----
-
-<a name="method-selection"></a>
+<p id="method-selection" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Which GGUF method should I use?
 
 | Goal | Method | Notes |
@@ -562,9 +568,7 @@ To generate an imatrix, use llama.cpp's `llama-imatrix` (or unsloth's
 pipeline) on calibration text; both the GGUF and legacy binary imatrix
 formats load.
 
----
-
-<a name="recipes"></a>
+<p id="recipes" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Per-tensor recipes — the open `UD-*`
 
 Unsloth's Dynamic 2.0 presets (`UD-Q4_K_XL` etc.) are a proprietary
@@ -607,9 +611,7 @@ quantui-rs gguf model.safetensors out.gguf -m q4_k_m \
 order; feeding it back via `--tensor-type-file` reproduces the assignment
 exactly.
 
----
-
-<a name="verify-against"></a>
+<p id="verify-against" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ `--verify-against` — oracle equivalence report
 
 Compare your freshly converted GGUF against a reference GGUF (unsloth
@@ -652,9 +654,7 @@ violations, `1` the reference can't be parsed.
 
 ([back to top](#readme-top))
 
----
-
-<a name="recipe-from"></a>
+<p id="recipe-from" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ `--recipe-from` — quantize aligned with a reference
 
 Extract the per-tensor dtype assignment from any existing GGUF and apply it
@@ -683,9 +683,7 @@ Verified on LFM2.5-VL-3B: with `--recipe-from` + `--verify-against`, every
 shared quantized tensor is byte-exact or dead-block-cosmetic, 0 divergent,
 0 spec violations.
 
----
-
-<a name="universal-models"></a>
+<p id="universal-models" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Universal model support (multimodal / wrapped checkpoints)
 
 The naming layer is **generic**, not per-model: it handles the two layouts
@@ -739,9 +737,7 @@ Pass `--arch lfm2` explicitly.
 
 ([back to top](#readme-top))
 
----
-
-<a name="validate-info"></a>
+<p id="validate-info" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ `validate` and `info`
 
 ### ▸ validate — check a quantized output
@@ -777,9 +773,7 @@ quantui-rs info model.safetensors --raw   # raw JSON header
 
 Parses only the header (no tensor payloads).
 
----
-
-<a name="cast"></a>
+<p id="cast" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Casting to a single-file bf16/fp16 model (`cast`)
 
 `gguf -m bf16` already converts losslessly **to GGUF**. `cast` is the same
@@ -893,9 +887,7 @@ during the run, not in the final line.
 
 ([back to top](#readme-top))
 
----
-
-<a name="exit-codes"></a>
+<p id="exit-codes" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Exit codes (all commands)
 
 | Code | Meaning |
@@ -915,9 +907,7 @@ exits `0` on success like any other — a non-zero code would read as failure an
 break existing scripts. Scripts that need to know whether a run was byte-exact
 should grep the [`parity:` line](#conformance) instead.
 
----
-
-<a name="completions"></a>
+<p id="completions" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Shell completions
 
 The `completions` subcommand emits a completion script for your shell
@@ -946,9 +936,7 @@ quantui-rs completions elvish >> ~/.elvish/rc.elv
 Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`. After
 reloading your shell, `quantui-rs <TAB>` completes subcommands and flags.
 
----
-
-<a name="worked-examples"></a>
+<p id="worked-examples" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Worked examples: real models
 
 ### ▸ LFM2.5-VL-3B → Q8_0, aligned with unsloth
@@ -1005,9 +993,7 @@ rather than a `parity:` line.
 
 ([back to top](#readme-top))
 
----
-
-<a name="parity"></a>
+<p id="parity" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Parity contract & known boundaries
 
 **Byte-exact (golden-verified):**
@@ -1089,9 +1075,7 @@ deliberate opt-ins, and every run declares which kind it was on the
 
 ([back to top](#readme-top))
 
----
-
-<a name="performance"></a>
+<p id="performance" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 ## ❯ Performance
 
 Measured on a 24-core Windows box, 1.004 GiB fixture (32×4096×4096 bf16),
@@ -1106,7 +1090,7 @@ The byte-exact contract rules out numeric shortcuts that would widen the
 gap — parity was prioritized over raw speed. Reproduce with
 `cargo bench -p quant-core` and `tools/bench_python_ref.py`.
 
----
+<p id="development" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
 ## ❯ Development, benchmarks & tooling
 
@@ -1115,7 +1099,7 @@ GGUF tooling scripts, and the measured-negative results that were
 deliberately not recommended — all moved to
 **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
----
+<p id="license" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
 ## ❯ License
 
@@ -1123,3 +1107,18 @@ MIT — see [LICENSE](LICENSE). Third-party notices:
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributions:
 [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:
 [SECURITY.md](SECURITY.md).
+
+<!-- HEADER BADGES -->
+
+[rust-shield]: https://img.shields.io/badge/Rust-1.89%2B-000000?style=for-the-badge&logo=rust&logoColor=white
+[rust-url]: https://www.rust-lang.org
+[mit-shield]: https://img.shields.io/badge/License-MIT-8957e5?style=for-the-badge&logo=opensourceinitiative&logoColor=white
+[license-url]: LICENSE
+[platform-shield]: https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-000000?style=for-the-badge&logo=github&logoColor=white
+[building-url]: https://github.com/wildminder/quantui-rs#building
+[parity-shield]: https://img.shields.io/badge/parity-exact%20on%20default%20paths-8957e5?style=for-the-badge&logo=shield&logoColor=white
+[conformance]: #conformance
+[stars-shield]: https://img.shields.io/github/stars/wildminder/quantui-rs?style=for-the-badge&logo=github&logoColor=white
+[stars-url]: https://github.com/wildminder/quantui-rs/stargazers
+[commit-shield]: https://img.shields.io/github/last-commit/wildminder/quantui-rs?style=for-the-badge&logo=github&logoColor=white
+[commit-url]: https://github.com/wildminder/quantui-rs/commits/main
