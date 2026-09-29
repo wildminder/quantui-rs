@@ -3,10 +3,12 @@ resolver = "2"
 members = ["crates/quant-core", "crates/quant-cli"]
 
 [workspace.package]
-# 0.2.0 — adds opt-in quality modes (--format nvfp4_l2) and the byte-exact
-# nvfp4_rot16 preset, plus third-party format conformance vectors. No existing
-# format's output bytes change; the default paths stay byte-exact.
-version = "0.2.0"
+# 0.3.0 — adds the `cast` subcommand: a single-file bf16/fp16/fp32
+# .safetensors from a single file or a sharded HF folder, with no quantization
+# metadata written. Adds a measured format/parameter matrix to the README.
+# No existing format's output bytes change; the default paths stay byte-exact
+# and every quantizer is untouched.
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"

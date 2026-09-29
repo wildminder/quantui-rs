@@ -1,8 +1,9 @@
 # quantui-rs
 
 Standalone, single-binary Rust CLI that quantizes Hugging Face `safetensors`
-models to **ComfyUI-compatible INT8 / FP8 / MXFP8 / NVFP4** and converts HF
-models to **GGUF** (34 usable llama.cpp-compatible methods) — with a hard
+models to **ComfyUI-compatible INT8 / FP8 / MXFP8 / NVFP4**, converts HF
+models to **GGUF** (34 usable llama.cpp-compatible methods), and **casts**
+models to a single-file **bf16 / fp16 / fp32** `.safetensors` — with a hard
 contract: **outputs are byte-exact against the Python/torch and llama.cpp
 references** on all default paths. The handful of opt-in formats that trade
 that guarantee for accuracy say so on every run
@@ -17,6 +18,9 @@ quantui-rs quantize mymodel.safetensors
 # Convert a HF model to a GGUF (llama.cpp / unsloth ecosystem)
 quantui-rs gguf mymodel.safetensors -m q8_0
 
+# Merge a sharded HF model into ONE single-file bf16 .safetensors
+quantui-rs cast ./my-hf-model --to bf16
+
 # Quantize "aligned with" an existing reference GGUF (e.g. unsloth output)
 quantui-rs gguf model.safetensors out.gguf -m q8_0 \
     --recipe-from unsloth-Q8_0.gguf --verify-against unsloth-Q8_0.gguf
@@ -27,22 +31,24 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
 1. [Building](#building)
 2. [Command overview](#command-overview)
 3. [Quantizing to INT8/FP8/MXFP8/NVFP4 (`quantize`)](#quantize)
-4. [Quality modes — `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
-5. [Format conformance & the `parity:` marker](#conformance)
-6. [Tried, measured, rejected](#rejected)
-7. [Converting to GGUF (`gguf`)](#gguf)
-8. [Which GGUF method should I use?](#method-selection)
-9. [Per-tensor recipes — the open `UD-*`](#recipes)
-10. [`--verify-against` — oracle equivalence report](#verify-against)
-11. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
-12. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
-13. [Validating (`validate`) and inspecting (`info`)](#validate-info)
-14. [Exit codes](#exit-codes)
-15. [Shell completions](#completions)
-16. [Worked examples: real models](#worked-examples)
-17. [Parity contract & known boundaries](#parity)
-18. [Performance](#performance)
-19. [Repository layout & development](#development)
+4. [Format & parameter matrix](#format-matrix)
+5. [Quality modes — `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
+6. [Format conformance & the `parity:` marker](#conformance)
+7. [Tried, measured, rejected](#rejected)
+8. [Converting to GGUF (`gguf`)](#gguf)
+9. [Which GGUF method should I use?](#method-selection)
+10. [Per-tensor recipes — the open `UD-*`](#recipes)
+11. [`--verify-against` — oracle equivalence report](#verify-against)
+12. [`--recipe-from` — quantize aligned with a reference](#recipe-from)
+13. [Universal model support (multimodal / wrapped checkpoints)](#universal-models)
+14. [Validating (`validate`) and inspecting (`info`)](#validate-info)
+15. [Casting to a single-file bf16/fp16 model (`cast`)](#cast)
+16. [Exit codes](#exit-codes)
+17. [Shell completions](#completions)
+18. [Worked examples: real models](#worked-examples)
+19. [Parity contract & known boundaries](#parity)
+20. [Performance](#performance)
+21. [Repository layout & development](#development)
 
 ---
 
@@ -61,11 +67,12 @@ cargo build --release
 |---|---|
 | `quantize` | safetensors → ComfyUI quantized safetensors (INT8 plain/Hadamard, FP8 E4M3, MXFP8, NVFP4) |
 | `gguf` | safetensors → GGUF (34 usable llama.cpp methods, recipes, oracle verification) |
+| `cast` | safetensors (single **or** sharded) → one single-file bf16/fp16/fp32 `.safetensors`. **No quantization** |
 | `validate` | Structural + numeric validation of a quantized output |
 | `info` | Inspect a safetensors header without loading tensors |
 
-Both conversion commands accept a single `.safetensors` file **or** a sharded
-HF model folder (containing `model.safetensors.index.json`).
+`quantize`, `gguf` and `cast` accept a single `.safetensors` file **or** a
+sharded HF model folder (containing `model.safetensors.index.json`).
 
 ---
 
@@ -111,6 +118,48 @@ guarantee for accuracy, `nvfp4_rot16` keeps the guarantee (a rotation is a
 parity-exact transform) but carries an end-to-end caveat, and `int8_clip09` is
 an opt-in that is **known to be worse**. Every run states which kind it was on
 the [`parity:` line](#conformance).
+
+<a name="format-matrix"></a>
+### Format & parameter matrix
+
+Every combination the CLI accepts, and exactly what it emits. `bpw` is the
+**measured** on-disk cost including scales, computed for a 4096×4096 layer —
+scales are real bytes, not free, and at 4-bit they are a third of the file.
+
+| `--format` | Scaling mode | Block size | `X.weight` | `X.weight_scale` | Extra tensors | bpw | Parity |
+|---|---|---|---|---|---|---|---|
+| `int8` | `block` | 64 | `I8` | `F32` `[r/64, c/64]` | `input_scale` | 8.008 | `exact` |
+| `int8` | `block` | **128** (default) | `I8` | `F32` `[r/128, c/128]` | `input_scale` | 8.002 | `exact` |
+| `int8` | `block` | 256 | `I8` | `F32` `[r/256, c/256]` | `input_scale` | 8.000 | `exact` |
+| `int8` | `row` | — | `I8` | `F32` `[r, 1]` | `input_scale` | 8.008 | `exact` |
+| `int8` | `tensor` | — | `I8` | `F32` scalar | `input_scale` | 8.000 | `exact` |
+| `int8_convrot` | `row` (forced) | 256 (group) | `I8` | `F32` `[r, 1]` | `input_scale` | 8.008 | `exact` |
+| `int8_clip09` | `row` | — | `I8` | `F32` `[r, 1]` | `input_scale` | 8.008 | ⚠️ measured-worse |
+| `fp8_e4m3` | `block` | 64 | `F8_E4M3` | `F32` `[r/64, c/64]` | — | 8.008 | `exact` |
+| `fp8_e4m3` | `block` | **128** (default) | `F8_E4M3` | `F32` `[r/128, c/128]` | — | 8.002 | `exact` |
+| `fp8_e4m3` | `block` | 256 | `F8_E4M3` | `F32` `[r/256, c/256]` | — | 8.000 | `exact` |
+| `fp8_e4m3` | `row` | — | `F8_E4M3` | `F32` `[r, 1]` | — | 8.008 | `exact` |
+| `fp8_e4m3` | `tensor` | — | `F8_E4M3` | `F32` scalar | — | 8.000 | `exact` |
+| `mxfp8` | `block` (fixed) | 32 (fixed) | `F8_E4M3` | `U8` e8m0, swizzled `[256,4]` | — | **8.250** | `exact` |
+| `nvfp4` | `block` (fixed) | 16 (fixed) | `U8` (2×E2M1/byte) | `F8_E4M3`, swizzled `[256,8]` | `weight_scale_2` `F32` | **4.500** | `exact` |
+| `nvfp4_l2` | `block` (fixed) | 16 (fixed) | `U8` (2×E2M1/byte) | `F8_E4M3`, swizzled `[256,8]` | `weight_scale_2` `F32` | **4.500** | `quality-tuned` |
+| `nvfp4_rot16` | `block` (fixed) | 16 (fixed) + rotation 16 | `U8` (2×E2M1/byte) | `F8_E4M3`, swizzled `[256,8]` | `weight_scale_2` `F32` | **4.500** | `exact` |
+
+**Reading the numbers.** INT8 and FP8 land at ~8.00 bpw — the F32 scales are
+noise at that width. The 4-bit formats are where scales stop being noise:
+MXFP8's 1-byte-per-32 E8M0 scale adds **0.25 bpw** (→ 8.25), and NVFP4's
+1-byte-per-16 E4M3 scale adds **0.5 bpw** (→ 4.5). A "4-bit" NVFP4 file is
+really 4.5.
+
+**Fixed-block formats reject the block flags.** Passing `-m` or `-b` with
+`mxfp8`/`nvfp4` **exits 2** — those block sizes are part of the format
+definition, not a tuning knob. `int8_convrot` forces `row` and ignores `-m`.
+
+**Which tensors are affected.** Only 2D `*.weight` whose dims satisfy the block
+size are quantized; everything else is copied at `--orig-dtype`. `mxfp8` and
+`nvfp4` additionally apply `AVOID_KEY_NAMES` exclusions, so a nominally 4-bit
+model is partly full-precision in practice — run `info` on the output to see
+the real quantized share.
 
 ### Full parameter reference
 
@@ -782,16 +831,116 @@ Parses only the header (no tensor payloads).
 
 ---
 
+<a name="cast"></a>
+## Casting to a single-file bf16/fp16 model (`cast`)
+
+`gguf -m bf16` already converts losslessly **to GGUF**. `cast` is the same
+operation for the other direction: producing a **single-file
+`.safetensors`** in bf16, fp16 or fp32 — the format ComfyUI and transformers
+actually load.
+
+```sh
+# Merge a 3-shard HF model into ONE bf16 .safetensors (auto-named)
+quantui-rs cast ./VibeVoice-1.5B --to bf16
+# -> wrote VibeVoice-1.5B-bf16.safetensors (1204 tensors)
+
+# Explicit destination, and a real narrowing to fp16
+quantui-rs cast ./my-model merged-f16.safetensors --to f16
+
+# Widen back up
+quantui-rs cast merged-f16.safetensors --to f32
+```
+
+```
+quantui-rs cast [OPTIONS] <INPUT> [OUTPUT]
+
+  <INPUT>                 .safetensors file OR sharded HF model folder
+  [OUTPUT]                .safetensors path; omitted = auto-named
+                          <base>-<tag>.safetensors beside the input
+      --to <TO>           bf16 | f16 | f32            [required]
+```
+
+`cast` has no progress bar and no extra flags — it prints one `cast:` summary
+line on success. There is nothing to tune: the target dtype is the only
+decision, and every other parameter is fixed by the format.
+
+### This is a cast, not a quantization
+
+The output carries **no quantization metadata at all** — no `.comfy_quant`
+blob, no `weight_scale` tensors, no `__metadata__._quantization_metadata`. The
+only metadata written is `{"format": "pt"}`, the same tag
+`safetensors.torch.save_file` writes. That is deliberate: a bf16 file
+advertising itself as ComfyUI-quantized while containing nothing quantized
+loads as a **broken** model, which is why this is a separate command instead
+of a `--format` value on `quantize`.
+
+For the same reason `cast` prints a `cast:` summary, **never** a `parity:`
+line — that marker means `exact` vs `quality-tuned` for `quantize` runs, and a
+cast is neither. f32→bf16 is not reversible, so claiming byte-exact parity
+would be false.
+
+### Conversion rules
+
+| Source → target | Behaviour |
+|---|---|
+| Same dtype (bf16→bf16) | **Verbatim byte copy.** No decode, no re-encode |
+| Wider float (f32→bf16/f16) | Round-to-nearest-even narrowing |
+| Narrower float (bf16/f32→f16) | RNE narrowing, **refused on overflow** (below) |
+| Widening (bf16/f16→f32) | Exact |
+| Non-float (`I64`, `U8`, `BOOL`, …) | Passed through **untouched**, original header spelling preserved |
+| `F64` source | **Refused** — `f64→f32→bf16` is a double rounding whose result depends on the intermediate step |
+
+**Same-dtype is a true byte copy, not a round-trip.** A bf16→bf16 pass through
+`f32` is numerically lossless, but it can quiet a signalling-NaN payload and
+alter bits nobody asked to change. The fast path copies the payload untouched.
+
+**Overflow is an error, never a saturation.** bf16's range far exceeds f16's,
+so a bf16 value above f16's limit has no f16 representation — and
+`half::f16::from_f32` would return `Inf` for it. A file full of `Inf` where
+numbers were expected is silent data corruption that only shows up as garbage
+activations at inference, so `cast` refuses, **names the tensor and element**,
+and exits 1:
+
+```
+error: tensor "encoder.layers.0.mlp.gate_proj.weight": element 4112 is
+9.9e29, which overflows f16 (max finite 65504) and would be written as Inf.
+Refusing to emit Inf where a number was expected.
+```
+
+Subnormal collapse to `±0.0` is *not* treated as an error — that is ordinary,
+expected f16 narrowing. An `Inf` **input** is also not an error: f16 has a real
+infinity, so `Inf → Inf` is exact.
+
+### Safety
+
+The output is written to a temporary path and renamed into place only after
+the final header flush succeeds. A refused or interrupted run therefore leaves
+**no** output file, and never disturbs a pre-existing file at the destination.
+The source folder — including `model.safetensors.index.json` — is only ever
+read, never modified.
+
+### Determinism
+
+Two runs over the same input produce byte-identical output: tensors are
+emitted in the union header's first-appearance order, and nothing in the path
+is time- or hash-dependent.
+
+---
+
 <a name="exit-codes"></a>
 ## Exit codes (all commands)
 
 | Code | Meaning |
 |---|---|
 | 0 | Success (validate: all checks passed; gguf: report printed, diffs allowed) |
-| 1 | Runtime failure (I/O error, invalid file, validate found issues, unparseable `--verify-against` reference) |
-| 2 | Usage error (bad arguments, unknown GGUF method, missing input, missing `--imatrix`, bad recipe) |
+| 1 | Runtime failure (I/O error, invalid file, validate found issues, unparseable `--verify-against` reference, **cast: f16 overflow or `f64` source**) |
+| 2 | Usage error (bad arguments, unknown GGUF method, missing input, missing `--imatrix`, bad recipe, **cast: unusable input**) |
 | 3 | **gguf only**: `--verify-against` found spec violations in OUR output |
 | 130 | Cancelled by Ctrl-C (partial output is resumable) |
+
+**A `cast` refusal exits 1, not 2.** The command line was well-formed — the
+model simply cannot be represented at the requested dtype — so it is a data
+error, not a usage error.
 
 **Exit codes are unaffected by the opt-in quality formats.** A `nvfp4_l2` run
 exits `0` on success like any other — a non-zero code would read as failure and
@@ -866,6 +1015,25 @@ The LM backbone (`model.language_model.*`) maps to `blk.*` /
 heads and prediction head pass through under their original names. The 102
 conv kernels (row widths 4/7/8/10/16) are demoted to F16 with loud warnings
 — the output is always spec-conformant.
+
+### VibeVoice-1.5B → single-file bf16 (`cast`)
+
+The shipped repo is 3 shards; ComfyUI and transformers want one file:
+
+```sh
+quantui-rs cast ./VibeVoice-1.5B --to bf16
+# cast: 1204 tensors, lossless (BF16 -> BF16, verbatim copy)
+```
+
+All 1204 tensors were **already** BF16, so this is a pure shard merge — the
+payload is copied byte-for-byte and nothing is re-encoded. Output:
+`VibeVoice-1.5B-bf16.safetensors` (5.04 GiB), verified byte-identical to the
+concatenated shards and loadable by the upstream `safetensors` library under
+torch. The 3 source shards and the index file are left untouched.
+
+Note the difference from the GGUF example above: that one *converts* to a
+different container, this one only *merges* — hence `lossless (verbatim copy)`
+rather than a `parity:` line.
 
 ---
 
