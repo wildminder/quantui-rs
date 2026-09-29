@@ -6,7 +6,7 @@
 //!
 //! Exit-code contract exercised here: 0 ok, 1 data error, 2 usage error.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 fn bin() -> Command {
@@ -39,12 +39,7 @@ fn build_st(tensors: &[(&str, &str, Vec<u64>, Vec<u8>)]) -> Vec<u8> {
         entry.insert("dtype".into(), serde_json::Value::from(*dtype));
         entry.insert(
             "shape".into(),
-            serde_json::Value::Array(
-                shape
-                    .iter()
-                    .map(|&d| serde_json::Value::from(d))
-                    .collect(),
-            ),
+            serde_json::Value::Array(shape.iter().map(|&d| serde_json::Value::from(d)).collect()),
         );
         entry.insert("data_offsets".into(), serde_json::json!([start, end]));
         obj.insert((*name).to_string(), serde_json::Value::Object(entry));
@@ -76,22 +71,44 @@ fn f32_bytes(words: &[u32]) -> Vec<u8> {
 /// A small all-bf16 model: the shape of the real VibeVoice target, in miniature.
 fn write_bf16_model(path: &Path) {
     let bytes = build_st(&[
-        ("embed_tokens.weight", "BF16", vec![8, 4], bf16_bytes(&[0x3F80; 32])),
-        ("layers.0.self_attn.q_proj.weight", "BF16", vec![4, 4], bf16_bytes(&[0x4000; 16])),
-        ("layers.0.mlp.down_proj.weight", "BF16", vec![4, 4], bf16_bytes(&[0x3F00; 16])),
+        (
+            "embed_tokens.weight",
+            "BF16",
+            vec![8, 4],
+            bf16_bytes(&[0x3F80; 32]),
+        ),
+        (
+            "layers.0.self_attn.q_proj.weight",
+            "BF16",
+            vec![4, 4],
+            bf16_bytes(&[0x4000; 16]),
+        ),
+        (
+            "layers.0.mlp.down_proj.weight",
+            "BF16",
+            vec![4, 4],
+            bf16_bytes(&[0x3F00; 16]),
+        ),
     ]);
     std::fs::write(path, bytes).unwrap();
 }
 
-/// A sharded folder: `model.safetensors.index.json` + two shard files.
+/// One tensor fixture: (name, header dtype string, shape, payload bytes).
+type TensorFixture<'a> = (&'a str, &'a str, Vec<u64>, Vec<u8>);
+
+/// A sharded folder: `model.safetensors.index.json` + the shard files it maps.
 ///
-/// `extra_index` is merged into the weight map so a test can point a tensor at
-/// a shard that does not exist (to prove discovery is really consulted).
-fn write_sharded_folder(dir: &Path, shards: &[(&str, &[(&str, &str, Vec<u64>, Vec<u8>)])]) {
+/// Every tensor listed is entered into the index weight map pointing at its own
+/// shard, so the union header this drives has to consult the real index rather
+/// than guessing.
+fn write_sharded_folder(dir: &Path, shards: &[(&str, &[TensorFixture<'_>])]) {
     let mut weight_map = serde_json::Map::new();
     for (shard_name, tensors) in shards {
         for (tname, _, _, _) in *tensors {
-            weight_map.insert((*tname).to_string(), serde_json::Value::String((*shard_name).into()));
+            weight_map.insert(
+                (*tname).to_string(),
+                serde_json::Value::String((*shard_name).into()),
+            );
         }
         std::fs::write(dir.join(shard_name), build_st(tensors)).unwrap();
     }
@@ -157,13 +174,28 @@ fn cast_merges_sharded_folder_to_single_file() {
             (
                 "model-00001-of-00002.safetensors",
                 &[
-                    ("embed_tokens.weight", "BF16", vec![4, 2], bf16_bytes(&[0x3F80; 8])),
-                    ("layers.0.q.weight", "BF16", vec![2, 2], bf16_bytes(&[0x4000; 4])),
+                    (
+                        "embed_tokens.weight",
+                        "BF16",
+                        vec![4, 2],
+                        bf16_bytes(&[0x3F80; 8]),
+                    ),
+                    (
+                        "layers.0.q.weight",
+                        "BF16",
+                        vec![2, 2],
+                        bf16_bytes(&[0x4000; 4]),
+                    ),
                 ],
             ),
             (
                 "model-00002-of-00002.safetensors",
-                &[("layers.1.q.weight", "BF16", vec![2, 2], bf16_bytes(&[0x3F00; 4]))],
+                &[(
+                    "layers.1.q.weight",
+                    "BF16",
+                    vec![2, 2],
+                    bf16_bytes(&[0x3F00; 4]),
+                )],
             ),
         ],
     );
@@ -186,25 +218,41 @@ fn cast_merges_sharded_folder_to_single_file() {
 
     // One file, every tensor from BOTH shards.
     let header = read_header(&out);
-    for name in ["embed_tokens.weight", "layers.0.q.weight", "layers.1.q.weight"] {
+    for name in [
+        "embed_tokens.weight",
+        "layers.0.q.weight",
+        "layers.1.q.weight",
+    ] {
         assert!(
             header.get(name).is_some(),
             "{name} must be present in the merged output"
         );
     }
     // Shapes preserved.
-    assert_eq!(header["embed_tokens.weight"]["shape"], serde_json::json!([4, 2]));
-    assert_eq!(header["layers.1.q.weight"]["shape"], serde_json::json!([2, 2]));
+    assert_eq!(
+        header["embed_tokens.weight"]["shape"],
+        serde_json::json!([4, 2])
+    );
+    assert_eq!(
+        header["layers.1.q.weight"]["shape"],
+        serde_json::json!([2, 2])
+    );
 
     // A same-dtype bf16->bf16 merge is a VERBATIM copy: payloads identical.
     assert_eq!(
         read_tensor(&out, "layers.0.q.weight"),
-        read_tensor(&model.join("model-00001-of-00002.safetensors"), "layers.0.q.weight"),
+        read_tensor(
+            &model.join("model-00001-of-00002.safetensors"),
+            "layers.0.q.weight"
+        ),
         "same-dtype merge must copy payload bytes verbatim"
     );
     assert_eq!(
         read_tensor(&out, "layers.1.q.weight"),
-        read_tensor(&model.join("model-00002-of-00002.safetensors"), "layers.1.q.weight"),
+        read_tensor(
+            &model.join("model-00002-of-00002.safetensors"),
+            "layers.1.q.weight"
+        ),
         "payload from the second shard must survive verbatim"
     );
 }
@@ -225,10 +273,19 @@ fn cast_single_file_input_roundtrips() {
         .arg("bf16")
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 
     let header = read_header(&out);
-    assert_eq!(header.as_object().unwrap().len(), 4, "3 tensors + __metadata__");
+    assert_eq!(
+        header.as_object().unwrap().len(),
+        4,
+        "3 tensors + __metadata__"
+    );
     assert_eq!(
         read_tensor(&out, "layers.0.mlp.down_proj.weight"),
         read_tensor(&src, "layers.0.mlp.down_proj.weight"),
@@ -257,7 +314,12 @@ fn cast_is_deterministic_across_two_runs() {
             .arg("f32")
             .output()
             .unwrap();
-        assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+        assert_eq!(
+            res.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
     }
     assert_eq!(
         std::fs::read(&a).unwrap(),
@@ -273,7 +335,12 @@ fn cast_output_dtype_matches_request() {
     let src = tmp.path().join("model.safetensors");
     std::fs::write(
         &src,
-        build_st(&[("w", "F32", vec![4], f32_bytes(&[0x3F800000, 0x40000000, 0x40400000, 0x40800000]))]),
+        build_st(&[(
+            "w",
+            "F32",
+            vec![4],
+            f32_bytes(&[0x3F800000, 0x40000000, 0x40400000, 0x40800000]),
+        )]),
     )
     .unwrap();
 
@@ -287,14 +354,23 @@ fn cast_output_dtype_matches_request() {
             .arg(flag)
             .output()
             .unwrap();
-        assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+        assert_eq!(
+            res.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
         let header = read_header(&out);
         assert_eq!(
             header["w"]["dtype"],
             serde_json::Value::String(want.into()),
             "--to {flag} must write dtype {want}"
         );
-        assert_eq!(header["w"]["shape"], serde_json::json!([4]), "shape preserved");
+        assert_eq!(
+            header["w"]["shape"],
+            serde_json::json!([4]),
+            "shape preserved"
+        );
     }
 }
 
@@ -331,7 +407,12 @@ fn cast_preserves_ambiguous_and_non_float_header_spelling() {
         .arg("bf16")
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
     let header = read_header(&out);
     // The ambiguous U16 tensor is passed through untouched, spelling intact.
     assert_eq!(
@@ -346,8 +427,14 @@ fn cast_preserves_ambiguous_and_non_float_header_spelling() {
         "a passed-through U16 tensor must keep its exact bytes"
     );
     // The other non-float tensors keep theirs.
-    assert_eq!(header["w.i64"]["dtype"], serde_json::Value::String("I64".into()));
-    assert_eq!(header["w.bool"]["dtype"], serde_json::Value::String("BOOL".into()));
+    assert_eq!(
+        header["w.i64"]["dtype"],
+        serde_json::Value::String("I64".into())
+    );
+    assert_eq!(
+        header["w.bool"]["dtype"],
+        serde_json::Value::String("BOOL".into())
+    );
 }
 
 // --------------------------------------------------------------------------- //
@@ -373,10 +460,17 @@ fn cast_writes_no_quantization_metadata() {
         .arg("bf16")
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 
     let header = read_header(&out);
-    let meta = header["__metadata__"].as_object().expect("__metadata__ present");
+    let meta = header["__metadata__"]
+        .as_object()
+        .expect("__metadata__ present");
     assert_eq!(
         meta.len(),
         1,
@@ -387,7 +481,12 @@ fn cast_writes_no_quantization_metadata() {
 
     // No tensor name and no metadata key may mention quantization.
     let raw = String::from_utf8_lossy(&read_header_bytes(&out)).into_owned();
-    for forbidden in [".comfy_quant", "weight_scale", "_quantization_metadata", "comfy_quant"] {
+    for forbidden in [
+        ".comfy_quant",
+        "weight_scale",
+        "_quantization_metadata",
+        "comfy_quant",
+    ] {
         assert!(
             !raw.contains(forbidden),
             "output must not mention {forbidden:?}: {raw}"
@@ -479,8 +578,14 @@ fn cast_reports_conversion_with_real_dtype_names() {
     assert_eq!(res.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&res.stdout);
     assert!(stdout.contains("cast:"), "{stdout}");
-    assert!(stdout.contains("F32 -> BF16"), "must name both dtypes: {stdout}");
-    assert!(stdout.contains("converted"), "must say it converted: {stdout}");
+    assert!(
+        stdout.contains("F32 -> BF16"),
+        "must name both dtypes: {stdout}"
+    );
+    assert!(
+        stdout.contains("converted"),
+        "must say it converted: {stdout}"
+    );
     assert!(!stdout.contains("parity:"), "{stdout}");
 }
 
@@ -539,7 +644,11 @@ fn cast_refuses_bf16_to_f16_overflow_naming_the_tensor() {
         .arg("f16")
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(1), "overflow is a DATA error, exit 1");
+    assert_eq!(
+        res.status.code(),
+        Some(1),
+        "overflow is a DATA error, exit 1"
+    );
     let stderr = String::from_utf8_lossy(&res.stderr);
     assert!(
         stderr.contains("a.huge"),
@@ -642,7 +751,10 @@ fn successful_cast_leaves_no_temp_file() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains("cast-tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "temp files left after success: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "temp files left after success: {leftovers:?}"
+    );
     assert!(out.exists(), "the real output must exist after success");
 }
 
@@ -696,7 +808,11 @@ fn cast_rejects_non_safetensors_input() {
         .arg("bf16")
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(2), "non-safetensors input is a usage error");
+    assert_eq!(
+        res.status.code(),
+        Some(2),
+        "non-safetensors input is a usage error"
+    );
 }
 
 /// An `f64` source is a DATA error (exit 1), not a usage error.
@@ -721,7 +837,10 @@ fn cast_rejects_f64_source_with_exit_1() {
     assert_eq!(res.status.code(), Some(1), "f64 source is a DATA error");
     assert!(!out.exists(), "a refused f64 cast must leave no output");
     let stderr = String::from_utf8_lossy(&res.stderr);
-    assert!(stderr.contains("double rounding"), "must explain why: {stderr}");
+    assert!(
+        stderr.contains("double rounding"),
+        "must explain why: {stderr}"
+    );
 }
 
 /// `cast` only READS its input: shards, index, and sidecars must be untouched.
@@ -751,7 +870,9 @@ fn cast_leaves_source_folder_untouched() {
             )
         })
         .collect();
-    assert!(before.iter().any(|(n, _, _)| n == "model.safetensors.index.json"));
+    assert!(before
+        .iter()
+        .any(|(n, _, _)| n == "model.safetensors.index.json"));
     assert!(before.iter().any(|(n, _, _)| n == "config.json"));
 
     let out = tmp.path().join("out.safetensors");
@@ -763,7 +884,12 @@ fn cast_leaves_source_folder_untouched() {
         .arg("bf16")
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 
     // Same set of files, same sizes, same bytes.
     let after: Vec<(String, u64, Vec<u8>)> = std::fs::read_dir(&model)
@@ -779,8 +905,14 @@ fn cast_leaves_source_folder_untouched() {
         })
         .collect();
     assert_eq!(
-        before.iter().map(|(n, s, _)| (n.clone(), *s)).collect::<Vec<_>>(),
-        after.iter().map(|(n, s, _)| (n.clone(), *s)).collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|(n, s, _)| (n.clone(), *s))
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|(n, s, _)| (n.clone(), *s))
+            .collect::<Vec<_>>(),
         "the source folder's file set and sizes must be unchanged"
     );
     for (name, _, want) in &before {
@@ -802,8 +934,76 @@ fn cast_derives_default_output_name() {
             &[("w", "BF16", vec![2], bf16_bytes(&[0x3F80; 2]))],
         )],
     );
-    let res = bin().arg("cast").arg(&model).arg("--to").arg("bf16").output().unwrap();
-    assert_eq!(res.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&res.stderr));
+    let res = bin()
+        .arg("cast")
+        .arg(&model)
+        .arg("--to")
+        .arg("bf16")
+        .output()
+        .unwrap();
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
     let expected = tmp.path().join("VibeVoice-1.5B-bf16.safetensors");
     assert!(expected.exists(), "expected {}", expected.display());
+}
+
+/// NEGATIVE CONTROL for the publish discipline: a refused cast must not
+/// disturb a PRE-EXISTING file at the destination.
+///
+/// # Why the obvious test is not enough
+///
+/// `refused_cast_leaves_no_output_file` asserts the output path does not exist
+/// after a refusal. That is the right user-visible property, but it does not
+/// pin the MECHANISM, and cannot: an implementation that writes straight to
+/// the destination and then deletes the partial file on the error path also
+/// leaves nothing behind. Both designs pass that test.
+///
+/// This test removes the ambiguity. It puts a file with known content at the
+/// destination first, then runs a cast that must be refused:
+///
+/// - under the temp-file design, the destination is never opened, so the
+///   sentinel is untouched;
+/// - under write-then-delete, the sentinel is destroyed and the refusal leaves
+///   no file — so the sentinel is gone, which this test detects.
+///
+/// The sentinel is what makes the assertion discriminating: it converts
+/// "nothing there afterwards" into "whatever was there before is still there".
+#[test]
+fn refused_cast_does_not_disturb_a_preexisting_destination_file() {
+    let tmp = tmp_dir();
+    let src = tmp.path().join("big.safetensors");
+    std::fs::write(
+        &src,
+        build_st(&[("a.huge", "BF16", vec![2], bf16_bytes(&[0x7E1C, 0x3F80]))]),
+    )
+    .unwrap();
+
+    // A sentinel file at the destination, with content we can recognise.
+    let dest = tmp.path().join("sentinel.safetensors");
+    let sentinel = b"SENTINEL-AN-USER-S-THEIR-OWN-FILE".to_vec();
+    std::fs::write(&dest, &sentinel).unwrap();
+
+    let res = bin()
+        .arg("cast")
+        .arg(&src)
+        .arg(&dest)
+        .arg("--to")
+        .arg("f16")
+        .output()
+        .unwrap();
+    assert_eq!(res.status.code(), Some(1), "the cast must be refused");
+
+    assert!(
+        dest.exists(),
+        "a refused cast must not DELETE a pre-existing file at the destination"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        sentinel,
+        "a refused cast must not overwrite or truncate a pre-existing file"
+    );
 }

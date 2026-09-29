@@ -94,8 +94,7 @@ fn same_dtype_payload_is_byte_identical() {
         0x7F7F, // max finite
     ]);
     let before = src.clone();
-    let (out, outcome) =
-        cast_tensor("w", &src, DType::Bf16, DType::Bf16, &[8]).unwrap();
+    let (out, outcome) = cast_tensor("w", &src, DType::Bf16, DType::Bf16, &[8]).unwrap();
     assert_eq!(out, before, "bf16->bf16 must be a byte copy");
     assert_eq!(outcome, CastOutcome::Verbatim);
     assert!(outcome.is_verbatim());
@@ -127,8 +126,7 @@ fn same_dtype_payload_is_byte_identical() {
 fn verbatim_path_preserves_snan_payload_a_round_trip_would_erase() {
     let snan_bf16 = 0x7F81u16;
     let src = bf16_payload(&[snan_bf16]);
-    let (out, outcome) =
-        cast_tensor("w", &src, DType::Bf16, DType::Bf16, &[1]).unwrap();
+    let (out, outcome) = cast_tensor("w", &src, DType::Bf16, DType::Bf16, &[1]).unwrap();
     assert_eq!(outcome, CastOutcome::Verbatim);
     assert_eq!(
         out,
@@ -207,8 +205,16 @@ fn verbatim_path_preserves_snan_payload_a_round_trip_would_erase() {
 #[test]
 fn f32_to_bf16_matches_pinned_expected_bits() {
     let cases: &[(u32, u16, &str)] = &[
-        (0x3F80_8000, 0x3F80, "tie, even retained LSB -> round DOWN to even"),
-        (0x3F81_8000, 0x3F82, "tie, odd retained LSB -> round UP to even"),
+        (
+            0x3F80_8000,
+            0x3F80,
+            "tie, even retained LSB -> round DOWN to even",
+        ),
+        (
+            0x3F81_8000,
+            0x3F82,
+            "tie, odd retained LSB -> round UP to even",
+        ),
         (0x3F81_7FFF, 0x3F81, "just below the odd tie"),
         (0x3F81_8001, 0x3F82, "just above the odd tie"),
         (0x0000_0000, 0x0000, "+0.0"),
@@ -258,8 +264,16 @@ fn f32_to_bf16_matches_pinned_expected_bits() {
 #[test]
 fn f32_to_f16_matches_pinned_expected_bits() {
     let cases: &[(u32, u16, &str)] = &[
-        (0x3F80_1000, 0x3C00, "tie, even retained LSB -> round DOWN to even"),
-        (0x3F80_3000, 0x3C02, "tie, odd retained LSB -> round UP to even"),
+        (
+            0x3F80_1000,
+            0x3C00,
+            "tie, even retained LSB -> round DOWN to even",
+        ),
+        (
+            0x3F80_3000,
+            0x3C02,
+            "tie, odd retained LSB -> round UP to even",
+        ),
         (0x3F80_2FFF, 0x3C01, "just below the odd tie"),
         (0x3F80_3001, 0x3C02, "just above the odd tie"),
         (0x0000_0000, 0x0000, "+0.0"),
@@ -294,8 +308,14 @@ fn f32_to_f16_matches_pinned_expected_bits() {
 fn bf16_to_f16_overflow_errors_naming_the_tensor() {
     // bf16 0x7E1C == 5.18e37, far above the f16 max of 65504.
     let big = bf16_payload(&[0x7E1C, 0x3F80]);
-    let err = cast_tensor("encoder.layers.3.mlp.w", &big, DType::Bf16, DType::F16, &[2])
-        .expect_err("must refuse, not saturate");
+    let err = cast_tensor(
+        "encoder.layers.3.mlp.w",
+        &big,
+        DType::Bf16,
+        DType::F16,
+        &[2],
+    )
+    .expect_err("must refuse, not saturate");
 
     match &err {
         CastError::F16Overflow {
@@ -414,21 +434,24 @@ fn f64_source_is_rejected() {
 /// convention is part of its contract.
 #[test]
 fn non_float_dtypes_pass_through_untouched() {
-    // (dtype, a distinctive payload, element count)
+    // (dtype, a distinctive payload of `elem_size * count` bytes, count).
+    // The payload length must match `elem_size * count` exactly, since
+    // `cast_tensor` cross-checks shape against payload length for the
+    // float paths; the non-float paths pass through without that check.
     let cases: &[(DType, Vec<u8>, u64)] = &[
-        (DType::I64, vec![0xFF; 8 * 3], 3),
-        (DType::I32, vec![0x7B; 4 * 2], 2),
-        (DType::I16, vec![0x11; 2 * 5], 5),
-        (DType::I8, vec![0x22; 1 * 4], 4),
-        (DType::U8, vec![0xC3; 1 * 6], 6),
-        (DType::U16, vec![0x5A; 2 * 2], 2),
-        (DType::Bool, vec![0x01; 1 * 7], 7),
-        (DType::F8E4M3, vec![0x7E; 1 * 8], 8),
+        (DType::I64, vec![0xFF; 24], 3),   // 8 bytes/elem
+        (DType::I32, vec![0x7B; 8], 2),    // 4 bytes/elem
+        (DType::I16, vec![0x11; 10], 5),   // 2 bytes/elem
+        (DType::I8, vec![0x22; 4], 4),     // 1 byte/elem
+        (DType::U8, vec![0xC3; 6], 6),     // 1 byte/elem
+        (DType::U16, vec![0x5A; 4], 2),    // 2 bytes/elem
+        (DType::Bool, vec![0x01; 7], 7),   // 1 byte/elem
+        (DType::F8E4M3, vec![0x7E; 8], 8), // 1 byte/elem
     ];
 
     for &(dtype, ref payload, n) in cases {
         for target in [DType::Bf16, DType::F16, DType::F32] {
-            let (out, outcome) = cast_tensor("w", &payload, dtype, target, &[n]).unwrap();
+            let (out, outcome) = cast_tensor("w", payload, dtype, target, &[n]).unwrap();
             assert_eq!(
                 out, *payload,
                 "{dtype} must pass through untouched when targeting {target}"
@@ -470,7 +493,9 @@ fn float_dtypes_take_the_target_and_output_dtype_for_is_correct() {
 #[test]
 fn widening_to_f32_is_exact() {
     // A spread of bf16 bit patterns including subnormals, zeros and specials.
-    let words = [0x3F80u16, 0x8000, 0x0000, 0x0001, 0x7F80, 0xFF80, 0x7FC0, 0x7F7F];
+    let words = [
+        0x3F80u16, 0x8000, 0x0000, 0x0001, 0x7F80, 0xFF80, 0x7FC0, 0x7F7F,
+    ];
     let src = bf16_payload(&words);
     let (out, outcome) = cast_tensor("w", &src, DType::Bf16, DType::F32, &[8]).unwrap();
     assert_eq!(outcome, CastOutcome::Converted);
@@ -527,8 +552,14 @@ fn output_header_carries_no_quantization_metadata() {
     let mut meta = serde_json::Map::new();
     meta.insert("format".into(), serde_json::Value::String("pt".into()));
     let mut w = IncrementalWriter::open_new_with(&out, 1 << 16, Some(meta)).unwrap();
-    w.add_tensor("a.w", DType::Bf16, None, &[2], &bf16_payload(&[0x3F80, 0x4000]))
-        .unwrap();
+    w.add_tensor(
+        "a.w",
+        DType::Bf16,
+        None,
+        &[2],
+        &bf16_payload(&[0x3F80, 0x4000]),
+    )
+    .unwrap();
     w.finalize().unwrap();
 
     // Read the raw header back and assert on its KEYS.
@@ -580,9 +611,12 @@ fn cast_preserves_shape_and_payload_for_the_target_model_case() {
     let n = 4096usize;
     let words: Vec<u16> = (0..n).map(|i| (i as u16).wrapping_mul(2654)).collect();
     let src = bf16_payload(&words);
-    let (out, outcome) = cast_tensor("big.weight", &src, DType::Bf16, DType::Bf16, &[n as u64])
-        .unwrap();
+    let (out, outcome) =
+        cast_tensor("big.weight", &src, DType::Bf16, DType::Bf16, &[n as u64]).unwrap();
     assert_eq!(outcome, CastOutcome::Verbatim);
     assert_eq!(out.len(), src.len(), "byte length preserved");
-    assert_eq!(out, src, "a 4096-element bf16 tensor must survive byte-identical");
+    assert_eq!(
+        out, src,
+        "a 4096-element bf16 tensor must survive byte-identical"
+    );
 }

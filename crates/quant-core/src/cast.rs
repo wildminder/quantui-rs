@@ -66,9 +66,7 @@
 //! discriminates round-to-nearest-even from truncation. The tests never call
 //! `f32_to_bf16_bits` to compute what they expect.
 
-use crate::dtype::{
-    bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType,
-};
+use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
 
 /// Largest finite `f16`. `half::f16::MAX` is 65504.0; the value above it
 /// rounds to `Inf` under RNE, so this is the exact overflow threshold.

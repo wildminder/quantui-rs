@@ -255,12 +255,9 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
     let tmp_path = temp_path_for(&out_path);
 
     let write_result = (|| -> Result<(usize, usize, usize, Vec<DType>), String> {
-        let mut writer = IncrementalWriter::open_new_with(
-            &tmp_path,
-            HEADER_SLOT_HINT,
-            Some(output_metadata()),
-        )
-        .map_err(|e| format!("creating {}: {e}", tmp_path.display()))?;
+        let mut writer =
+            IncrementalWriter::open_new_with(&tmp_path, HEADER_SLOT_HINT, Some(output_metadata()))
+                .map_err(|e| format!("creating {}: {e}", tmp_path.display()))?;
 
         let mut total = 0usize;
         let mut verbatim = 0usize;
@@ -296,10 +293,8 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
                 .map_err(|e| format!("reading {name}: {e}"))?;
 
             let is_float = matches!(info.dtype, DType::F32 | DType::F16 | DType::Bf16);
-            if is_float {
-                if !src_dtypes.contains(&info.dtype) {
-                    src_dtypes.push(info.dtype);
-                }
+            if is_float && !src_dtypes.contains(&info.dtype) {
+                src_dtypes.push(info.dtype);
             }
 
             let (bytes, outcome) = cast_tensor(name, payload, info.dtype, target, &info.shape)
