@@ -22,9 +22,7 @@
 //! tie (pins that we do NOT round up).
 
 use quant_core::cast::{cast_tensor, output_dtype_for, CastError, CastOutcome};
-use quant_core::dtype::{
-    bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType,
-};
+use quant_core::dtype::{f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, DType};
 
 /// Build an f32 payload from raw bit patterns.
 fn f32_payload(words: &[u32]) -> Vec<u8> {

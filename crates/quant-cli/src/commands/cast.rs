@@ -86,8 +86,15 @@ fn derive_output(input: &Path, to: CastToArg) -> Result<PathBuf, String> {
             input.display()
         )
     })?;
+    // "Beside the input" means: next to the FILE, or alongside the FOLDER —
+    // never inside it. Writing into the source folder would mutate the very
+    // directory this command promises to only read, and would put the merged
+    // output where a re-run of the source discovery could trip over it.
     let dir = if input.is_dir() {
-        input.to_path_buf()
+        input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
     } else {
         input
             .parent()
@@ -110,7 +117,10 @@ fn output_metadata() -> Map<String, Value> {
 /// Print the `cast:` summary (never a `parity:` line).
 fn report(total: usize, verbatim: usize, converted: usize, src_desc: &str, dst: DType) {
     if converted == 0 {
-        println!("cast: {total} tensors, lossless (verbatim copy)");
+        // Name the dtypes here too. This is the same-dtype branch, and for the
+        // all-bf16 target model it is the COMMON case — so it is exactly the
+        // run that must not leave the reader guessing what was copied.
+        println!("cast: {total} tensors, lossless ({src_desc} -> {dst}, verbatim copy)");
     } else if verbatim == 0 {
         println!(
             "cast: {total} tensors, {converted} converted \
@@ -146,33 +156,68 @@ fn temp_path_for(out: &Path) -> PathBuf {
     dir.join(format!(".{stem}.cast-tmp"))
 }
 
-pub fn run(args: CastArgs) -> ExitCode {
-    match run_inner(args) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(1)
+/// Why a run failed, which decides the exit code.
+///
+/// The spec fixes the mapping: a USAGE error (bad path, not a safetensors file
+/// or sharded folder) exits 2, while a DATA error (the model cannot be
+/// represented — f16 overflow, f64 source) exits 1. Collapsing both to 1 would
+/// make a typo in a path look like a corrupt model.
+struct CliError {
+    message: String,
+    usage: bool,
+}
+
+impl CliError {
+    fn usage(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            usage: true,
+        }
+    }
+
+    fn data(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            usage: false,
         }
     }
 }
 
-fn run_inner(args: CastArgs) -> Result<ExitCode, String> {
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        // A bare string from the write path is a DATA failure (overflow
+        // refusal, IO error on a well-formed model).
+        Self::data(message)
+    }
+}
+
+pub fn run(args: CastArgs) -> ExitCode {
+    match run_inner(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {}", e.message);
+            ExitCode::from(if e.usage { 2 } else { 1 })
+        }
+    }
+}
+
+fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
     let started = Instant::now();
     let target = target_dtype(args.to);
 
     // --- Input classification (reuses discover; never reimplemented) --------
     let (kind, base) = discover::classify_input(&args.input);
     let kind = kind.ok_or_else(|| {
-        format!(
+        CliError::usage(format!(
             "{} is neither a .safetensors file nor a sharded model folder",
             args.input.display()
-        )
+        ))
     })?;
     let _ = base; // only needed for the default output name, computed below
 
     let out_path = match &args.output {
         Some(p) => p.clone(),
-        None => derive_output(&args.input, args.to)?,
+        None => derive_output(&args.input, args.to).map_err(CliError::usage)?,
     };
 
     // --- Build the tensor-name -> shard map --------------------------------
@@ -188,7 +233,10 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, String> {
         }
     };
     if shard_paths.is_empty() {
-        return Err(format!("no .safetensors shards found in {}", args.input.display()));
+        return Err(CliError::data(format!(
+            "no .safetensors shards found in {}",
+            args.input.display()
+        )));
     }
 
     let union = discover::resolve_union(&shard_paths).map_err(|e| e.to_string())?;
@@ -282,18 +330,19 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, String> {
             .finalize()
             .map_err(|e| format!("finalizing {}: {e}", tmp_path.display()))?;
         Ok((total, verbatim, converted, src_dtypes))
-    })();
+    })()
+    .map_err(|e| {
+        // The destination was never touched — the half-built file is still at
+        // the temp path. Remove it so a failure cannot leave something that
+        // looks like a valid `.safetensors` next to the user's model.
+        // Best-effort: if removal itself fails there is nothing better to do,
+        // and the *destination* path remains absent, which is the property
+        // that actually matters.
+        let _ = std::fs::remove_file(&tmp_path);
+        CliError::data(e)
+    })?;
 
-    let (total, verbatim, converted, src_dtypes) = match write_result {
-        Ok(stats) => stats,
-        Err(e) => {
-            // Remove the half-built temp file. Best-effort: if removal itself
-            // fails there is nothing better to do, and the destination path is
-            // still untouched (which is the property that actually matters).
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-    };
+    let (total, verbatim, converted, src_dtypes) = write_result;
 
     // Publish atomically. Same directory as the destination, so this is a
     // rename and not a cross-device copy.
