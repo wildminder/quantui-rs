@@ -37,7 +37,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
 
 use quant_core::cast::{cast_tensor, output_dtype_for, CastOutcome};
 use quant_core::discover::{self, InputKind};
@@ -116,31 +115,30 @@ fn output_metadata() -> Map<String, Value> {
 }
 
 /// Print the `cast:` summary (never a `parity:` line).
-fn report(
-    total: usize,
-    verbatim: usize,
-    converted: usize,
-    src_desc: &str,
-    dst: DType,
-    elapsed_secs: f64,
-) {
+///
+/// BYTE-STABLE BY CONTRACT: nothing derived from wall-clock time, the
+/// filesystem, or iteration order of a hash map may appear here, so two runs of
+/// the same input print identical bytes. `quantize` and `gguf` both keep their
+/// printed summaries stable for the same reason — elapsed time is recorded into
+/// the recent-runs history instead, and the live progress bar shows
+/// `{elapsed_precise}` while the run is in flight, which is where the user is
+/// actually looking. A varying field here would make `cast` the only command
+/// whose summary cannot be grepped or diffed across runs.
+fn report(total: usize, verbatim: usize, converted: usize, src_desc: &str, dst: DType) {
     if converted == 0 {
         // Name the dtypes here too. This is the same-dtype branch, and for the
         // all-bf16 target model it is the COMMON case — so it is exactly the
         // run that must not leave the reader guessing what was copied.
-        println!(
-            "cast: {total} tensors, lossless ({src_desc} -> {dst}, verbatim copy) \
-             in {elapsed_secs:.1}s"
-        );
+        println!("cast: {total} tensors, lossless ({src_desc} -> {dst}, verbatim copy)");
     } else if verbatim == 0 {
         println!(
             "cast: {total} tensors, {converted} converted \
-             ({src_desc} -> {dst}, round-to-nearest-even) in {elapsed_secs:.1}s"
+             ({src_desc} -> {dst}, round-to-nearest-even)"
         );
     } else {
         println!(
             "cast: {total} tensors, {verbatim} verbatim, {converted} converted \
-             ({src_desc} -> {dst}, round-to-nearest-even) in {elapsed_secs:.1}s"
+             ({src_desc} -> {dst}, round-to-nearest-even)"
         );
     }
 }
@@ -213,7 +211,6 @@ pub fn run(args: CastArgs) -> ExitCode {
 }
 
 fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
-    let started = Instant::now();
     let target = target_dtype(args.to);
 
     // --- Input classification (reuses discover; never reimplemented) --------
@@ -397,13 +394,6 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
             format!("mixed({})", joined.join("+"))
         }
     };
-    report(
-        total,
-        verbatim,
-        converted,
-        &src_desc,
-        target,
-        started.elapsed().as_secs_f64(),
-    );
+    report(total, verbatim, converted, &src_desc, target);
     Ok(ExitCode::SUCCESS)
 }

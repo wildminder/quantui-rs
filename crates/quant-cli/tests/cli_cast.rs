@@ -762,75 +762,108 @@ fn successful_cast_leaves_no_temp_file() {
 // Progress reporting
 // --------------------------------------------------------------------------- //
 
-/// `--no-progress` is accepted, and the run stays exactly as quiet and exactly
-/// as informative as before.
+/// `--no-progress` is accepted, the run stays quiet, and the `cast:` summary is
+/// BYTE-STABLE across runs.
+///
+/// # Why byte-stability is the property worth pinning
+///
+/// `quantize` and `gguf` both keep their printed summaries free of wall-clock
+/// data — elapsed time is recorded into the recent-runs history, and the live
+/// bar shows `{elapsed_precise}` while the run is in flight. A duration in
+/// `cast`'s summary would have made it the only command whose output line
+/// differs between two identical runs, in a tool whose identity is
+/// deterministic, greppable output. So the summary must be a pure function of
+/// the input model.
+///
+/// # Why this test needs BOTH assertions below
+///
+/// The two-runs-identical comparison is the property, but on a 3-tensor fixture
+/// it is weak on its own: two sub-millisecond runs would BOTH render `0.0s` and
+/// compare EQUAL, so reintroducing an elapsed suffix could pass. The exact-literal
+/// comparison has no such hole — it rejects any added field regardless of
+/// timing. Together they pin the intent and the mechanism.
 ///
 /// # What this test can and cannot prove
 ///
 /// It CAN prove the flag exists and parses (clap exits 2 on an unknown flag, so
-/// exit 0 already means the argument is wired to `CastArgs::no_progress`), and
-/// that suppressing the bar does not disturb the output contract: the `cast:`
-/// summary still lands on STDOUT with its elapsed-time suffix, and STDERR stays
-/// completely empty.
+/// exit 0 already means the argument is wired to `CastArgs::no_progress`), that
+/// suppressing the bar does not disturb the output contract, and the two
+/// stability properties above.
 ///
 /// It CANNOT prove the bar is *suppressed* — `Command::output()` gives the child
 /// a pipe, so `indicatif` auto-hides the bar in this test whether or not the
-/// flag was passed. That assertion is therefore vacuous on its own and is kept
-/// only as a cheap regression net (a summary accidentally moved to stderr, or a
-/// stray `eprintln!` in the loop, would trip it). The flag's real rendering
-/// effect needs a TTY and is verified by hand, not here.
+/// flag was passed (verified: `TERM`/`CLICOLOR_FORCE` overrides change nothing,
+/// and the same suppression is observed for `gguf`). That assertion is therefore
+/// vacuous on its own and is kept only as a cheap regression net (a summary
+/// accidentally moved to stderr, or a stray `eprintln!` in the loop, would trip
+/// it). The flag's real rendering effect needs a TTY and is verified by hand.
 #[test]
-fn no_progress_keeps_the_summary_on_stdout_and_stderr_clean() {
+fn no_progress_keeps_a_byte_stable_summary_on_stdout_and_stderr_clean() {
     let tmp = tmp_dir();
     let src = tmp.path().join("m.safetensors");
     write_bf16_model(&src);
-    let out = tmp.path().join("out.safetensors");
 
-    let res = bin()
-        .arg("cast")
-        .arg(&src)
-        .arg(&out)
-        .arg("--to")
-        .arg("bf16")
-        .arg("--no-progress")
-        .output()
-        .unwrap();
+    // Two independent runs, each to its own output path.
+    let run = |name: &str| {
+        let res = bin()
+            .arg("cast")
+            .arg(&src)
+            .arg(tmp.path().join(name))
+            .arg("--to")
+            .arg("bf16")
+            .arg("--no-progress")
+            .output()
+            .unwrap();
+        assert_eq!(
+            res.status.code(),
+            Some(0),
+            "--no-progress must be a recognised flag and the cast must succeed: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        (
+            String::from_utf8_lossy(&res.stdout).into_owned(),
+            String::from_utf8_lossy(&res.stderr).into_owned(),
+        )
+    };
+    let (stdout_a, stderr_a) = run("a.safetensors");
+    let (stdout_b, _) = run("b.safetensors");
+
+    // (1) The summary is stdout, and it survives --no-progress unchanged.
+    assert!(
+        stdout_a.contains("cast:"),
+        "the cast: summary must survive --no-progress, got: {stdout_a}"
+    );
+    assert!(
+        stdout_a.contains("lossless") && stdout_a.contains("BF16 -> BF16"),
+        "the summary must keep naming what it did, got: {stdout_a}"
+    );
+
+    // (2) EXACT bytes: no varying field may be present at all. This is the
+    // assertion that survives the `0.0s`-twice hole described above.
     assert_eq!(
-        res.status.code(),
-        Some(0),
-        "--no-progress must be a recognised flag and the cast must succeed: {}",
-        String::from_utf8_lossy(&res.stderr)
+        stdout_a, "cast: 3 tensors, lossless (BF16 -> BF16, verbatim copy)\n",
+        "the cast: summary must be byte-exact and free of any run-varying field"
     );
 
-    // The summary is stdout, unchanged in substance by the flag.
-    let stdout = String::from_utf8_lossy(&res.stdout);
-    assert!(
-        stdout.contains("cast:"),
-        "the cast: summary must survive --no-progress, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("lossless") && stdout.contains("BF16 -> BF16"),
-        "the summary must keep naming what it did, got: {stdout}"
-    );
-    assert!(
-        stdout.contains(" in "),
-        "the summary must keep its elapsed-time suffix, got: {stdout}"
+    // (3) The property itself: two identical runs print identical bytes.
+    assert_eq!(
+        stdout_a, stdout_b,
+        "two runs of the same input must print a byte-identical cast: summary"
     );
 
     // STDERR carries no bar glyphs at all. The template is
     // `{{spinner}} [{{elapsed}}] {{bar:40}} {{pos}}/{{len}} {{msg}}` with
     // progress_chars "#>-", so '[' and '#' are the discriminating marks; a
     // healthy run of this fixture emits nothing to stderr whatsoever.
-    let stderr = String::from_utf8_lossy(&res.stderr);
     for glyph in ['[', '#', '>', '/'] {
         assert!(
-            !stderr.contains(glyph),
-            "--no-progress must leave no bar glyph {glyph:?} on stderr, got: {stderr}"
+            !stderr_a.contains(glyph),
+            "--no-progress must leave no bar glyph {glyph:?} on stderr, got: {stderr_a}"
         );
     }
     assert!(
-        stderr.is_empty(),
-        "a clean bf16->bf16 run has nothing to warn about: {stderr}"
+        stderr_a.is_empty(),
+        "a clean bf16->bf16 run has nothing to warn about: {stderr_a}"
     );
 
     // The flag is documented in `--help` with the SAME wording the other two
