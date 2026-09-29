@@ -47,6 +47,7 @@ use quant_core::st_io::writer::IncrementalWriter;
 use serde_json::{Map, Value};
 
 use crate::args::{CastArgs, CastToArg};
+use crate::progress::{BarSink, NullSink, ProgressSink};
 
 /// Bytes to reserve for the header slot up front.
 ///
@@ -115,21 +116,31 @@ fn output_metadata() -> Map<String, Value> {
 }
 
 /// Print the `cast:` summary (never a `parity:` line).
-fn report(total: usize, verbatim: usize, converted: usize, src_desc: &str, dst: DType) {
+fn report(
+    total: usize,
+    verbatim: usize,
+    converted: usize,
+    src_desc: &str,
+    dst: DType,
+    elapsed_secs: f64,
+) {
     if converted == 0 {
         // Name the dtypes here too. This is the same-dtype branch, and for the
         // all-bf16 target model it is the COMMON case — so it is exactly the
         // run that must not leave the reader guessing what was copied.
-        println!("cast: {total} tensors, lossless ({src_desc} -> {dst}, verbatim copy)");
+        println!(
+            "cast: {total} tensors, lossless ({src_desc} -> {dst}, verbatim copy) \
+             in {elapsed_secs:.1}s"
+        );
     } else if verbatim == 0 {
         println!(
             "cast: {total} tensors, {converted} converted \
-             ({src_desc} -> {dst}, round-to-nearest-even)"
+             ({src_desc} -> {dst}, round-to-nearest-even) in {elapsed_secs:.1}s"
         );
     } else {
         println!(
             "cast: {total} tensors, {verbatim} verbatim, {converted} converted \
-             ({src_desc} -> {dst}, round-to-nearest-even)"
+             ({src_desc} -> {dst}, round-to-nearest-even) in {elapsed_secs:.1}s"
         );
     }
 }
@@ -254,6 +265,15 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
     // renamed over the destination, which is atomic within a directory.
     let tmp_path = temp_path_for(&out_path);
 
+    // Progress sink, built exactly as `quantize`/`gguf` build theirs. The
+    // total is known UP FRONT from the union header, so the bar is accurate
+    // from the first frame — unlike those two, which discover it as they go.
+    let mut sink: Box<dyn ProgressSink> = if args.no_progress {
+        Box::new(NullSink)
+    } else {
+        Box::new(BarSink::new(&format!("cast -> {}", target_tag(args.to))))
+    };
+
     let write_result = (|| -> Result<(usize, usize, usize, Vec<DType>), String> {
         let mut writer =
             IncrementalWriter::open_new_with(&tmp_path, HEADER_SLOT_HINT, Some(output_metadata()))
@@ -280,6 +300,11 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
                     .map_err(|e| format!("opening {}: {e}", sp.display()))?,
             );
         }
+
+        // Announce the total before the first tensor, so the bar renders as
+        // `0/N` rather than an indeterminate bar.
+        let expected = union.entries.len();
+        sink.update(0, expected);
 
         for (name, info) in &union.entries {
             let src = name_to_shard
@@ -319,14 +344,23 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
                 CastOutcome::Verbatim => verbatim += 1,
                 CastOutcome::Converted => converted += 1,
             }
+            // Advance after the tensor is durably written, so the position can
+            // never claim progress the file does not have.
+            sink.update(total, expected);
         }
 
         writer
             .finalize()
             .map_err(|e| format!("finalizing {}: {e}", tmp_path.display()))?;
         Ok((total, verbatim, converted, src_dtypes))
-    })()
-    .map_err(|e| {
+    })();
+
+    // Always clear the progress bar before reporting anything — including on
+    // the overflow / f64 / IO error paths — so the message is never garbled by
+    // a live bar. Mirrors `quantize.rs::run_single`.
+    sink.finish();
+
+    let (total, verbatim, converted, src_dtypes) = write_result.map_err(|e| {
         // The destination was never touched — the half-built file is still at
         // the temp path. Remove it so a failure cannot leave something that
         // looks like a valid `.safetensors` next to the user's model.
@@ -336,8 +370,6 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
         let _ = std::fs::remove_file(&tmp_path);
         CliError::data(e)
     })?;
-
-    let (total, verbatim, converted, src_dtypes) = write_result;
 
     // Publish atomically. Same directory as the destination, so this is a
     // rename and not a cross-device copy.
@@ -365,7 +397,13 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
             format!("mixed({})", joined.join("+"))
         }
     };
-    report(total, verbatim, converted, &src_desc, target);
-    let _ = started;
+    report(
+        total,
+        verbatim,
+        converted,
+        &src_desc,
+        target,
+        started.elapsed().as_secs_f64(),
+    );
     Ok(ExitCode::SUCCESS)
 }

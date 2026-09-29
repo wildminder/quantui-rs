@@ -397,6 +397,10 @@ pub struct CastArgs {
     /// Target float dtype for every float tensor in the model.
     #[arg(long = "to", value_enum)]
     pub to: CastToArg,
+
+    /// Disable the progress bar (plain, CI-friendly output).
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 // --------------------------------------------------------------------------- //

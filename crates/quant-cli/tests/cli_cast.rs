@@ -759,6 +759,113 @@ fn successful_cast_leaves_no_temp_file() {
 }
 
 // --------------------------------------------------------------------------- //
+// Progress reporting
+// --------------------------------------------------------------------------- //
+
+/// `--no-progress` is accepted, and the run stays exactly as quiet and exactly
+/// as informative as before.
+///
+/// # What this test can and cannot prove
+///
+/// It CAN prove the flag exists and parses (clap exits 2 on an unknown flag, so
+/// exit 0 already means the argument is wired to `CastArgs::no_progress`), and
+/// that suppressing the bar does not disturb the output contract: the `cast:`
+/// summary still lands on STDOUT with its elapsed-time suffix, and STDERR stays
+/// completely empty.
+///
+/// It CANNOT prove the bar is *suppressed* — `Command::output()` gives the child
+/// a pipe, so `indicatif` auto-hides the bar in this test whether or not the
+/// flag was passed. That assertion is therefore vacuous on its own and is kept
+/// only as a cheap regression net (a summary accidentally moved to stderr, or a
+/// stray `eprintln!` in the loop, would trip it). The flag's real rendering
+/// effect needs a TTY and is verified by hand, not here.
+#[test]
+fn no_progress_keeps_the_summary_on_stdout_and_stderr_clean() {
+    let tmp = tmp_dir();
+    let src = tmp.path().join("m.safetensors");
+    write_bf16_model(&src);
+    let out = tmp.path().join("out.safetensors");
+
+    let res = bin()
+        .arg("cast")
+        .arg(&src)
+        .arg(&out)
+        .arg("--to")
+        .arg("bf16")
+        .arg("--no-progress")
+        .output()
+        .unwrap();
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "--no-progress must be a recognised flag and the cast must succeed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+
+    // The summary is stdout, unchanged in substance by the flag.
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(
+        stdout.contains("cast:"),
+        "the cast: summary must survive --no-progress, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("lossless") && stdout.contains("BF16 -> BF16"),
+        "the summary must keep naming what it did, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(" in "),
+        "the summary must keep its elapsed-time suffix, got: {stdout}"
+    );
+
+    // STDERR carries no bar glyphs at all. The template is
+    // `{{spinner}} [{{elapsed}}] {{bar:40}} {{pos}}/{{len}} {{msg}}` with
+    // progress_chars "#>-", so '[' and '#' are the discriminating marks; a
+    // healthy run of this fixture emits nothing to stderr whatsoever.
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    for glyph in ['[', '#', '>', '/'] {
+        assert!(
+            !stderr.contains(glyph),
+            "--no-progress must leave no bar glyph {glyph:?} on stderr, got: {stderr}"
+        );
+    }
+    assert!(
+        stderr.is_empty(),
+        "a clean bf16->bf16 run has nothing to warn about: {stderr}"
+    );
+
+    // The flag is documented in `--help` with the SAME wording the other two
+    // subcommands use. Compared against `quantize --help` rather than a
+    // hardcoded string, so this is a drift guard: clap strips the doc comment's
+    // trailing period when rendering, so a literal here would be brittle AND
+    // would not notice the three descriptions diverging.
+    let help_line = |sub: &str| -> String {
+        let res = bin().arg(sub).arg("--help").output().unwrap();
+        assert_eq!(res.status.code(), Some(0), "{sub} --help must succeed");
+        let text = String::from_utf8_lossy(&res.stdout);
+        let idx = text
+            .find("--no-progress")
+            .unwrap_or_else(|| panic!("{sub} --help must list --no-progress, got: {text}"));
+        text[idx..]
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let cast_help = help_line("cast");
+    assert!(
+        cast_help.starts_with("Disable the progress bar"),
+        "cast --no-progress must be documented as disabling the bar, got: {cast_help:?}"
+    );
+    assert_eq!(
+        cast_help,
+        help_line("quantize"),
+        "cast and quantize must document --no-progress identically (checked by \
+         value, not by literal, because clap rewraps help text)"
+    );
+}
+
+// --------------------------------------------------------------------------- //
 // Usage errors and the read-only guarantee
 // --------------------------------------------------------------------------- //
 
