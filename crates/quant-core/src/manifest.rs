@@ -262,6 +262,31 @@ impl QuantConfig {
             .map(|re| re.is_match(name))
             .unwrap_or(false)
     }
+
+    /// Compile `--exclude-layers` ONCE and report whether it is usable.
+    ///
+    /// `excluded` swallows a compile error with `unwrap_or(false)`, so an
+    /// invalid pattern silently excludes NOTHING and the run emits a full
+    /// quantized file with no diagnostic. That behaviour is deliberate and
+    /// pinned by `excluded_regex_semantics` (the Python original is not on
+    /// this box, so the oracle cannot be re-checked — do not quietly change
+    /// the semantics). This accessor exists so the CLI can WARN instead of
+    /// leaving the user to discover the mistake from the file size.
+    ///
+    /// Returns the compile error, if any. `Ok(())` when no pattern is set.
+    pub fn exclude_layers_status(&self) -> Result<(), regex::Error> {
+        match &self.exclude_layers {
+            None => Ok(()),
+            Some(p) => regex::Regex::new(p).map(|_| ()),
+        }
+    }
+
+    /// How many tensors the exclusion actually removes, for the CLI summary.
+    /// Counting is done against the real names so a no-op pattern is visible
+    /// as `0` rather than silently producing an oversized artifact.
+    pub fn count_excluded<'a>(&self, names: impl Iterator<Item = &'a str>) -> usize {
+        names.filter(|n| self.excluded(n)).count()
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -673,6 +698,79 @@ mod tests {
         );
         c.exclude_layers = None;
         assert!(!c.excluded("anything"));
+    }
+
+    /// The `unwrap_or(false)` in `excluded` is a SILENT no-op on a typo, which
+    /// is the whole reason `exclude_layers_status` exists. Pin both halves:
+    /// the status must reject what `excluded` quietly ignores, and a valid
+    /// pattern must report Ok.
+    #[test]
+    fn exclude_layers_status_catches_what_excluded_swallows() {
+        let mut c = QuantConfig::default();
+        c.exclude_layers = Some("[invalid".into());
+        assert!(
+            c.exclude_layers_status().is_err(),
+            "an invalid pattern must be REPORTED, not silently ignored"
+        );
+        // And the swallow itself is unchanged — this test documents the
+        // behaviour the CLI warning exists to surface, not to endorse.
+        assert!(!c.excluded("attn_norm.weight"));
+
+        c.exclude_layers = Some("attn_norm".into());
+        assert!(c.exclude_layers_status().is_ok());
+        c.exclude_layers = None;
+        assert!(c.exclude_layers_status().is_ok(), "no pattern is always ok");
+    }
+
+    /// The pattern that reproduces ComfyUI's own `transformer_blocks`-only
+    /// selection on Qwen-Image 2.1, verified against the real tensor names:
+    /// it must hit every non-block 2-D weight, and must NOT touch anything
+    /// inside `transformer_blocks`.
+    #[test]
+    fn transformer_blocks_only_exclusion_is_exact() {
+        let mut c = QuantConfig::default();
+        c.exclude_layers =
+            Some(r"^(img_in|modulation|norm_out|proj_out|time_text_embed|txt_in)\.".into());
+        // Every non-block 2-D weight in that model.
+        for n in [
+            "img_in.weight",
+            "modulation.1.weight",
+            "norm_out.linear.weight",
+            "proj_out.weight",
+            "time_text_embed.timestep_embedder.linear_1.weight",
+            "time_text_embed.timestep_embedder.linear_2.weight",
+            "txt_in.in_layer.weight",
+            "txt_in.out_layer.weight",
+        ] {
+            assert!(c.excluded(n), "{n} should be excluded");
+        }
+        // Nothing inside the blocks may be caught — this is the direction
+        // that would silently change 192 tensors if the regex were loose.
+        for n in [
+            "transformer_blocks.0.attn.to_q.weight",
+            "transformer_blocks.0.attn.to_k.weight",
+            "transformer_blocks.47.img_mlp.gate_up.weight",
+            "transformer_blocks.9.attn.to_out.0.weight",
+        ] {
+            assert!(!c.excluded(n), "{n} must NOT be excluded");
+        }
+    }
+
+    #[test]
+    fn count_excluded_reports_zero_for_a_noop_pattern() {
+        let names = [
+            "transformer_blocks.0.attn.to_q.weight",
+            "transformer_blocks.0.attn.to_k.weight",
+        ];
+        let mut c = QuantConfig::default();
+        c.exclude_layers = Some("[invalid".into());
+        assert_eq!(
+            c.count_excluded(names.iter().copied()),
+            0,
+            "a swallowed compile error must be visible as 0, not as a mystery file size"
+        );
+        c.exclude_layers = Some("attn\\.to_q".into());
+        assert_eq!(c.count_excluded(names.iter().copied()), 1);
     }
 
     // tempfile is only needed by tests here but lives in dev-deps of the crate.

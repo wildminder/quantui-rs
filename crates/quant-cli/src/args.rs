@@ -302,6 +302,13 @@ pub struct QuantizeArgs {
     pub no_heur: bool,
 
     /// Regex; matching layer names are kept at full precision (not quantized).
+    ///
+    /// Matched with SEARCH semantics (unanchored) against the FULL tensor
+    /// name, `.weight` suffix included — e.g. `transformer_blocks.0.attn.to_q.weight`.
+    /// An INVALID pattern excludes nothing (and now warns); the regex engine
+    /// has no lookaround, so "keep only X" must be spelled as an alternation
+    /// of the prefixes to drop, e.g. to quantize only transformer blocks:
+    ///   --exclude-layers '^(img_in|modulation|norm_out|proj_out|time_text_embed|txt_in)\.'
     #[arg(long)]
     pub exclude_layers: Option<String>,
 

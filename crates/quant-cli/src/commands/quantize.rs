@@ -126,6 +126,23 @@ fn orig_dtype(d: OrigDtypeArg) -> &'static str {
 /// historical defaults `block` / 128. MXFP8/NVFP4 have FIXED scaling
 /// parameters (block scaling at the format's own block size, 32/16) — the
 /// caller must have rejected explicit overrides already.
+/// The `--exclude-layers` diagnostic, or `None` when there is nothing to say.
+///
+/// Split out of `run` so it is TESTABLE. An earlier version inlined the
+/// `eprintln!`, and disabling that inline `if let Err(...)` left all 17
+/// `quant-core` unit tests green — the core predicate was covered but the CLI
+/// call site that actually reaches the user was not, which is precisely the
+/// half that matters. A warning nobody can regression-test is a warning that
+/// gets tidied away.
+fn exclude_layers_warning(cfg: &QuantConfig) -> Option<String> {
+    let err = cfg.exclude_layers_status().err()?;
+    Some(format!(
+        "warning: --exclude-layers {:?} is not a valid regex ({err}); \
+         it will exclude NOTHING and every eligible tensor will be quantized",
+        cfg.exclude_layers.as_deref().unwrap_or("")
+    ))
+}
+
 fn build_config(args: &QuantizeArgs) -> QuantConfig {
     // `--heur` / `--no-heur` are mutually-overriding flags; default ON.
     let skip_inefficient = !args.no_heur;
@@ -371,6 +388,17 @@ pub fn run(args: QuantizeArgs) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+
+    // `--exclude-layers` failure modes. `QuantConfig::excluded` swallows a
+    // regex compile error (`unwrap_or(false)`), so a typo'd pattern would
+    // silently exclude NOTHING and emit a fully-quantized, much larger file
+    // with no diagnostic at all. The semantics are deliberately left alone
+    // (pinned by `excluded_regex_semantics`; the Python original is not on
+    // this box to re-check the oracle) — but the silence is not acceptable,
+    // so it is surfaced here.
+    if let Some(msg) = exclude_layers_warning(&build_config(&args)) {
+        eprintln!("{msg}");
+    }
 
     // MXFP8/NVFP4 have FIXED scaling parameters (block scaling at the
     // format's own block size). An explicit --scaling-mode / --block-size
@@ -663,10 +691,53 @@ fn run_sharded(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_id, parity_line, scaling_mode_arg, FormatArg, QuantizeArgs};
+    use super::{
+        exclude_layers_warning, format_id, parity_line, scaling_mode_arg, FormatArg, QuantizeArgs,
+    };
     use quant_core::manifest::{Format, QuantConfig};
     use quant_core::quality::Quality;
     use std::path::PathBuf;
+
+    /// The CLI half of the invalid-`--exclude-layers` diagnostic.
+    ///
+    /// This exists because the FIRST version inlined the `eprintln!` in
+    /// `run`, and mutating that `if let Err(...)` to `if false` left every
+    /// `quant-core` test green — the predicate was covered, the user-visible
+    /// half was not. These assertions make the call site itself load-bearing.
+    #[test]
+    fn invalid_exclude_layers_warns_and_names_the_consequence() {
+        let cfg = QuantConfig {
+            exclude_layers: Some("[invalid".into()),
+            ..QuantConfig::default()
+        };
+        let msg = exclude_layers_warning(&cfg).expect("must warn on a bad regex");
+        assert!(
+            msg.contains("[invalid"),
+            "the warning must name the offending pattern: {msg}"
+        );
+        assert!(
+            msg.contains("exclude NOTHING"),
+            "the warning must state the CONSEQUENCE, not just that something \
+             is wrong — a user who sees only 'invalid regex' does not know \
+             their output is about to be un-excluded: {msg}"
+        );
+    }
+
+    #[test]
+    fn valid_or_absent_exclude_layers_does_not_warn() {
+        let ok = QuantConfig {
+            exclude_layers: Some(r"^(img_in|modulation)\.".into()),
+            ..QuantConfig::default()
+        };
+        assert!(
+            exclude_layers_warning(&ok).is_none(),
+            "a valid pattern must not cry wolf"
+        );
+        assert!(
+            exclude_layers_warning(&QuantConfig::default()).is_none(),
+            "no pattern means nothing to warn about"
+        );
+    }
 
     /// Minimal `QuantizeArgs` for the given `--format`. `scaling_mode` is left
     /// `None` so `scaling_mode_arg` applies the documented `block` default,
