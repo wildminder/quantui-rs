@@ -235,8 +235,9 @@ fn golden_ruler_e2m1_exhaustive_grid() {
 ///
 /// The invariant worth pinning is the one the reference actually
 /// guarantees: the byte is an E4M3 NaN, and the element codes are the
-/// NaN-derived `0xCC`, not zero. `0xFF` is asserted on x86_64 only so a
-/// genuine polarity flip on that platform is still caught.
+/// NaN-derived magnitude 4, not the real zero code. `0xFF` / `0xCC` are
+/// asserted on x86_64 only, so a genuine polarity flip on that platform
+/// is still caught while aarch64 stops reporting an invisible one.
 #[test]
 fn all_zero_block_is_nan_like_the_reference() {
     let block = [0.0f32; 16];
@@ -262,9 +263,40 @@ fn all_zero_block_is_nan_like_the_reference() {
         "on x86_64 the NaN is negative (0xffc00000), so E4M3 must be 0xFF"
     );
     // Every packed byte carries the NaN-derived code, not 0x00.
+    //
+    // The E2M1 code is ALSO NaN-sign-dependent: `f32_to_e2m1_bits` ends
+    // with `code | sign_lp`, and `encode_element` divides `0.0 / total`
+    // where `total = 0 * NaN`, so the element NaN inherits the sign of
+    // the scale NaN. Measured on the same two toolchains:
+    //
+    // | platform | scale byte | E2M1 code | packed byte |
+    // |---|---|---|---|
+    // | x86_64 | `0xFF` | `0x0C` (sign set) | `0xCC` |
+    // | aarch64 | `0x7F` | `0x04` (sign clear) | `0x44` |
+    //
+    // Magnitude code 4 (= 2.0) on both -- only the SIGN nibble differs,
+    // and it is the same root cause as the scale byte above, not a
+    // second one. So the invariant is `code & 0x07 == 4` (the NaN
+    // magnitude, never 0x00 which would be a real zero code), with the
+    // exact bytes pinned on x86_64 only.
+    for (i, b) in q.qdata.iter().enumerate() {
+        let hi = b >> 4;
+        let lo = b & 0x0F;
+        assert_eq!(
+            hi & 0x07,
+            4,
+            "byte {i} high nibble {hi:#04x} lost the NaN magnitude code"
+        );
+        assert_eq!(
+            lo & 0x07,
+            4,
+            "byte {i} low nibble {lo:#04x} lost the NaN magnitude code"
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
     assert!(
         q.qdata.iter().all(|b| *b == 0xCC),
-        "expected uniform NaN-derived code 0xCC, got {:?}",
+        "on x86_64 the NaN is negative, so every packed byte is 0xCC, got {:?}",
         &q.qdata[..4.min(q.qdata.len())]
     );
 }
