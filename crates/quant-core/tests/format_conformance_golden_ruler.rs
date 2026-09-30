@@ -204,21 +204,63 @@ fn golden_ruler_e2m1_exhaustive_grid() {
 /// An all-zero NVFP4 tensor produces NaN element codes, NOT zero codes.
 ///
 /// This is faithful to the reference, not a bug: with per_tensor_scale = 0,
-/// `scaled_block_scales = 0/0 = NaN`, E4M3(NaN) = 0xFF, and
-/// `total_scale = 0 * NaN = NaN`. The reference guard
+/// `scaled_block_scales = 0/0 = NaN`, E4M3(NaN) is 0x7F or 0xFF (see
+/// below), and `total_scale = 0 * NaN = NaN`. The reference guard
 /// `zero_scale_mask = (total_scale == 0)` is therefore False, so
 /// `data_scaled = 0.0 / NaN = NaN` and clamps do not rescue it.
 /// comfy-kitchen quantization.py:149-154.
 ///
 /// Recorded explicitly so a future change to the zero-block guard is a
 /// deliberate, reviewed decision rather than an accidental parity break.
+///
+/// # Why the scale byte is masked, not compared to 0xFF
+///
+/// E4M3 has no infinity; its only NaN is exp=1111 + mantissa=111, which
+/// encodes to byte `0x7F` with the sign bit CLEAR or `0xFF` with it SET.
+/// Both decode back to NaN (verified through torch 2.13). Which one you
+/// get is decided by the SIGN OF THE SOURCE NaN, and IEEE 754 does not
+/// fix that sign for a NaN *generated* by an operation:
+///
+/// | platform | `0.0f32 / 0.0f32` | E4M3 |
+/// |---|---|---|
+/// | x86_64 (SSE) | `0xffc00000` (negative quiet NaN) | `0xFF` |
+/// | aarch64 (macOS CI) | `0x7fc00000` (positive quiet NaN) | `0x7F` |
+///
+/// torch reproduces exactly this: `torch.tensor(0.0)/torch.tensor(0.0)`
+/// is `0xffc00000` on x86_64 and casts to `0xFF`, so the kernel is doing
+/// the reference thing on the platform the goldens were generated on.
+/// Hard-coding `0xFF` would therefore encode an x86 artefact as if it
+/// were a reference invariant, and would fail on every aarch64 runner
+/// for a difference that is invisible after decoding.
+///
+/// The invariant worth pinning is the one the reference actually
+/// guarantees: the byte is an E4M3 NaN, and the element codes are the
+/// NaN-derived `0xCC`, not zero. `0xFF` is asserted on x86_64 only so a
+/// genuine polarity flip on that platform is still caught.
 #[test]
 fn all_zero_block_is_nan_like_the_reference() {
     let block = [0.0f32; 16];
     let q = quant_core::quant_nvfp4::quantize_nvfp4_weight(&block, 1, 16);
     assert_eq!(q.per_tensor_scale, 0.0);
-    // E4M3 NaN byte.
-    assert_eq!(q.scale[0], 0xFF, "block scale is E4M3(NaN) = 0xFF");
+    // E4M3 NaN: exp=1111, mantissa=111. The sign bit is NOT pinned --
+    // a NaN synthesised by 0.0/0.0 carries whatever sign the platform's
+    // hardware produces, and both 0x7F and 0xFF decode to NaN.
+    assert_eq!(
+        q.scale[0] & 0x7F,
+        0x7F,
+        "block scale must be an E4M3 NaN (0x7F or 0xFF), got {:#04x}",
+        q.scale[0]
+    );
+    assert!(
+        fp8_e4m3_bits_to_f32(q.scale[0]).is_nan(),
+        "block scale must decode back to NaN, got {}",
+        fp8_e4m3_bits_to_f32(q.scale[0])
+    );
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        q.scale[0], 0xFF,
+        "on x86_64 the NaN is negative (0xffc00000), so E4M3 must be 0xFF"
+    );
     // Every packed byte carries the NaN-derived code, not 0x00.
     assert!(
         q.qdata.iter().all(|b| *b == 0xCC),
