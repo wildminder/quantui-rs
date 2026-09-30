@@ -892,10 +892,56 @@ fn is_quantizable(config: &QuantConfig, name: &str, shape: &[u64]) -> bool {
     if shape.len() != 2 || shape.contains(&0) {
         return false;
     }
-    if config.skip_inefficient && should_skip_shape(shape, heur_block_size(config)) {
+    if config.skip_inefficient && skips_for_efficiency(config, shape) {
         return false;
     }
     true
+}
+
+/// The efficiency-skip predicate, split by scaling mode semantics.
+///
+/// `should_skip_shape` (`quant.rs`) is a verbatim port of
+/// `stream_quant.py::_should_skip_shape`: it demands that BOTH dimensions be
+/// `>= block_size` and divisible by it. That is a **block-mode** requirement —
+/// a block quantizer reduces over `ceil(m/bs)*ceil(n/bs)` blocks, so a partial
+/// trailing block has no correct encoding.
+///
+/// ConvRot is NOT block mode. `int8_convrot` is row mode by construction
+/// (`commands/quantize.rs` pins `ScalingMode::Row`, and validation guarantees
+/// `convrot => INT8 + row`), so its scale is ONE value per row reduced over `n`
+/// elements. There is no block grid at all, hence no reason to constrain the row
+/// count: the reduction axis is the column axis and nothing else.
+///
+/// Two independent facts pin this down:
+///   1. our own kernel decides rotation purely on columns —
+///      `let rotated = config.convrot && n % gs == 0;` (see `compute_weight_outputs`).
+///      A tensor with `m < gs` but `n % gs == 0` rotates perfectly well.
+///   2. ComfyUI's own convrot group-size shrink loop only ever inspects the LAST
+///      axis: `while g > 4 and t.shape[-1] % g: g //= 4`
+///      (comfy/ldm/wan/model_animate2.py). It never looks at the row axis.
+///
+/// Measured consequence (YuE2-3B, 229 reference-quantized tensors): the
+/// both-dims predicate silently skipped `llm2vae.weight [64, 2048]` — the only
+/// such tensor in the model, and one the ComfyUI reference DOES quantize. The
+/// column-only predicate misses 0 of 229, and still skips `vae2llm [2048, 64]`
+/// (its `n = 64`) exactly as the reference does.
+///
+/// Deliberately NOT reused here: a `n % convrot_group_size` predicate would also
+/// match the reference, but it would newly skip golden `[256, 128]` (n = 128),
+/// moving a pinned parity digest and dropping coverage of every weight with
+/// `in_features < 256`. `[256, 128]` is quantized but NOT rotated — the
+/// documented fallback where a tensor whose `n` is indivisible by the group size
+/// "stays PLAIN row-wise INT8 ... convrot_applied=False" (see the INT8 arm of
+/// `compute_weight_outputs`). That is intended byte-parity, not a regression.
+fn skips_for_efficiency(config: &QuantConfig, shape: &[u64]) -> bool {
+    let bs = heur_block_size(config);
+    if config.convrot {
+        // Row mode: only the reduction (column) axis is meaningful.
+        let n = shape[1] as usize;
+        n < bs || n % bs != 0
+    } else {
+        should_skip_shape(shape, bs)
+    }
 }
 
 /// Build the file-level `__metadata__` map for this run (plan Phase D.1, §3.3).
