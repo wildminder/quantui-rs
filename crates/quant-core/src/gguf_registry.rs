@@ -96,6 +96,43 @@ pub enum GgufScheme {
     Q2_0,
 }
 
+impl GgufScheme {
+    /// True for the five super-block (K-quant) schemes.
+    ///
+    /// These are the schemes for which `rlx-gguf`'s encoders are
+    /// self-documented as "lower quality than upstream's iterative search"
+    /// (`rlx-gguf-0.2.14/src/quantize.rs:544`, family label at `:270`). We
+    /// carry byte-exact ports of llama.cpp's weighted encoders
+    /// (`gguf_quants::quantize_row_q*_k_weighted`), but they are only
+    /// reachable when an imatrix row is supplied — the sole gate is
+    /// `cfg.imatrix.is_some()` in `gguf_convert.rs`. A K-quant method
+    /// WITHOUT an imatrix therefore silently uses the weaker encoder.
+    pub fn is_k_quant(&self) -> bool {
+        matches!(
+            self,
+            GgufScheme::Q2K | GgufScheme::Q3K | GgufScheme::Q4K | GgufScheme::Q5K | GgufScheme::Q6K
+        )
+    }
+}
+
+/// True when this method can emit a K-quant scheme, i.e. when running it
+/// without an imatrix means some tensors go through rlx's simplified
+/// encoder.
+///
+/// Only the default scheme is consulted, and that is sufficient *by
+/// construction of the current registry*: every one of the 11 K-quant
+/// methods (`q2_k`…`q6_k`) declares a K-quant default, and no non-K
+/// method declares a K-quant in `rules` or via `engine`. An earlier
+/// version also checked `policy.rules` and the `KMoreBits { base, more }`
+/// pair "for safety" — that was unreachable code, and a mutation disabling
+/// it kept the whole suite green, which is exactly how dead code hides.
+///
+/// If a future method ever mixes (K-quant only in a rule), the K-quant
+/// `all_k_quant_methods_are_detected` test fails and this must grow a check.
+pub fn method_emits_k_quant(method: &RegistryEntry) -> bool {
+    method.policy.default.is_k_quant()
+}
+
 /// Per-tensor quantization policy of a method.
 ///
 /// `Default` covers the plain methods (`q4_k_s` → Q4K everywhere, `f16` →

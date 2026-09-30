@@ -259,6 +259,38 @@ pub fn run(args: GgufArgs) -> ExitCode {
         None
     };
 
+    // T5: make the weaker default encoder VISIBLE.
+    //
+    // rlx-gguf's K-quant encoders are self-documented as "lower quality than
+    // upstream's iterative search" (rlx-gguf-0.2.14/src/quantize.rs:544,
+    // family label at :270). We carry byte-exact ports of llama.cpp's
+    // weighted encoders (gguf_quants::quantize_row_q*_k_weighted) but they
+    // are reachable ONLY when an imatrix row exists — the sole gate is
+    // `cfg.imatrix.is_some()` in gguf_convert.rs. Measured on YuE2-3B Q2_K
+    // (20 tensors, rel-L2 vs the bf16 source): 0.32985 simplified (this
+    // path) vs 0.26936 weighted vs 0.29840 for the published reference.
+    //
+    // We warn rather than switching the default: flipping it is a parity
+    // event on a byte-exact-sensitive path, and the weighted encoders are
+    // golden-tested only WITH an imatrix row, so flipping first would
+    // leave the current default pinned by no oracle at all. Making the
+    // loss visible costs nothing and is reversible.
+    //
+    // The iq* family is NOT reached here — those are `requires_imatrix` and
+    // already hard-error above (llama-quantize refuses the same way).
+    if imatrix.is_none() && quant_core::gguf_registry::method_emits_k_quant(entry) {
+        eprintln!(
+            "warning: method '{}' is a K-quant and no --imatrix was given, so K-quant tensors \
+             are encoded with rlx-gguf's SIMPLIFIED min/max search instead of llama.cpp's \
+             weighted one. Measured on YuE2-3B Q2_K (rel-L2, lower is better): 0.32985 \
+             simplified vs 0.26936 weighted vs 0.29840 for a published reference — roughly 18% \
+             worse than our own weighted path. Even a uniform matrix selects the better \
+             encoder: tools/make_uniform_imatrix.py <model.gguf> out.imatrix, then rerun with \
+             --imatrix out.imatrix.",
+            args.method
+        );
+    }
+
     // Phase 6: per-tensor recipe + the two category overrides. Every qtype
     // must be a USABLE method id — validated here (exit 2) so a typo never
     // surfaces mid-conversion.
