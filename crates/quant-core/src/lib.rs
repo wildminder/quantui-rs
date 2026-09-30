@@ -5,6 +5,7 @@
 //! Phases A-E), so every module below is fully implemented — nothing is
 //! stubbed or gated behind a phase marker any more.
 
+pub mod comfy_loader_contract;
 pub mod comfy_schema;
 // dtype casting for the `cast` subcommand. NOT a quantizer: no scaling, no
 // metadata, and it writes no quantization markers.

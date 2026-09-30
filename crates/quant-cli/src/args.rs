@@ -348,6 +348,22 @@ pub struct ValidateArgs {
     /// input_scale == 1.0). Reads tensor payloads, not just headers.
     #[arg(long)]
     pub numeric: bool,
+
+    /// Check the file against **ComfyUI's own loader contract** rather than the
+    /// reference encoder's stricter one.
+    ///
+    /// The default pass validates what `convert_to_quant` produces; this
+    /// validates what `comfy/ops.py` consumes. The two differ, so a file can
+    /// pass one and fail the other. Specifically this rejects a `format` string
+    /// that is not a key in ComfyUI's `QUANT_ALGOS` (which the loader indexes
+    /// with no fallback, so it raises `KeyError`), and any format whose
+    /// required sibling scale tensors are missing.
+    ///
+    /// A pass here means the file is **contract-conformant**, not proven
+    /// loadable: only a real ComfyUI load settles whether the runtime applies
+    /// a convrot inverse rotation.
+    #[arg(long)]
+    pub comfy: bool,
 }
 
 // --------------------------------------------------------------------------- //

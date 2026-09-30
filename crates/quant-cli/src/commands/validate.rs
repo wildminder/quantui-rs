@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use quant_core::comfy_loader_contract::{check_comfy_loadable, is_comfy_loadable, ContractIssue};
 use quant_core::validator::{format_report, validate_comfy_quant};
 
 use crate::args::ValidateArgs;
@@ -54,6 +55,18 @@ pub fn run(args: ValidateArgs) -> ExitCode {
         if i > 0 {
             println!();
         }
+        if args.comfy {
+            // The CONSUMER's contract, not the reference encoder's. Kept as a
+            // separate branch rather than folded into `validate_comfy_quant`
+            // because being stricter than ComfyUI rejects files it loads fine,
+            // and being looser passes files it cannot load at all.
+            let issues = check_comfy_loadable(target);
+            println!("{}", format_comfy_report(target, &issues));
+            if !is_comfy_loadable(&issues) {
+                any_failed = true;
+            }
+            continue;
+        }
         let report = validate_comfy_quant(target, args.numeric);
         println!("{}", format_report(&report));
         if !report.ok {
@@ -66,4 +79,28 @@ pub fn run(args: ValidateArgs) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Render a ComfyUI-contract report.
+///
+/// Kept byte-stable (no timings, no paths beyond the target) so it is diffable
+/// across runs, matching the existing report's discipline.
+fn format_comfy_report(path: &Path, issues: &[ContractIssue]) -> String {
+    use quant_core::comfy_loader_contract::ContractIssue::*;
+
+    let mut out = format!("ComfyUI loader contract: {}\n", path.display());
+    for issue in issues {
+        match issue {
+            Fatal(m) => out.push_str(&format!("  ERROR   {m}\n")),
+            Advisory(m) => out.push_str(&format!("  note    {m}\n")),
+        }
+    }
+    if issues.is_empty() {
+        out.push_str("  OK      no quantized layers found; nothing for ComfyUI to resolve\n");
+    } else if is_comfy_loadable(issues) {
+        out.push_str("  OK      contract-conformant (NOT proof of load — only a real ComfyUI load settles that)\n");
+    } else {
+        out.push_str("  FAIL    ComfyUI would raise on this file\n");
+    }
+    out
 }
