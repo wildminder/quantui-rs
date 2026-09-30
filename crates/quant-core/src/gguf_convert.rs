@@ -452,17 +452,34 @@ pub fn convert_hf_to_gguf(
     // case and would take 1 for a condition the user can still see.
     if let Some(r) = cfg.recipe.as_ref() {
         if !r.rules.is_empty() && !recipe_matched {
+            // Name the CONSEQUENCE accurately. With no bare default the
+            // method default won every tensor; WITH one, the bare default
+            // still applies and only the rules were ignored. Saying
+            // "the method default was applied to all N tensors" in the
+            // second case would send the user to debug the wrong layer.
+            let consequence = match r.default {
+                Some(d) => format!(
+                    "none of them took effect — every one of the {} tensors fell back to the \
+                     recipe's bare default ({})",
+                    total_tensors,
+                    crate::gguf_recipe::scheme_id(d),
+                ),
+                None => format!(
+                    "the method default was applied to all {} tensors and the recipe had no \
+                     effect",
+                    total_tensors,
+                ),
+            };
             let msg = format!(
                 "warning: recipe for method '{}' has {} rule(s) but NONE of them matched any \
-                 tensor — the method default was applied to all {} tensors and the recipe had no \
-                 effect. The usual cause is a name-space mismatch: rules are matched against the \
-                 GGUF-side name (e.g. `blk.0.attn_q.weight`), so a reference using foreign names \
-                 (e.g. `model_weights/model.layers.0...`) matches nothing. Remap the reference \
-                 into this tool's name space (see tools/make_recipe.py) and pass it via \
-                 --tensor-type-file, or drop the recipe to silence this.",
+                 tensor — {}. The usual cause is a name-space mismatch: rules are matched \
+                 against the GGUF-side name (e.g. `blk.0.attn_q.weight`), so a reference using \
+                 foreign names (e.g. `model_weights/model.layers.0...`) matches nothing. Remap \
+                 the reference into this tool's name space (see tools/make_recipe.py) and pass \
+                 it via --tensor-type-file, or drop the recipe to silence this.",
                 cfg.method_id,
                 r.rules.len(),
-                total_tensors,
+                consequence,
             );
             report_warnings.push(msg.clone());
             if let Some(cb) = on_warning.as_mut() {
@@ -945,11 +962,22 @@ fn resolve_one_tensor(
         // The driver turns "zero rules ever matched" into a warning, which
         // is the only signal that a `--recipe-from` reference in a foreign
         // name space was silently ignored.
+        //
+        // Two-step on purpose: `matching_rule` deliberately collapses to
+        // rule-hits-only (it must distinguish "a rule decided this" from
+        // "the bare default decided this", which is what makes the
+        // name-space mismatch detectable at all), so it CANNOT stand in
+        // for `scheme_for` here. Reading the scheme off `matching_rule`
+        // alone silently DROPPED the bare default: a recipe of
+        // `ffn_down=q6_k` + a trailing `q8_0` left every unmatched tensor
+        // on the method's own policy engine instead of q8_0. That is the
+        // documented GGUF-Tool-Suite recipe extension, so the fallback to
+        // `r.default` below is load-bearing, not defensive.
         let hit = r.matching_rule(&gguf_name);
         if hit.is_some() {
             *recipe_matched = true;
         }
-        hit.map(|i| r.rules[i].scheme)
+        hit.map(|i| r.rules[i].scheme).or(r.default)
     }) {
         // Manual mode — the engine and its counters are skipped.
         s

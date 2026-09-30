@@ -225,7 +225,12 @@ fn parse_qtype(qtype: &str, path: &str, line: usize) -> Result<GgufScheme, Recip
 
 /// Inverse of [`parse_qtype`] for a scheme: any usable method whose default
 /// is this scheme round-trips (prefer the canonical plain method ids).
-fn scheme_id(scheme: GgufScheme) -> String {
+///
+/// Public because the conversion driver's "your recipe's rules matched
+/// nothing" warning has to name the bare default that actually won the run
+/// (see `gguf_convert.rs`). Duplicating this mapping at the call site would
+/// be a second source of truth for method-id spelling.
+pub fn scheme_id(scheme: GgufScheme) -> String {
     // The canonical id for each scheme used in recipes: the plain method
     // whose policy.default is exactly this scheme (deterministic pick:
     // first usable id in registry order).
