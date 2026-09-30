@@ -169,6 +169,19 @@ impl TensorRecipe {
         self.default
     }
 
+    /// Index of the first rule matching `gguf_name`, or `None`.
+    ///
+    /// Exists so a caller can tell "a rule decided this tensor" from "the
+    /// bare default decided it" — a distinction [`Self::scheme_for`]
+    /// deliberately collapses, and which is exactly what makes a
+    /// name-space mismatch SILENT: a `--recipe-from` reference written
+    /// against a foreign naming scheme (`model_weights/…` instead of our
+    /// `blk.N.…`) matches zero rules, so every tensor falls through to the
+    /// method default and the run exits 0 having applied nothing.
+    pub fn matching_rule(&self, gguf_name: &str) -> Option<usize> {
+        self.rules.iter().position(|r| r.regex.is_match(gguf_name))
+    }
+
     /// Serialize back to the file format (used by `--emit-recipe` and the
     /// round-trip test): rules in order, then the bare default.
     pub fn to_text(&self) -> String {

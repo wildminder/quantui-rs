@@ -353,6 +353,10 @@ pub fn convert_hf_to_gguf(
     let mut row_fallback_tensors: Vec<String> = Vec::new();
     let mut effective_schemes: Vec<(String, GgufScheme)> = Vec::new();
     let mut report_warnings: Vec<String> = Vec::new();
+    // Did ANY recipe rule ever decide a tensor? A recipe can parse cleanly,
+    // have rules, and still match nothing — the silent no-op. Counted here
+    // and reported once at the end (per-tensor reporting would be noise).
+    let mut recipe_matched = false;
     let mut emitted = 0usize;
     let mut chunk: Vec<ResolvedTensor> = Vec::new();
     let mut chunk_bytes = 0u64;
@@ -375,6 +379,7 @@ pub fn convert_hf_to_gguf(
             model_facts,
             reader,
             name,
+            &mut recipe_matched,
         )?;
         chunk_bytes += raw_len;
         chunk.push(resolved);
@@ -431,6 +436,37 @@ pub fn convert_hf_to_gguf(
             emitted += 1;
             if let Some(cb) = on_progress.as_mut() {
                 cb(emitted, total);
+            }
+        }
+    }
+
+    // Silent-no-op guard. A recipe whose rules all address a DIFFERENT name
+    // space (e.g. a reference that writes `model_weights/…` while we resolve
+    // `blk.N.…`) matches nothing, so every tensor silently takes the method
+    // default and the run exits 0. That is the worst failure mode this tool
+    // has: it looks like it honoured the reference and did not.
+    //
+    // Warn, do not fail. A recipe may legitimately only carry a bare default
+    // (zero rules is not a defect), and exit codes are constrained to
+    // 0/1/2/3/130 — a hard error here would be wrong for the default-only
+    // case and would take 1 for a condition the user can still see.
+    if let Some(r) = cfg.recipe.as_ref() {
+        if !r.rules.is_empty() && !recipe_matched {
+            let msg = format!(
+                "warning: recipe for method '{}' has {} rule(s) but NONE of them matched any \
+                 tensor — the method default was applied to all {} tensors and the recipe had no \
+                 effect. The usual cause is a name-space mismatch: rules are matched against the \
+                 GGUF-side name (e.g. `blk.0.attn_q.weight`), so a reference using foreign names \
+                 (e.g. `model_weights/model.layers.0...`) matches nothing. Remap the reference \
+                 into this tool's name space (see tools/make_recipe.py) and pass it via \
+                 --tensor-type-file, or drop the recipe to silence this.",
+                cfg.method_id,
+                r.rules.len(),
+                total_tensors,
+            );
+            report_warnings.push(msg.clone());
+            if let Some(cb) = on_warning.as_mut() {
+                cb(&msg);
             }
         }
     }
@@ -864,6 +900,7 @@ fn resolve_one_tensor(
     model_facts: llama_policy::ModelFacts,
     reader: &SafetensorsReader,
     name: &str,
+    recipe_matched: &mut bool,
 ) -> Result<ResolvedTensor, GgufError> {
     let info = reader.header().get(name).expect("name came from header");
     let raw = reader.tensor_bytes(name)?;
@@ -903,7 +940,17 @@ fn resolve_one_tensor(
         // Upstream skips the manual+engine block when the method's
         // default type is not quantized (:711) — the recipe is inert.
         entry.policy.default
-    } else if let Some(s) = cfg.recipe.as_ref().and_then(|r| r.scheme_for(&gguf_name)) {
+    } else if let Some(s) = cfg.recipe.as_ref().and_then(|r| {
+        // Record whether a RULE (not the bare default) decided this tensor.
+        // The driver turns "zero rules ever matched" into a warning, which
+        // is the only signal that a `--recipe-from` reference in a foreign
+        // name space was silently ignored.
+        let hit = r.matching_rule(&gguf_name);
+        if hit.is_some() {
+            *recipe_matched = true;
+        }
+        hit.map(|i| r.rules[i].scheme)
+    }) {
         // Manual mode — the engine and its counters are skipped.
         s
     } else {
