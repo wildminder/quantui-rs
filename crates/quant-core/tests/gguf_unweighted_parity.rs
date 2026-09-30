@@ -158,12 +158,13 @@ fn unweighted_differs_from_weighted() {
         .collect();
 
     // (id, rlx GgmlType, our weighted port, block bytes)
-    let weighted: &[(
-        &str,
+    type WeightedArm = (
+        &'static str,
         GgmlType,
         fn(&[f32], usize, Option<&[f32]>) -> Vec<u8>,
         usize,
-    )] = &[
+    );
+    let weighted: &[WeightedArm] = &[
         ("q2_k", GgmlType::Q2K, quantize_row_q2_k_weighted, 84),
         ("q3_k", GgmlType::Q3K, quantize_row_q3_k_weighted, 110),
         ("q4_k", GgmlType::Q4K, quantize_row_q4_k_weighted, 144),

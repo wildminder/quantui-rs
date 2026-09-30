@@ -151,6 +151,11 @@ pub struct QuantConfig {
     pub calib_seed: i64,
     /// Optional exclude-layers regex; None disables matching.
     pub exclude_layers: Option<String>,
+    /// Optional allow-list of name prefixes (`--only`); empty disables it.
+    /// A 2-D `.weight` is quantized only if its name starts with one of
+    /// these. This is the INVERSE of `exclude_layers` and the two compose:
+    /// a tensor must match `only_prefixes` AND not match `exclude_layers`.
+    pub only_prefixes: Vec<String>,
     /// Opt-in quality refinement (Tier 2). `Exact` — the default — keeps this
     /// format byte-exact with the references; every other variant changes
     /// output bytes on purpose and is only reachable through an explicit
@@ -173,6 +178,7 @@ impl Default for QuantConfig {
             skip_inefficient: true,
             calib_seed: 233983427,
             exclude_layers: None,
+            only_prefixes: Vec::new(),
             quality: Quality::Exact,
         }
     }
@@ -230,11 +236,29 @@ impl QuantConfig {
             None => String::new(),
             Some(id) => format!(r#""quality_tuning": "{id}", "#),
         };
+        // Same trick for the two SELECTION flags, and for the same reason:
+        // an empty suffix keeps the payload byte-identical to the historical
+        // form, so every pinned digest above is preserved.
+        //
+        // These keys were MISSING, which was a real hole rather than a
+        // cosmetic gap. `load_manifest` trusts a partial output iff the hash
+        // matches, so quantizing with no `--exclude-layers` and then
+        // resuming WITH one reused the same hash and appended tensors chosen
+        // by a different rule — two selection policies silently mixed into
+        // one artifact, which is precisely the failure this hash exists to
+        // prevent. `--only` would have inherited the same hole.
+        let mut selection_suffix = String::new();
+        if let Some(p) = &self.exclude_layers {
+            selection_suffix.push_str(&format!(r#""exclude_layers": "{p}", "#));
+        }
+        for p in &self.only_prefixes {
+            selection_suffix.push_str(&format!(r#""only_prefix": "{p}", "#));
+        }
         let payload = format!(
             concat!(
                 r#"{{"block_size": {}, "calib_seed": {}, "convrot": {}, "#,
                 r#""convrot_group_size": {}, "int8": {}, "no_learned_rounding": {}, "#,
-                "{}",
+                "{}{}",
                 r#""scaling_mode": "{}", "skip_inefficient": {}, "target_format": "{}"}}"#
             ),
             block_size,
@@ -244,6 +268,7 @@ impl QuantConfig {
             int8,
             self.no_learned_rounding,
             quality_suffix,
+            selection_suffix,
             scaling_mode,
             self.skip_inefficient,
             target_format,
@@ -267,11 +292,13 @@ impl QuantConfig {
     ///
     /// `excluded` swallows a compile error with `unwrap_or(false)`, so an
     /// invalid pattern silently excludes NOTHING and the run emits a full
-    /// quantized file with no diagnostic. That behaviour is deliberate and
-    /// pinned by `excluded_regex_semantics` (the Python original is not on
-    /// this box, so the oracle cannot be re-checked — do not quietly change
-    /// the semantics). This accessor exists so the CLI can WARN instead of
-    /// leaving the user to discover the mistake from the file size.
+    /// quantized file. The reference does the same thing
+    /// (`unsloth-quant-tui quantui/tensor_quant.py:106`,
+    /// `except re.error: return False`), so `excluded` keeps that behaviour
+    /// for byte-parity — but we are a STANDALONE project and a silent no-op
+    /// that inflates a 14 GB artifact by 129 MB is a defect we need not
+    /// inherit. The CLI therefore REJECTS an unparseable pattern at the
+    /// argument boundary (usage error, exit 2) rather than running with it.
     ///
     /// Returns the compile error, if any. `Ok(())` when no pattern is set.
     pub fn exclude_layers_status(&self) -> Result<(), regex::Error> {
@@ -279,6 +306,14 @@ impl QuantConfig {
             None => Ok(()),
             Some(p) => regex::Regex::new(p).map(|_| ()),
         }
+    }
+
+    /// True when `name` is inside the `--only` allow-list.
+    ///
+    /// Empty list = no allow-list = everything passes, which keeps the
+    /// default behaviour byte-identical to having no flag at all.
+    pub fn in_keep_set(&self, name: &str) -> bool {
+        self.only_prefixes.is_empty() || self.only_prefixes.iter().any(|p| name.starts_with(p))
     }
 
     /// How many tensors the exclusion actually removes, for the CLI summary.
@@ -754,6 +789,101 @@ mod tests {
         ] {
             assert!(!c.excluded(n), "{n} must NOT be excluded");
         }
+    }
+
+    /// `--only` is an ALLOW-list, so the two flags are inverses and compose.
+    /// Empty list must mean "no allow-list" (default behaviour), NOT "match
+    /// nothing" — the latter would silently quantize zero tensors.
+    #[test]
+    fn only_prefixes_allow_list_semantics() {
+        let mut c = QuantConfig::default();
+        assert!(
+            c.in_keep_set("anything.at.all"),
+            "empty list = no allow-list"
+        );
+
+        c.only_prefixes = vec!["transformer_blocks".into()];
+        assert!(c.in_keep_set("transformer_blocks.0.attn.to_q.weight"));
+        assert!(!c.in_keep_set("proj_out.weight"));
+        assert!(!c.in_keep_set("txt_in.in_layer.weight"));
+
+        // Prefix, not substring: "transformer_blocks" must not match a
+        // hypothetical "my_transformer_blocks_extra".
+        assert!(!c.in_keep_set("my_transformer_blocks_extra.weight"));
+
+        // Repeatable = OR.
+        c.only_prefixes.push("txt_in".into());
+        assert!(c.in_keep_set("txt_in.in_layer.weight"));
+        assert!(!c.in_keep_set("proj_out.weight"));
+    }
+
+    /// The two flags compose: allow-list AND NOT excluded.
+    #[test]
+    fn only_and_exclude_compose() {
+        let mut c = QuantConfig::default();
+        c.only_prefixes = vec!["transformer_blocks".into()];
+        c.exclude_layers = Some(r"\.attn\.to_q\.weight$".into());
+
+        // Inside the allow-list AND matched by the regex -> the regex wins.
+        // `is_quantizable` requires `in_keep_set(name) && !excluded(name)`.
+        let dropped = "transformer_blocks.0.attn.to_q.weight";
+        assert!(c.in_keep_set(dropped));
+        assert!(c.excluded(dropped));
+        assert!(
+            !(c.in_keep_set(dropped) && !c.excluded(dropped)),
+            "allow-list membership must not override an explicit exclusion"
+        );
+
+        // Inside the allow-list, not matched -> quantized.
+        let kept = "transformer_blocks.0.attn.to_k.weight";
+        assert!(c.in_keep_set(kept) && !c.excluded(kept));
+
+        // Outside the allow-list -> not quantized, whatever the regex says.
+        let outside = "proj_out.weight";
+        assert!(!c.in_keep_set(outside));
+    }
+
+    /// 🔴 THE RESUME-GUARD FIX. `config_hash` is the ONLY thing
+    /// `load_manifest` trusts, so two selection policies that share a hash
+    /// let a re-run resume into a partial artifact built under a different
+    /// policy — silently, with no error. These keys were absent.
+    #[test]
+    fn selection_flags_participate_in_the_resume_hash() {
+        let base = QuantConfig::default();
+        let h = base.config_hash();
+
+        let mut excl = QuantConfig::default();
+        excl.exclude_layers = Some("attn_norm".into());
+        assert_ne!(
+            excl.config_hash(),
+            h,
+            "a differing --exclude-layers MUST change the hash, or a resume \
+             mixes two selection policies into one artifact"
+        );
+
+        let mut only = QuantConfig::default();
+        only.only_prefixes = vec!["transformer_blocks".into()];
+        assert_ne!(
+            only.config_hash(),
+            h,
+            "a differing --only MUST change the hash"
+        );
+
+        // Different prefixes are different policies too.
+        let mut other = QuantConfig::default();
+        other.only_prefixes = vec!["txt_in".into()];
+        assert_ne!(only.config_hash(), other.config_hash());
+
+        // And the DEFAULT must be byte-identical to the historical payload,
+        // which is what keeps every pinned digest in this file valid.
+        let mut noop = QuantConfig::default();
+        noop.exclude_layers = None;
+        noop.only_prefixes = Vec::new();
+        assert_eq!(
+            noop.config_hash(),
+            h,
+            "an empty selection suffix must leave the hash untouched"
+        );
     }
 
     #[test]

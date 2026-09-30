@@ -126,23 +126,6 @@ fn orig_dtype(d: OrigDtypeArg) -> &'static str {
 /// historical defaults `block` / 128. MXFP8/NVFP4 have FIXED scaling
 /// parameters (block scaling at the format's own block size, 32/16) — the
 /// caller must have rejected explicit overrides already.
-/// The `--exclude-layers` diagnostic, or `None` when there is nothing to say.
-///
-/// Split out of `run` so it is TESTABLE. An earlier version inlined the
-/// `eprintln!`, and disabling that inline `if let Err(...)` left all 17
-/// `quant-core` unit tests green — the core predicate was covered but the CLI
-/// call site that actually reaches the user was not, which is precisely the
-/// half that matters. A warning nobody can regression-test is a warning that
-/// gets tidied away.
-fn exclude_layers_warning(cfg: &QuantConfig) -> Option<String> {
-    let err = cfg.exclude_layers_status().err()?;
-    Some(format!(
-        "warning: --exclude-layers {:?} is not a valid regex ({err}); \
-         it will exclude NOTHING and every eligible tensor will be quantized",
-        cfg.exclude_layers.as_deref().unwrap_or("")
-    ))
-}
-
 fn build_config(args: &QuantizeArgs) -> QuantConfig {
     // `--heur` / `--no-heur` are mutually-overriding flags; default ON.
     let skip_inefficient = !args.no_heur;
@@ -258,6 +241,7 @@ fn build_config(args: &QuantizeArgs) -> QuantConfig {
         skip_inefficient,
         calib_seed: args.calib_seed,
         exclude_layers: args.exclude_layers.clone(),
+        only_prefixes: args.only.clone(),
     }
 }
 
@@ -389,15 +373,23 @@ pub fn run(args: QuantizeArgs) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    // `--exclude-layers` failure modes. `QuantConfig::excluded` swallows a
-    // regex compile error (`unwrap_or(false)`), so a typo'd pattern would
-    // silently exclude NOTHING and emit a fully-quantized, much larger file
-    // with no diagnostic at all. The semantics are deliberately left alone
-    // (pinned by `excluded_regex_semantics`; the Python original is not on
-    // this box to re-check the oracle) — but the silence is not acceptable,
-    // so it is surfaced here.
-    if let Some(msg) = exclude_layers_warning(&build_config(&args)) {
-        eprintln!("{msg}");
+    // `--exclude-layers` must be a VALID regex. `QuantConfig::excluded`
+    // swallows a compile error with `unwrap_or(false)`, so running with a
+    // typo'd pattern would emit a fully-quantized, much larger file with no
+    // diagnostic. The reference does the same silent thing
+    // (`unsloth-quant-tui quantui/tensor_quant.py:106`,
+    // `except re.error: return False`), but we are a standalone project and
+    // need not inherit a silent no-op that inflated a 14 GB artifact by
+    // 129 MB. Reject at the argument boundary, beside every other usage
+    // error, so it can never be missed.
+    let cfg = build_config(&args);
+    if let Err(e) = cfg.exclude_layers_status() {
+        eprintln!(
+            "error: --exclude-layers {:?} is not a valid regex: {e}",
+            cfg.exclude_layers.as_deref().unwrap_or("")
+        );
+        eprintln!("hint: to KEEP only some layers, prefer --only <PREFIX> over inverting a regex");
+        return ExitCode::from(2);
     }
 
     // MXFP8/NVFP4 have FIXED scaling parameters (block scaling at the
@@ -691,52 +683,51 @@ fn run_sharded(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        exclude_layers_warning, format_id, parity_line, scaling_mode_arg, FormatArg, QuantizeArgs,
-    };
+    use super::{build_config, format_id, parity_line, scaling_mode_arg, FormatArg, QuantizeArgs};
     use quant_core::manifest::{Format, QuantConfig};
     use quant_core::quality::Quality;
     use std::path::PathBuf;
 
-    /// The CLI half of the invalid-`--exclude-layers` diagnostic.
-    ///
-    /// This exists because the FIRST version inlined the `eprintln!` in
-    /// `run`, and mutating that `if let Err(...)` to `if false` left every
-    /// `quant-core` test green — the predicate was covered, the user-visible
-    /// half was not. These assertions make the call site itself load-bearing.
+    /// `--only` is the flag that replaces inverting a long exclusion regex.
+    /// It must reach the effective config verbatim — a dropped field would
+    /// silently quantize everything and inflate the artifact, which is the
+    /// exact failure `--only` exists to make impossible.
     #[test]
-    fn invalid_exclude_layers_warns_and_names_the_consequence() {
-        let cfg = QuantConfig {
-            exclude_layers: Some("[invalid".into()),
-            ..QuantConfig::default()
-        };
-        let msg = exclude_layers_warning(&cfg).expect("must warn on a bad regex");
+    fn only_prefixes_reach_the_effective_config() {
+        let mut a = args_for(FormatArg::Int8);
         assert!(
-            msg.contains("[invalid"),
-            "the warning must name the offending pattern: {msg}"
+            build_config(&a).only_prefixes.is_empty(),
+            "no --only must mean no allow-list, not an allow-list that matches nothing"
         );
-        assert!(
-            msg.contains("exclude NOTHING"),
-            "the warning must state the CONSEQUENCE, not just that something \
-             is wrong — a user who sees only 'invalid regex' does not know \
-             their output is about to be un-excluded: {msg}"
+        a.only = vec!["transformer_blocks".into()];
+        assert_eq!(build_config(&a).only_prefixes, ["transformer_blocks"]);
+        a.only = vec!["transformer_blocks".into(), "txt_in".into()];
+        assert_eq!(
+            build_config(&a).only_prefixes.len(),
+            2,
+            "must be repeatable"
         );
     }
 
+    /// An invalid `--exclude-layers` must be REJECTED before any work. The
+    /// core predicate still swallows the error (byte-parity with the
+    /// reference), so this guard is the only thing between a typo and a
+    /// silently oversized artifact.
     #[test]
-    fn valid_or_absent_exclude_layers_does_not_warn() {
-        let ok = QuantConfig {
-            exclude_layers: Some(r"^(img_in|modulation)\.".into()),
-            ..QuantConfig::default()
-        };
+    fn invalid_exclude_layers_is_detected_before_any_work() {
+        let mut a = args_for(FormatArg::Int8);
+        a.exclude_layers = Some("[invalid".into());
+        let cfg = build_config(&a);
         assert!(
-            exclude_layers_warning(&ok).is_none(),
-            "a valid pattern must not cry wolf"
+            cfg.exclude_layers_status().is_err(),
+            "run() relies on this to exit 2 before touching the input file"
         );
         assert!(
-            exclude_layers_warning(&QuantConfig::default()).is_none(),
-            "no pattern means nothing to warn about"
+            !cfg.excluded("attn_norm.weight"),
+            "the core still refuses to exclude — that is WHY the guard is needed"
         );
+        a.exclude_layers = Some(r"^(img_in|modulation)\.".into());
+        assert!(build_config(&a).exclude_layers_status().is_ok());
     }
 
     /// Minimal `QuantizeArgs` for the given `--format`. `scaling_mode` is left
@@ -752,6 +743,7 @@ mod tests {
             heur: true,
             no_heur: false,
             exclude_layers: None,
+            only: Vec::new(),
             output_mode: crate::args::OutputModeArg::Sharded,
             orig_dtype: crate::args::OrigDtypeArg::Bfloat16,
             calib_seed: 233983427,

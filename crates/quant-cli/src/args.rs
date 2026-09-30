@@ -305,12 +305,21 @@ pub struct QuantizeArgs {
     ///
     /// Matched with SEARCH semantics (unanchored) against the FULL tensor
     /// name, `.weight` suffix included — e.g. `transformer_blocks.0.attn.to_q.weight`.
-    /// An INVALID pattern excludes nothing (and now warns); the regex engine
-    /// has no lookaround, so "keep only X" must be spelled as an alternation
-    /// of the prefixes to drop, e.g. to quantize only transformer blocks:
-    ///   --exclude-layers '^(img_in|modulation|norm_out|proj_out|time_text_embed|txt_in)\.'
+    /// An INVALID pattern is a usage error, not a silent no-op.
     #[arg(long)]
     pub exclude_layers: Option<String>,
+
+    /// Quantize ONLY 2-D weights whose name starts with this prefix. Repeatable
+    /// to allow several. Composes with `--exclude-layers`: a tensor must match
+    /// one `--only` prefix AND not match the exclude regex.
+    ///
+    /// Prefer this over inverting a regex: the engine has no lookaround, so
+    /// "keep only X" spelled as an exclusion is a long alternation that is
+    /// easy to typo and silently widens the artifact. To match ComfyUI's own
+    /// selection on Qwen-Image 2.1, for example:
+    ///   --only transformer_blocks
+    #[arg(long = "only", value_name = "PREFIX")]
+    pub only: Vec<String>,
 
     /// Output layout for sharded inputs.
     #[arg(long, value_enum, default_value_t = OutputModeArg::Sharded)]

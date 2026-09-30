@@ -884,6 +884,13 @@ fn is_quantizable(config: &QuantConfig, name: &str, shape: &[u64]) -> bool {
     if config.excluded(name) {
         return false;
     }
+    // `--only` allow-list. Checked BEFORE the shape/divisibility work because
+    // it is the cheapest test and the most selective: a name outside the list
+    // is out regardless of its shape. Empty list = no allow-list, so the
+    // default path is untouched.
+    if !config.in_keep_set(name) {
+        return false;
+    }
     // MXFP8/NVFP4 only: substring exclusion against ctq AVOID_KEY_NAMES.
     if config.format.carries_file_metadata() && AVOID_KEY_NAMES.iter().any(|pat| name.contains(pat))
     {
