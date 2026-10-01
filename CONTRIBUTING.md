@@ -103,5 +103,24 @@ Notes on the choices:
   to zero, so the same commit produces the same SHA256 on every run.
 
 Release notes come from a committed `RELEASE_NOTES.md` at the repo root when
-one exists, otherwise GitHub generates them from the commit list. Re-running the
-workflow uploads to the existing Release instead of failing.
+one exists, otherwise GitHub generates them from the commit list.
+
+### Retrying a failed release
+
+If the run fails partway (say the upload step), do **not** reach for "Re-run
+failed jobs" and do not move the published tag. GitHub executes the workflow
+file as it exists **at the tag**, so a fix committed to `main` is invisible to
+that re-run and it fails the same way. Use the manual trigger instead:
+
+**Actions → release → Run workflow**, pick the branch with the fix, and set the
+`tag` input to the release you are repairing (e.g. `v0.3.0`). It builds from
+the tag's source and attaches to the existing release.
+
+Two things worth knowing:
+
+- Build artifacts are kept **90 days**. They are the only copy of the binaries
+  between the matrix and the upload, so a retry can reuse them instead of
+  rebuilding all five.
+- Any job that runs `gh` needs an `actions/checkout` step. The `gh` CLI works
+  out which repository to upload to from the git remote and aborts with
+  `fatal: not a git repository` when there is no `.git`.
