@@ -29,6 +29,22 @@ on:
   push:
     tags:
       - "v*"
+  # Manual re-run. Two reasons this exists:
+  #   1. A failed run can be retried WITHOUT rewriting a published tag.
+  #      GitHub executes the workflow file as it exists AT THE TAG, so a fix
+  #      committed to main is invisible to a re-run of that run — "Re-run
+  #      failed jobs" would fail identically forever. This trigger runs the
+  #      file from the branch you choose instead.
+  #   2. Re-uploading assets to an existing release without a new build.
+  #
+  # Leave `tag` empty to build the ref you are looking at. Set it to re-attach
+  # to an existing release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build/attach (blank = use the selected ref)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -46,10 +62,19 @@ jobs:
       version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On a manual run the ref is a branch, which may be ahead of the tag.
+          # Check out the tag when one was named, so the built binary really
+          # corresponds to the released commit.
+          ref: ${{ inputs.tag || github.ref }}
       - id: check
+        env:
+          # inputs.tag is only populated for workflow_dispatch; on a tag push
+          # GITHUB_REF_NAME is the tag. Prefer whichever is present.
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${REQUESTED_TAG:-${GITHUB_REF_NAME}}"
           manifest="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           echo "tag=$tag  cargo=$manifest"
           if [ "$tag" != "v$manifest" ]; then
@@ -103,6 +128,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Must match verify-tag: on a manual run, build the TAG's source, not
+          # the branch's. Otherwise a re-attach would ship binaries built from
+          # commits that were never part of the release.
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
