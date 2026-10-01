@@ -1,5 +1,9 @@
 <a id="readme-top"></a>
 
+<p align="center">
+  <img src="assets/icon.svg" width="96" height="96" alt="quantui-rs icon: a block grid with one row collapsed into a quantized bar">
+</p>
+
 # ⟪ quantui-rs ⟫
 
 **One static Rust binary that quantizes, converts, and casts Hugging Face `safetensors` models.** No Python, no torch, no runtime dependencies.
@@ -59,6 +63,13 @@ Needs Rust stable ≥ 1.89. No other dependencies.
 cargo build --release
 # binary: target/release/quantui-rs(.exe)  (~2.6 MB, LTO + stripped)
 ```
+
+On Windows the icon is **embedded into the executable's PE resource section**
+by `crates/quant-cli/build.rs`, so Explorer, the taskbar and Alt-Tab all show it
+without a companion file. Edit `assets/icon.svg`, then regenerate the shipped
+`.ico` with `python tools/gen_icon.py` (needs `pip install pillow`). The build
+panics if the `.ico` is missing rather than silently producing an icon-less
+binary.
 
 <p id="commands" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 

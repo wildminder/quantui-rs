@@ -9,3 +9,10 @@
 *.f32 binary
 *.pt binary
 *.npz binary
+
+# The app icon is embedded into the exe by crates/quant-cli/build.rs, so its
+# bytes are load-bearing on every platform: EOL mangling here would produce an
+# rc.exe that embeds a different (or corrupt) icon. Same reasoning as the
+# parity goldens above.
+*.ico binary
+*.png binary

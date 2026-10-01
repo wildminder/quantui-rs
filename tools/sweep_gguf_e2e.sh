@@ -25,7 +25,6 @@ fi
 MODEL="tools/sweep_e2e/model"
 IMATRIX="tools/sweep_e2e/imatrix.dat"
 OUT="tools/sweep_e2e/out"
-GGUF_PY="tools/sweep_e2e/gguf_py_check.py"
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 

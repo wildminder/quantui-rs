@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  quantui-rs app icon.
+
+  Design intent — "a tensor grid losing precision": a lattice of blocks (the
+  quantized weight matrix) whose lower band has been collapsed into a single
+  wide bar (the quantization itself). Flat, two inks on a rounded square, no
+  gradient and no shadow, so it stays legible down to 16px in a taskbar.
+
+  The ◆/❯ glyph language of the README is echoed by the bevelled corner cut on
+  the collapsed bar.
+
+  GEOMETRY IS THE POINT: only the two upper rows carry live cells; the bar
+  replaces the third row and the fourth row is deliberately EMPTY. An earlier
+  draft kept cells under the bar and two of them peeked out below it, which
+  read as a rendering artifact rather than as intent.
+
+  This file is the SOURCE. assets/icon.ico is generated from it by
+  tools/gen_icon.py — edit the SVG, then regenerate; never hand-edit the .ico.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="96" fill="#12141A"/>
+  <g fill="#3D4457">
+    <!-- rows 1-2: three blocky cells each, the uncompressed tensor -->
+    <rect x="112" y="112" width="80" height="80" rx="14"/>
+    <rect x="216" y="112" width="80" height="80" rx="14"/>
+    <rect x="320" y="112" width="80" height="80" rx="14"/>
+    <rect x="112" y="216" width="80" height="80" rx="14"/>
+    <rect x="216" y="216" width="80" height="80" rx="14"/>
+    <rect x="320" y="216" width="80" height="80" rx="14"/>
+  </g>
+  <!-- row 3: collapsed to one quantized bar, accent ink, corner cut as ◆ -->
+  <path d="M112 320 H372 L400 348 L372 376 H112 A14 14 0 0 1 98 362 V334 A14 14 0 0 1 112 320 Z"
+        fill="#E8734A"/>
+</svg>

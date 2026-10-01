@@ -25,3 +25,9 @@ tools/sweep_e2e/
 crates/quant-core/tmp_*.safetensors
 crates/quant-core/tmp_*.safetensors.quant-manifest.json
 crates/quant-core/tmp_*.bin
+
+# App icon: assets/icon.svg is the source and assets/icon.ico is the shipped
+# artifact (build.rs embeds it), so BOTH are committed — the .ico must be
+# present for a fresh clone to build. The preview render is derived from the
+# .ico and only useful when eyeballing the design, so it stays out.
+assets/icon-preview.png
