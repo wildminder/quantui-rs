@@ -3,12 +3,14 @@ resolver = "2"
 members = ["crates/quant-core", "crates/quant-cli"]
 
 [workspace.package]
-# 0.3.0 — adds the `cast` subcommand: a single-file bf16/fp16/fp32
-# .safetensors from a single file or a sharded HF folder, with no quantization
-# metadata written. Adds a measured format/parameter matrix to the README.
-# No existing format's output bytes change; the default paths stay byte-exact
-# and every quantizer is untouched.
-version = "0.3.0"
+# 0.3.1 — a plain HuggingFace folder holding one `model.safetensors` is
+# accepted by `quantize` / `cast` / `info` again. The folder was classified as
+# a single-file input but never resolved to the file inside it, so Windows
+# rejected the directory itself ("Access is denied", os error 5). `gguf` also
+# derives the model dir from that resolution now, so a folder input
+# auto-detects its arch instead of writing an empty one. Every quantizer is
+# untouched and emitted bytes are unchanged for file and sharded inputs.
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
