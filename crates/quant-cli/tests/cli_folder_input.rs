@@ -389,6 +389,110 @@ fn gguf_still_accepts_a_folder_holding_one_safetensors() {
     assert!(out.exists(), "gguf must write {}", out.display());
 }
 
+/// A folder input must AUTO-DETECT the arch, exactly like the file inside it.
+///
+/// The second `SingleFile` bug, in the same shape as the first: `gguf` derived
+/// the model dir from `kind` and took `input.parent()`, so for a FOLDER that
+/// pointed one level too high, `config.json` was never found, and the GGUF went
+/// out with an EMPTY arch — while the same model passed as a file was tagged
+/// correctly. The two artifacts differed at byte 57.
+///
+/// Asserted on the arch reported in the summary line, which is the user-visible
+/// symptom; `gguf --audit` / the raw KV bytes are not needed to catch a
+/// regression, and a summary assertion keeps the test independent of metadata
+/// ordering.
+#[test]
+fn gguf_folder_input_auto_detects_arch_like_file_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("m");
+    write_hf_folder(&model);
+    let llama = br#"{"architectures":["LlamaForCausalLM"],"model_type":"llama",
+                      "hidden_size":128,"num_hidden_layers":1,"vocab_size":128}"#;
+    std::fs::write(model.join("config.json"), llama).unwrap();
+
+    let mut arches: Vec<String> = Vec::new();
+    // Same two shapes as the byte-identity test: the folder, and the file in it.
+    for (input, out_name) in [
+        (model.clone(), "from_folder.gguf"),
+        (model.join("model.safetensors"), "from_file.gguf"),
+    ] {
+        let out = tmp.path().join(out_name);
+        let res = bin()
+            .args([
+                "gguf",
+                input.to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--method",
+                "f16",
+                "--no-progress",
+            ])
+            .output()
+            .unwrap();
+        assert_ok(&res, &format!("gguf on {}", input.display()));
+        let stdout = String::from_utf8_lossy(&res.stdout);
+        // The summary ends "...; arch <name>; ...". An empty arch prints as a
+        // bare "arch ;" — that is the exact regression.
+        let arch = stdout
+            .split("arch ")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap_or("<none>")
+            .trim()
+            .to_string();
+        assert_eq!(
+            arch,
+            "llama",
+            "arch must be auto-detected for {}\nstdout: {stdout}",
+            input.display()
+        );
+        arches.push(arch);
+    }
+    assert_eq!(
+        arches[0], arches[1],
+        "folder and file input must agree on arch"
+    );
+}
+
+/// `--arch` must still override auto-detection on a FOLDER input.
+///
+/// The fix reworked how the model dir is derived, so this pins that the
+/// explicit-override path is unaffected by it: an override must not depend on
+/// `config.json` being found at all.
+#[test]
+fn gguf_folder_input_respects_an_explicit_arch_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("m");
+    write_hf_folder(&model);
+    // A config that would auto-detect as llama...
+    std::fs::write(
+        model.join("config.json"),
+        br#"{"architectures":["LlamaForCausalLM"],"model_type":"llama",
+            "hidden_size":128,"num_hidden_layers":1,"vocab_size":128}"#,
+    )
+    .unwrap();
+    let out = tmp.path().join("override.gguf");
+
+    let res = bin()
+        .args([
+            "gguf",
+            model.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--method",
+            "f16",
+            "--arch",
+            "qwen2",
+            "--no-progress",
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&res, "gguf with --arch on a folder");
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(
+        stdout.contains("arch qwen2"),
+        "--arch must win over auto-detection\nstdout: {stdout}"
+    );
+}
+
 // --------------------------------------------------------------------------- //
 // No regression on the two shapes that already worked
 // --------------------------------------------------------------------------- //
