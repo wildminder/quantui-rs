@@ -214,6 +214,13 @@ jobs:
     needs: [verify-tag, build]
     runs-on: ubuntu-latest
     steps:
+      # The `gh` CLI resolves which repository to upload to from the git
+      # remote, so it needs a real checkout. Without this it aborts with
+      # "failed to run git: fatal: not a git repository" and the archives never
+      # reach the Release — after five successful builds, which is the most
+      # expensive place to fail. The checkout costs about a second.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: all
