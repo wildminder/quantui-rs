@@ -144,6 +144,59 @@ pub fn classify_input(path: impl AsRef<Path>) -> (Option<InputKind>, Option<Stri
     (None, None)
 }
 
+/// Resolve a [`InputKind::SingleFile`] input to the actual `.safetensors`
+/// **file** path.
+///
+/// `classify_input` accepts TWO different shapes under `SingleFile`:
+/// a path that is itself a `.safetensors` file, and a *folder* holding
+/// exactly one `.safetensors` (plain HuggingFace layout, no index). It returns
+/// only a `(kind, base_name)` pair, so it never tells the caller which file
+/// lives inside such a folder. Every caller that actually OPENS the input must
+/// therefore go through here first: opening the folder itself is what produced
+/// the reported failure — on Windows `File::open` on a directory returns
+/// `ERROR_ACCESS_DENIED` ("os error 5"), and the error text then names the
+/// directory rather than the model.
+///
+/// The reference reaches the same contract from the other side: it *validates*
+/// the folder in `worker_ctq.py::resolve_input` and separately *resolves* it
+/// in `gguf_export.py::_discover_inputs`. A folder with one `.safetensors` is
+/// valid input, so the resolution has to happen somewhere — this is that place.
+///
+/// The `.safetensors` extension is NOT re-checked for the direct-file case:
+/// extension is `classify_input`'s gate, and duplicating it here would make the
+/// two disagree. 0 or >1 candidates in a folder is an error rather than an
+/// arbitrary pick, matching `resolve_input`'s diagnostics.
+pub fn resolve_single_file(path: impl AsRef<Path>) -> Result<PathBuf, DiscoverError> {
+    let p = path.as_ref();
+    if p.is_file() {
+        return Ok(p.to_path_buf());
+    }
+    if !p.is_dir() {
+        return Err(DiscoverError::NotASingleFileInput(p.to_path_buf()));
+    }
+    // Only real files count: a *directory* named `foo.safetensors` inside the
+    // model folder is not a candidate (and opening it would fail the same way).
+    let mut found: Vec<PathBuf> = Vec::new();
+    let rd = std::fs::read_dir(p).map_err(|source| DiscoverError::Io {
+        path: p.to_path_buf(),
+        source,
+    })?;
+    for entry in rd.filter_map(|e| e.ok()) {
+        let child = entry.path();
+        if child.is_file() && child.extension().and_then(|s| s.to_str()) == Some("safetensors") {
+            found.push(child);
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(DiscoverError::NoSafetensorsInFolder(p.to_path_buf())),
+        count => Err(DiscoverError::AmbiguousSingleFile {
+            path: p.to_path_buf(),
+            count,
+        }),
+    }
+}
+
 // --------------------------------------------------------------------------- //
 // Sharded-model discovery (worker_ctq.py::discover_shards).
 // --------------------------------------------------------------------------- //
@@ -189,6 +242,19 @@ pub enum DiscoverError {
         #[source]
         source: std::io::Error,
     },
+    /// `resolve_single_file`: the path is neither a file nor a folder, so there
+    /// is nothing to resolve. Distinct from [`DiscoverError::IndexNotFound`]
+    /// because no index was expected — the input itself does not exist.
+    #[error("not a .safetensors file nor a folder: {0}")]
+    NotASingleFileInput(PathBuf),
+    /// `resolve_single_file`: a folder was given but holds no `.safetensors`.
+    #[error("no .safetensors file found inside folder: {0}")]
+    NoSafetensorsInFolder(PathBuf),
+    /// `resolve_single_file`: a folder was given but holds more than one
+    /// `.safetensors`, so the single-file input is ambiguous. Such a folder is
+    /// only usable as a *sharded* input, which needs an index file.
+    #[error("folder holds {count} .safetensors files, expected exactly 1: {path}")]
+    AmbiguousSingleFile { path: PathBuf, count: usize },
     #[error(transparent)]
     St(#[from] StError),
 }
@@ -530,6 +596,114 @@ mod tests {
         assert_eq!(classify_input(&txt), (None, None));
         // Empty string.
         assert_eq!(classify_input(""), (None, None));
+    }
+
+    // ---------------- resolve_single_file ---------------- //
+
+    #[test]
+    fn resolve_passes_through_a_real_file() {
+        let d = tmpdir();
+        let f = d.path().join("mymodel.safetensors");
+        write(&f, b"x");
+        assert_eq!(resolve_single_file(&f).unwrap(), f);
+    }
+
+    #[test]
+    fn resolve_folder_to_its_only_safetensors() {
+        let d = tmpdir();
+        let dir = d.path().join("VibeVoice-Realtime-0.5B");
+        let f = dir.join("model.safetensors");
+        write(&f, b"x");
+        // Sidecars are present in a real HF folder and must be ignored.
+        write(&dir.join("config.json"), b"{}");
+        write(&dir.join("tokenizer.json"), b"{}");
+        // The folder classifies as SingleFile …
+        assert_eq!(
+            classify_input(&dir),
+            (
+                Some(InputKind::SingleFile),
+                Some("VibeVoice-Realtime-0.5B".into())
+            )
+        );
+        // … and resolves to the file the classifier could not name.
+        assert_eq!(resolve_single_file(&dir).unwrap(), f);
+    }
+
+    #[test]
+    fn resolve_folder_errors_are_specific() {
+        let d = tmpdir();
+        // Neither file nor folder.
+        assert!(matches!(
+            resolve_single_file(d.path().join("nope.safetensors")),
+            Err(DiscoverError::NotASingleFileInput(_))
+        ));
+        // Folder with no .safetensors at all.
+        let empty = d.path().join("empty");
+        write(&empty.join("config.json"), b"{}");
+        assert!(matches!(
+            resolve_single_file(&empty),
+            Err(DiscoverError::NoSafetensorsInFolder(_))
+        ));
+        // Folder with two .safetensors is ambiguous for a single-file input.
+        let two = d.path().join("two");
+        write(&two.join("a.safetensors"), b"x");
+        write(&two.join("b.safetensors"), b"x");
+        match resolve_single_file(&two) {
+            Err(DiscoverError::AmbiguousSingleFile { count, .. }) => assert_eq!(count, 2),
+            other => panic!("expected AmbiguousSingleFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_ignores_a_directory_named_like_a_shard() {
+        // A DIRECTORY called `weights.safetensors` is not a readable candidate;
+        // counting it would hand the caller a path that cannot be opened.
+        let d = tmpdir();
+        let dir = d.path().join("hf");
+        write(&dir.join("real.safetensors"), b"x");
+        std::fs::create_dir_all(dir.join("weights.safetensors")).unwrap();
+        assert_eq!(
+            resolve_single_file(&dir).unwrap(),
+            dir.join("real.safetensors")
+        );
+    }
+
+    #[test]
+    fn resolve_is_the_inverse_of_classify_for_every_single_file_input() {
+        // The contract that was broken: whatever `classify_input` accepts as
+        // SingleFile must resolve to a path that is actually openable as a file.
+        let d = tmpdir();
+        let mut inputs: Vec<PathBuf> = Vec::new();
+
+        let plain = d.path().join("mymodel.safetensors");
+        write(&plain, b"x");
+        inputs.push(plain);
+
+        let hf = d.path().join("hf_folder");
+        write(&hf.join("model.safetensors"), b"x");
+        write(&hf.join("config.json"), b"{}");
+        inputs.push(hf);
+
+        // A bare shard marker file, which classifies by its PARENT folder name.
+        let sharded_parent = d.path().join("some_model");
+        inputs.push(sharded_parent.join("model-00001-of-00003.safetensors"));
+        write(&inputs[2], b"x");
+
+        for inp in &inputs {
+            assert_eq!(
+                classify_input(inp).0,
+                Some(InputKind::SingleFile),
+                "{} must classify as SingleFile",
+                inp.display()
+            );
+            let resolved = resolve_single_file(inp).unwrap();
+            assert!(
+                resolved.is_file(),
+                "{} resolved to a non-file {}",
+                inp.display(),
+                resolved.display()
+            );
+        }
     }
 
     // ---------------- discover_shards ---------------- //

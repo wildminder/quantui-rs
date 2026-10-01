@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use rlx_gguf::{quantize, GgmlType, GgufWriter, MetaValue};
 
-use crate::discover::{classify_input, resolve_union, InputKind};
+use crate::discover::{classify_input, resolve_single_file, resolve_union, InputKind};
 use crate::dtype::DType;
 use crate::gguf_names::{hf_to_gguf_name, load_arch_info};
 use crate::gguf_registry::{self, GgufScheme};
@@ -524,19 +524,12 @@ type Collected = (Vec<(String, usize)>, Vec<SafetensorsReader>);
 fn collect_tensors(input: &Path, kind: InputKind) -> Result<Collected, GgufError> {
     match kind {
         InputKind::SingleFile => {
-            // A single file, or a folder holding exactly one safetensors.
-            let file = if input.is_file() {
-                input.to_path_buf()
-            } else {
-                let mut sts: Vec<PathBuf> = std::fs::read_dir(input)?
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
-                    .collect();
-                sts.sort();
-                sts.pop()
-                    .ok_or_else(|| GgufError::BadInput(input.display().to_string()))?
-            };
+            // Either a real `.safetensors` file or a folder holding exactly one
+            // (plain HF layout). `classify_input` reports the kind but not
+            // WHICH file is inside such a folder, so defer to the shared
+            // resolver rather than repeating the directory scan here.
+            let file =
+                resolve_single_file(input).map_err(|e| GgufError::BadInput(e.to_string()))?;
             let reader = SafetensorsReader::open(&file)?;
             let names: Vec<(String, usize)> = reader
                 .header()

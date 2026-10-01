@@ -234,7 +234,15 @@ fn run_inner(args: CastArgs) -> Result<ExitCode, CliError> {
     // ORDER is the union's first-appearance order (stable across runs, which
     // is what makes the output byte-deterministic).
     let shard_paths: Vec<PathBuf> = match kind {
-        InputKind::SingleFile => vec![args.input.clone()],
+        // `SingleFile` may name a FOLDER that merely *contains* one
+        // `.safetensors` (plain HF layout), so resolve to the real file before
+        // anything opens it — handing the folder to `SafetensorsReader` is what
+        // produced Windows ERROR_ACCESS_DENIED ("os error 5").
+        InputKind::SingleFile => {
+            let file = discover::resolve_single_file(&args.input)
+                .map_err(|e| CliError::usage(e.to_string()))?;
+            vec![file]
+        }
         InputKind::ShardedFolder => {
             let model = discover::discover_shards(&args.input).map_err(|e| e.to_string())?;
             model.shard_paths()

@@ -9,6 +9,7 @@
 use std::process::ExitCode;
 
 use quant_core::comfy_schema::{layer_prefix, parse_blob};
+use quant_core::discover;
 use quant_core::st_io::reader::SafetensorsReader;
 
 use crate::args::InfoArgs;
@@ -38,10 +39,22 @@ fn fmt_shape(shape: &[u64]) -> String {
 }
 
 pub fn run(args: InfoArgs) -> ExitCode {
-    let reader = match SafetensorsReader::open(&args.input) {
-        Ok(r) => r,
+    // The input may be a plain HF folder that merely CONTAINS one
+    // `.safetensors`, which is just as valid an input as the file itself.
+    // `SafetensorsReader` can only open a real file, and handing it a directory
+    // fails on Windows with ERROR_ACCESS_DENIED ("os error 5"), so resolve the
+    // folder to the file inside it first.
+    let file = match discover::resolve_single_file(&args.input) {
+        Ok(f) => f,
         Err(e) => {
             eprintln!("error: {}: {e}", args.input.display());
+            return ExitCode::from(1);
+        }
+    };
+    let reader = match SafetensorsReader::open(&file) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}: {e}", file.display());
             return ExitCode::from(1);
         }
     };
@@ -58,7 +71,9 @@ pub fn run(args: InfoArgs) -> ExitCode {
         .iter()
         .map(|(_, info)| info.data_offsets.1 - info.data_offsets.0)
         .sum();
-    println!("file    : {}", args.input.display());
+    // Report the file actually read: with a folder input that is the resolved
+    // `.safetensors` inside it, which is what the table below describes.
+    println!("file    : {}", file.display());
     println!(
         "tensors : {} ({} of payload)",
         header.len(),

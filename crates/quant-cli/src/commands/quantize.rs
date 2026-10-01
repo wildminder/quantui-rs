@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use quant_core::discover::{
-    classify_input, ctq_quant_tags, discover_shards, suggest_comfy_output, InputKind,
+    classify_input, ctq_quant_tags, discover_shards, resolve_single_file, suggest_comfy_output,
+    InputKind,
 };
 use quant_core::manifest::{Format, QuantConfig, ScalingMode};
 use quant_core::stream::{
@@ -580,6 +581,12 @@ fn run_single(
     config: &QuantConfig,
     cancel: &AtomicBool,
 ) -> Result<RunOutcome, RunError> {
+    // `SingleFile` covers BOTH a real `.safetensors` file and a plain HF folder
+    // that merely CONTAINS one. `classify_input` returns only a kind, so it
+    // cannot say which file is inside such a folder — resolve it before
+    // anything opens the input, or the streamer is handed a directory and
+    // Windows fails with ERROR_ACCESS_DENIED ("os error 5").
+    let input = resolve_single_file(&args.input).map_err(|e| RunError::Failed(e.to_string()))?;
     let output = resolve_output(args, config)?;
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create output dir: {e}"))?;
@@ -588,7 +595,7 @@ fn run_single(
     let mut sink: Box<dyn ProgressSink> = make_sink(args, "quantizing");
     let result = {
         let mut cb = |cur: usize, total: usize| sink.update(cur, total);
-        stream_quantize_cancellable(&args.input, &output, config, Some(&mut cb), cancel)
+        stream_quantize_cancellable(&input, &output, config, Some(&mut cb), cancel)
     };
     // Always clear the progress bar before reporting — including on
     // cancellation/error — so the stop message is never garbled by the bar.
