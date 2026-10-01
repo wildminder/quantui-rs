@@ -263,15 +263,19 @@ pub fn convert_hf_to_gguf(
     let kind = kind.ok_or_else(|| GgufError::BadInput(input.display().to_string()))?;
     let base_name = base_name.unwrap_or_else(|| "model".to_string());
 
-    // 3. Collect the ordered (name, shard-index) list + open shard readers.
-    let (names, readers) = collect_tensors(input, kind)?;
+    // 3. Collect the ordered (name, shard-index) list + open shard readers,
+    //    plus the dir holding the model (for config.json).
+    let (names, readers, model_dir) = collect_tensors(input, kind)?;
     let total = names.len();
 
     // 4. Arch detection + metadata from config.json (best-effort).
-    let model_dir = match kind {
-        InputKind::SingleFile => input.parent().map(|p| p.to_path_buf()),
-        InputKind::ShardedFolder => Some(input.to_path_buf()),
-    };
+    //
+    // The dir comes from the same resolution that chose the weights, NOT from
+    // `kind`. `SingleFile` covers both a real `.safetensors` and a plain HF
+    // folder holding one, so matching on `kind` and taking `input.parent()`
+    // pointed one level too high for a folder: `config.json` was never found and
+    // the GGUF went out with an EMPTY arch, while the same model reached
+    // through the file path was tagged correctly.
     let arch_info = model_dir
         .as_deref()
         .and_then(load_arch_info)
@@ -517,9 +521,21 @@ pub fn convert_hf_to_gguf(
 
 // ─── tensor collection ──────────────────────────────────────────────
 
-/// Open shard readers and return the ordered tensor list as
-/// `(name, shard_index)` pairs (first-appearance order for sharded inputs).
-type Collected = (Vec<(String, usize)>, Vec<SafetensorsReader>);
+/// What `collect_tensors` hands back: the ordered tensor list as
+/// `(name, shard_index)` pairs (first-appearance order for sharded inputs), the
+/// open readers, and the directory holding the model — the one place
+/// `config.json` is looked for.
+///
+/// The dir is returned rather than recomputed by the caller because it must be
+/// derived from the SAME resolution that chose the weights. Deriving it twice
+/// is how a folder input ended up one level too high: `classify_input` reports
+/// the kind but not WHICH file is inside such a folder, so "the model dir" is
+/// only knowable after `resolve_single_file` has run.
+type Collected = (
+    Vec<(String, usize)>,
+    Vec<SafetensorsReader>,
+    Option<PathBuf>,
+);
 
 fn collect_tensors(input: &Path, kind: InputKind) -> Result<Collected, GgufError> {
     match kind {
@@ -537,7 +553,17 @@ fn collect_tensors(input: &Path, kind: InputKind) -> Result<Collected, GgufError
                 .filter(|n| n.as_str() != "__metadata__")
                 .map(|n| (n.clone(), 0usize))
                 .collect();
-            Ok((names, vec![reader]))
+            // The dir CONTAINING the resolved file, whether the caller passed
+            // that file directly or the folder around it. A bare relative name
+            // ("model.safetensors") has an EMPTY parent; `Path::new("")` still
+            // joins to "config.json" and reads the cwd, but state it — this
+            // mirrors the reference's `or "."`.
+            let dir = file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            Ok((names, vec![reader], Some(dir)))
         }
         InputKind::ShardedFolder => {
             let model = crate::discover::discover_shards(input)
@@ -556,7 +582,7 @@ fn collect_tensors(input: &Path, kind: InputKind) -> Result<Collected, GgufError
                     (n.clone(), idx)
                 })
                 .collect();
-            Ok((names, readers))
+            Ok((names, readers, Some(model.model_dir)))
         }
     }
 }
