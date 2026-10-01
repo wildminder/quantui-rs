@@ -207,7 +207,11 @@ jobs:
           name: bin-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          # Deliberately 90 days, not 7. These artifacts are the ONLY copy of
+          # the binaries: if the attach step fails, re-running it recovers the
+          # exact archives instead of rebuilding all five. 7 days is not enough
+          # window if a human is asleep at the wrong moment.
+          retention-days: 90
 
   attach:
     name: Attach to GitHub Release
