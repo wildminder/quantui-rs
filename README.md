@@ -1,7 +1,7 @@
 <a id="readme-top"></a>
 
 <p align="center">
-  <img src="assets/icon.svg" width="96" height="96" alt="quantui-rs icon: a block grid with one row collapsed into a quantized bar">
+  <img src="assets/icon.svg" width="96" height="96" alt="quantui-rs icon: a fine lattice of blocks narrowing through a wedge into a few large blocks — many weights collapsing onto few levels">
 </p>
 
 # ⟪ quantui-rs ⟫

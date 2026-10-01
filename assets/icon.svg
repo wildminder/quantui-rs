@@ -1,35 +1,108 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  quantui-rs app icon.
+  quantui-rs app icon — the funnel.
 
-  Design intent — "a tensor grid losing precision": a lattice of blocks (the
-  quantized weight matrix) whose lower band has been collapsed into a single
-  wide bar (the quantization itself). Flat, two inks on a rounded square, no
-  gradient and no shadow, so it stays legible down to 16px in a taskbar.
+  Design intent — "many weights, few buckets": a fine lattice of small cells on
+  the left narrows through a wedge into a few large blocks on the right. That is
+  quantization stated literally: N values collapse onto M levels. The wedge is
+  the projection; the coarse blocks are the codebook.
 
-  The ◆/❯ glyph language of the README is echoed by the bevelled corner cut on
-  the collapsed bar.
+  Origin: docs/misc/app-icon.svg, supplied as a single 74-subpath #da8346 blob
+  with no viewBox and no size. It was a 589.91 x 340.68 LANDSCAPE mark
+  (aspect 1.73), which cannot be dropped into a square Windows icon canvas
+  without letterboxing it to a stamp, so it was re-composed here rather than
+  pasted: uniformly scaled to 424x245, centred on a 512 square with a 44-unit
+  margin, and set on the same near-black plate as before so the orange reads on
+  a light taskbar. Geometry is otherwise the source's own — the wedge and all 73
+  cells keep their proportions exactly.
 
-  GEOMETRY IS THE POINT: only the two upper rows carry live cells; the bar
-  replaces the third row and the fourth row is deliberately EMPTY. An earlier
-  draft kept cells under the bar and two of them peeked out below it, which
-  read as a rendering artifact rather than as intent.
+  Read at 16px the fine lattice necessarily mushes (a cell is 1.5% of the
+  width), but the SILHOUETTE — narrow waist, flare to a solid right block —
+  still carries, which is what a taskbar actually shows.
 
   This file is the SOURCE. assets/icon.ico is generated from it by
   tools/gen_icon.py — edit the SVG, then regenerate; never hand-edit the .ico.
+  The generator reads the rects and the wedge from THIS file, so they cannot
+  drift apart.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <rect width="512" height="512" rx="96" fill="#12141A"/>
-  <g fill="#3D4457">
-    <!-- rows 1-2: three blocky cells each, the uncompressed tensor -->
-    <rect x="112" y="112" width="80" height="80" rx="14"/>
-    <rect x="216" y="112" width="80" height="80" rx="14"/>
-    <rect x="320" y="112" width="80" height="80" rx="14"/>
-    <rect x="112" y="216" width="80" height="80" rx="14"/>
-    <rect x="216" y="216" width="80" height="80" rx="14"/>
-    <rect x="320" y="216" width="80" height="80" rx="14"/>
+  <g fill="#DA8346">
+    <!-- the funnel: 73 lattice cells, left (fine) to right (coarse) -->
+    <rect x="44.00" y="133.57" width="19.34" height="19.34"/>
+    <rect x="71.57" y="133.57" width="19.34" height="19.34"/>
+    <rect x="99.15" y="133.57" width="19.34" height="19.34"/>
+    <rect x="126.73" y="133.57" width="19.34" height="19.34"/>
+    <rect x="154.31" y="133.57" width="19.34" height="19.34"/>
+    <rect x="362.74" y="146.55" width="49.98" height="49.98"/>
+    <rect x="418.03" y="146.55" width="49.98" height="49.98"/>
+    <rect x="44.00" y="161.76" width="19.34" height="19.34"/>
+    <rect x="71.57" y="161.76" width="19.34" height="19.34"/>
+    <rect x="99.15" y="161.76" width="19.34" height="19.34"/>
+    <rect x="126.73" y="161.76" width="19.34" height="19.34"/>
+    <rect x="154.31" y="161.76" width="19.34" height="19.34"/>
+    <rect x="181.89" y="161.77" width="19.34" height="19.34"/>
+    <rect x="44.00" y="189.95" width="19.34" height="19.34"/>
+    <rect x="71.57" y="189.95" width="19.34" height="19.34"/>
+    <rect x="99.15" y="189.95" width="19.34" height="19.34"/>
+    <rect x="126.73" y="189.95" width="19.34" height="19.34"/>
+    <rect x="154.31" y="189.95" width="19.34" height="19.34"/>
+    <rect x="181.89" y="189.96" width="19.34" height="19.34"/>
+    <rect x="209.47" y="189.97" width="19.34" height="19.34"/>
+    <rect x="237.04" y="189.97" width="19.34" height="19.34"/>
+    <rect x="362.74" y="202.85" width="49.98" height="49.98"/>
+    <rect x="418.03" y="202.85" width="49.98" height="49.98"/>
+    <rect x="44.00" y="218.15" width="19.34" height="19.34"/>
+    <rect x="71.57" y="218.15" width="19.34" height="19.34"/>
+    <rect x="99.15" y="218.15" width="19.34" height="19.34"/>
+    <rect x="126.73" y="218.15" width="19.34" height="19.34"/>
+    <rect x="154.31" y="218.15" width="19.34" height="19.34"/>
+    <rect x="181.89" y="218.16" width="19.34" height="19.34"/>
+    <rect x="209.47" y="218.17" width="19.34" height="19.34"/>
+    <rect x="237.04" y="218.17" width="19.34" height="19.34"/>
+    <rect x="264.62" y="218.17" width="19.34" height="19.34"/>
+    <rect x="44.00" y="246.34" width="19.34" height="19.34"/>
+    <rect x="71.57" y="246.34" width="19.34" height="19.34"/>
+    <rect x="99.15" y="246.34" width="19.34" height="19.34"/>
+    <rect x="126.73" y="246.34" width="19.34" height="19.34"/>
+    <rect x="154.31" y="246.34" width="19.34" height="19.34"/>
+    <rect x="181.89" y="246.35" width="19.34" height="19.34"/>
+    <rect x="209.47" y="246.36" width="19.34" height="19.34"/>
+    <rect x="237.04" y="246.36" width="19.34" height="19.34"/>
+    <rect x="264.62" y="246.36" width="19.34" height="19.34"/>
+    <rect x="362.74" y="259.23" width="49.98" height="49.98"/>
+    <rect x="418.03" y="259.23" width="49.98" height="49.98"/>
+    <rect x="44.00" y="274.53" width="19.34" height="19.34"/>
+    <rect x="71.57" y="274.53" width="19.34" height="19.34"/>
+    <rect x="99.15" y="274.53" width="19.34" height="19.34"/>
+    <rect x="126.73" y="274.53" width="19.34" height="19.34"/>
+    <rect x="154.31" y="274.53" width="19.34" height="19.34"/>
+    <rect x="181.89" y="274.54" width="19.34" height="19.34"/>
+    <rect x="209.47" y="274.55" width="19.34" height="19.34"/>
+    <rect x="237.04" y="274.55" width="19.34" height="19.34"/>
+    <rect x="264.62" y="274.55" width="19.34" height="19.34"/>
+    <rect x="44.00" y="302.72" width="19.34" height="19.34"/>
+    <rect x="71.57" y="302.72" width="19.34" height="19.34"/>
+    <rect x="99.15" y="302.72" width="19.34" height="19.34"/>
+    <rect x="126.73" y="302.72" width="19.34" height="19.34"/>
+    <rect x="154.31" y="302.72" width="19.34" height="19.34"/>
+    <rect x="181.89" y="302.73" width="19.34" height="19.34"/>
+    <rect x="209.47" y="302.74" width="19.34" height="19.34"/>
+    <rect x="237.04" y="302.74" width="19.34" height="19.34"/>
+    <rect x="362.74" y="315.61" width="49.98" height="49.98"/>
+    <rect x="418.03" y="315.61" width="49.98" height="49.98"/>
+    <rect x="44.00" y="330.91" width="19.34" height="19.34"/>
+    <rect x="71.57" y="330.91" width="19.34" height="19.34"/>
+    <rect x="99.15" y="330.91" width="19.34" height="19.34"/>
+    <rect x="126.73" y="330.91" width="19.34" height="19.34"/>
+    <rect x="154.31" y="330.91" width="19.34" height="19.34"/>
+    <rect x="181.89" y="330.92" width="19.34" height="19.34"/>
+    <rect x="44.00" y="359.10" width="19.34" height="19.34"/>
+    <rect x="71.57" y="359.10" width="19.34" height="19.34"/>
+    <rect x="99.15" y="359.10" width="19.34" height="19.34"/>
+    <rect x="126.73" y="359.10" width="19.34" height="19.34"/>
+    <rect x="154.31" y="359.10" width="19.34" height="19.34"/>
+    <!-- the wedge: the projection from many values onto few levels -->
+    <path d="M292.17 218.14 L355.72 161.75 L355.72 350.23 L292.17 293.85 Z"/>
   </g>
-  <!-- row 3: collapsed to one quantized bar, accent ink, corner cut as ◆ -->
-  <path d="M112 320 H372 L400 348 L372 376 H112 A14 14 0 0 1 98 362 V334 A14 14 0 0 1 112 320 Z"
-        fill="#E8734A"/>
 </svg>
