@@ -1,0 +1,253 @@
+name: release
+
+# Attaches ready-to-run binaries to a GitHub Release.
+#
+# Triggered by pushing a version tag (vX.Y.Z). For each target it builds with
+# the release profile, smoke-tests the binary (it must run and print its own
+# version), packs it with a SHA256, and a final job attaches everything to the
+# Release along with one combined checksum file.
+#
+# WHY A SEPARATE WORKFLOW rather than a step in ci.yml: ci.yml runs on every
+# push and PR, and building 5 release binaries on each wastes runner minutes on
+# artifacts nobody downloads. Releases are rare and the artifacts are the point.
+#
+# WHY THE TAG IS CHECKED against Cargo.toml before anything is built: a tag that
+# disagrees with the manifest produces a binary whose `--version` lies, and the
+# PE version resource (crates/quant-cli/build.rs) is stamped from
+# CARGO_PKG_VERSION, so Explorer's Details tab would show the wrong number too.
+# Failing loudly beats shipping that.
+#
+# Each target builds on a runner of its OWN architecture, so nothing is cross
+# compiled. That matters for two reasons: an aarch64 Linux binary produced by
+# cross-compiling needs an aarch64 linker, and the smoke test below can
+# actually RUN every artifact instead of merely inspecting its header.
+#
+# This workflow deliberately has no `pull_request` trigger: a fork's PR must
+# never be granted `contents: write`. It only ever runs for a tag you pushed.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fail before burning 5 runner-minutes on a mistyped tag.
+  verify-tag:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          manifest="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$tag  cargo=$manifest"
+          if [ "$tag" != "v$manifest" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $manifest"
+            echo "Retag, or bump Cargo.toml and commit before tagging."
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: verify-tag
+    # One failing target must not hide the others' results.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is STATIC (musl) on purpose. A glibc-linked build from
+          # ubuntu-24.04 (glibc 2.39) refuses to start on an older distro, which
+          # is the single most common "the download is broken" report for a
+          # Rust CLI. musl has no runtime dependency at all.
+          #
+          # Both archs use NATIVE runners (free for public repos), so the
+          # smoke test below runs the real binary. ubuntu-latest is x86_64;
+          # there is no ubuntu-latest-arm alias, the ARM label is spelled out.
+          - name: linux-x86_64 (static)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - name: linux-aarch64 (static)
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+          # Windows gets a .zip because that is what Explorer expects; a .tar.gz
+          # is an extra manual step on the platform most users are on.
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          # macos-latest is ARM64 (Apple Silicon) as of macOS 26. The Intel
+          # build needs an explicit -intel label, or the job silently ships a
+          # second ARM binary under an x86_64 file name.
+          - name: macos-aarch64 (Apple Silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - name: macos-x86_64 (Intel)
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (release, locked)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/quantui-rs"
+          # `-f`, not `-x`: Git Bash does not always report a freshly written
+          # .exe as executable, and a false negative here would fail the release
+          # for no reason.
+          [ -f "$bin" ] || bin="$bin.exe"
+          test -f "$bin" || { echo "::error::no binary at $bin"; exit 1; }
+          # Runs on EVERY target because each has a native runner of its own
+          # architecture. A binary that cannot print its own version, or prints
+          # the wrong one, must not reach a Release.
+          got="$("$bin" --version)"
+          echo "$got"
+          echo "$got" | grep -q "${{ needs.verify-tag.outputs.version }}" \
+            || { echo "::error::binary reports '$got' but the tag is ${{ needs.verify-tag.outputs.version }}"; exit 1; }
+          # And it must actually work, not merely start.
+          "$bin" --help > /dev/null
+          wc -c < "$bin"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ needs.verify-tag.outputs.version }}"
+          stem="quantui-rs-$ver-${{ matrix.target }}"
+          bin="target/${{ matrix.target }}/release/quantui-rs"
+          [ -f "$bin" ] || bin="$bin.exe"
+
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            # `zip` is NOT installed on windows-latest and neither is 7z, but
+            # the runner's bundled Python is. zipfile needs no install and
+            # behaves identically on all three runner images. The heredoc is
+            # quoted so the SHELL expands $stem and Python does not.
+            cp "$bin" "${stem}.exe"
+            STEM="$stem" python - <<'PY'
+          import os, zipfile
+          stem = os.environ["STEM"]
+          with zipfile.ZipFile(f"dist/{stem}.zip", "w", zipfile.ZIP_DEFLATED) as z:
+              z.write(f"{stem}.exe", f"{stem}.exe")
+          PY
+            rm -f "${stem}.exe"
+          else
+            cp "$bin" "$stem"
+            # Reproducible archive, built with Python rather than tar(1).
+            #
+            # `gzip -n` alone is NOT enough, and this was measured: two runs of
+            # `tar | gzip -n` produced different SHA256s because tar embeds the
+            # file's mtime plus uid/gid/uname. GNU tar's `--sort/--owner/--mtime`
+            # would fix it but bsdtar (macOS) rejects those flags, so the two
+            # runners would disagree.
+            #
+            # tarfile is byte-identical on all three runner images and lets every
+            # volatile field be pinned: mtime 0, uid/gid 0, empty uname/gname,
+            # mode 0755. Same commit in, same bytes out.
+            STEM="$stem" SRC="$bin" python - <<'PY'
+          import os, tarfile, gzip
+          stem, src = os.environ["STEM"], os.environ["SRC"]
+          with open(f"dist/{stem}.tar.gz", "wb") as raw:
+              # mtime=0 in the gzip header too, so the OUTER file is stable.
+              with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+                  with tarfile.open(fileobj=gz, mode="w") as tar:
+                      info = tar.gettarinfo(src, arcname=stem)
+                      info.mtime = 0
+                      info.uid = info.gid = 0
+                      info.uname = info.gname = ""
+                      info.mode = 0o755
+                      with open(src, "rb") as fh:
+                          tar.addfile(info, fh)
+          PY
+          rm -f "$stem"
+          fi
+          ls -la dist/
+
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # `sha256sum *` alone records a leading "./" on some coreutils
+          # versions; strip it so the manifest reads cleanly and
+          # `sha256sum -c SHA256SUMS.txt` works from any directory.
+          for f in *; do
+            [ "$f" = "SHA256SUMS.txt" ] && continue
+            sha256sum "$f"
+          done | sed 's|  \./|  |' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  attach:
+    name: Attach to GitHub Release
+    needs: [verify-tag, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          # merge-multiple:false gives each job its own directory. Flattening
+          # would be fine here (the file names embed the target and are unique)
+          # but per-job dirs keep the provenance visible if a step ever changes.
+          merge-multiple: false
+
+      - name: Collect and build one checksum manifest
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Drop the per-job manifests; one combined file is what a user needs.
+          find all -name 'SHA256SUMS.txt' -delete
+          find all -type f -exec mv {} out/ \;
+          ( cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="RELEASE_NOTES.md"
+          # Idempotent: re-running after editing the notes uploads to the
+          # existing Release instead of failing on "already exists".
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            args=(--title "quantui-rs v$TAG" --generate-notes)
+            # A committed RELEASE_NOTES.md, if present, wins over the
+            # auto-generated commit list.
+            [ -f "$notes" ] && args+=(--notes-file "$notes")
+            gh release create "$TAG" out/* "${args[@]}"
+          fi
+          gh release view "$TAG" --json url,assets \
+            --jq '.assets[] | "  \(.name)  \(.size) bytes"'

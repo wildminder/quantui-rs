@@ -38,6 +38,7 @@ quantui-rs gguf model.safetensors out.gguf -m q8_0 \
 
 - [Building](#building)
 - [Commands](#commands)
+- [Prebuilt binaries](#downloads)
 - [Quantizing for ComfyUI (`quantize`)](#quantize)
 - [Quality modes: `nvfp4_l2` and `nvfp4_rot16`](#quality-modes)
 - [Parity contract, `parity:` marker & known boundaries](#parity)
@@ -85,6 +86,37 @@ binary.
 
 `quantize`, `gguf` and `cast` all take a single `.safetensors` file **or** a
 sharded HF model folder (one containing `model.safetensors.index.json`).
+
+<p id="downloads" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
+
+## ❯ Prebuilt binaries
+
+Every release ships a ready-to-run binary. No install, no runtime, no
+`cargo`.
+
+| Platform | File | Notes |
+|---|---|---|
+| Linux x86_64 | `quantui-rs-<ver>-x86_64-unknown-linux-musl.tar.gz` | static, runs on any distro |
+| Linux ARM64 | `quantui-rs-<ver>-aarch64-unknown-linux-musl.tar.gz` | static (Raspberry Pi, Graviton, Ampere) |
+| Windows x86_64 | `quantui-rs-<ver>-x86_64-pc-windows-msvc.zip` | |
+| macOS Apple Silicon | `quantui-rs-<ver>-aarch64-apple-darwin.tar.gz` | M1/M2/M3/M4 |
+| macOS Intel | `quantui-rs-<ver>-x86_64-apple-darwin.tar.gz` | |
+
+Verify a download against the `SHA256SUMS.txt` in the same release:
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+The Linux builds are statically linked, so they do not depend on your
+distribution's `glibc` version.
+
+> **macOS:** the binaries are unsigned and not notarized, so Gatekeeper blocks
+> them on first run. Check the checksum first, then allow it once via
+> **System Settings → Privacy & Security → Open Anyway**. If no button appears,
+> `xattr -d com.apple.quarantine ./quantui-rs-<ver>-aarch64-apple-darwin` does
+> it. Downloading with `curl` instead of a browser usually skips the prompt
+> entirely.
 
 <p id="quantize" align="center">◆◇◆◇◆◇◆◇◆◇◆</p>
 
