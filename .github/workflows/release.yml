@@ -59,7 +59,26 @@ jobs:
     name: Verify tag matches Cargo.toml
     runs-on: ubuntu-latest
     outputs:
+      # BARE manifest version, e.g. `0.3.1`. This is what the binary's own
+      # `--version` prints (`quantui-rs 0.3.1`), so the smoke test greps for
+      # this. Do NOT "simplify" it by dropping the other output and using this
+      # everywhere — see `tag` below.
       version: ${{ steps.check.outputs.version }}
+      # FULL tag including the `v`, e.g. `v0.3.1`. This is the ONLY correct
+      # value to hand to git or `gh release`, because it is the name the ref
+      # actually has in refs/tags/.
+      #
+      # WHY BOTH EXIST, since this has already caused a bad release: they are
+      # not interchangeable. `gh release view 0.3.1` does not find the release
+      # published on tag `v0.3.1`, so the attach job's "does the release
+      # already exist?" guard fell through to `gh release create 0.3.1`. That
+      # did not error — `gh release create` CREATES the tag when it is missing,
+      # pointing it at the default branch's HEAD — so it silently published a
+      # second release, on a bare tag, carrying all six assets. Two releases
+      # then both read as v0.3.1 to a human, because the create path re-added
+      # the `v` to the title while the tag had it stripped. That shipped on
+      # both 0.3.0 and 0.3.1 before it was noticed.
+      tag: ${{ steps.check.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,6 +102,9 @@ jobs:
             exit 1
           fi
           echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          # Published alongside `version`, not instead of it: the binary prints
+          # the bare version, but every git/gh ref operation needs the tag.
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.name }}
@@ -275,16 +297,59 @@ jobs:
       - name: Create release and upload
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.verify-tag.outputs.version }}
+          # The FULL `v`-prefixed tag (`v0.3.1`), NOT the bare manifest version.
+          # Every command below addresses a REF in refs/tags/, and that ref is
+          # named `v0.3.1`. Passing `0.3.1` here silently produced a duplicate
+          # release — see the note on verify-tag's `tag` output.
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          # Bare version (`0.3.1`), used ONLY to build the human-readable
+          # release title. Kept separate so the title cannot ever be assembled
+          # by concatenating a literal `v` onto something that already has one.
+          VERSION: ${{ needs.verify-tag.outputs.version }}
         run: |
           set -euo pipefail
           notes="RELEASE_NOTES.md"
+
+          # The tag MUST already exist before we are allowed to create a
+          # release for it. `gh release create` treats a nonexistent tag as an
+          # instruction to CREATE one, pointed at the default branch's HEAD —
+          # not at the commit you just built and smoke-tested. That is the
+          # actual mechanism behind the duplicate releases: no error, a
+          # plausible-looking release, and a stray tag on the wrong commit.
+          # Refusing here turns a silently wrong artifact into a loud failure,
+          # which is the same philosophy as verify-tag above.
+          #
+          # `--exit-code` is what makes a miss detectable; without it ls-remote
+          # exits 0 on no match and prints nothing.
+          #
+          # This is the SECOND of two independent guards, not the only one.
+          # verify-tag already refuses any tag that is not exactly
+          # `v$manifest`, which is what rejects a bare `0.3.1`. This one
+          # catches the case verify-tag cannot see: a ref that was never
+          # pushed at all. Note the two are not redundant — once the stray
+          # bare tags exist, a bare name WOULD pass this check, because the
+          # ref genuinely exists. So do not weaken verify-tag on the
+          # assumption that this guard covers it.
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::tag $TAG does not exist on the remote"
+            echo "Refusing to create a release: gh release create would auto-create"
+            echo "the tag at the default branch HEAD, not at the release commit."
+            echo "Push the tag first:  git tag $TAG <commit> && git push origin $TAG"
+            exit 1
+          fi
+          # Echo the ref we resolved, so the run log records exactly which
+          # commit the release will point at.
+          echo "Confirmed remote tag: $(git ls-remote --tags origin "refs/tags/$TAG")"
+
           # Idempotent: re-running after editing the notes uploads to the
           # existing Release instead of failing on "already exists".
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" out/* --clobber
           else
-            args=(--title "quantui-rs v$TAG" --generate-notes)
+            # Title comes from the BARE version, so the `v` appears exactly once
+            # whether the tag is `v0.3.1`. Deriving it from $TAG instead would
+            # render "quantui-rs vv0.3.1".
+            args=(--title "quantui-rs v$VERSION" --generate-notes)
             # A committed RELEASE_NOTES.md, if present, wins over the
             # auto-generated commit list.
             [ -f "$notes" ] && args+=(--notes-file "$notes")
