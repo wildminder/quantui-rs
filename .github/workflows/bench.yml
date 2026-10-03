@@ -25,9 +25,9 @@ permissions:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Bench (save nightly baseline)
         run: cargo bench -p quant-core --bench stream_small --locked -- --save-baseline nightly
@@ -35,7 +35,7 @@ jobs:
         # Proves the baseline mechanism works; same-run variance must be ~0.
         run: cargo bench -p quant-core --bench stream_small --locked -- --baseline nightly
       - name: Upload criterion report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-nightly
           path: target/criterion

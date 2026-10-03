@@ -25,12 +25,19 @@ concurrency:
 #     CTRL_BREAK_EVENT to a child process group is a Windows console
 #     mechanism; the core cancel path is covered in-process on every OS.
 #   - tests build paths with PathBuf::join, no hardcoded separators.
+#
+# Runners and action majors are pinned deliberately:
+#   - `ubuntu-24.04`, not `ubuntu-latest`: the floating label starts migrating
+#     to Ubuntu 26 on 2026-10-19. Pinning keeps the test matrix reproducible and
+#     avoids a surprise toolchain/glibc change landing mid-migration.
+#   - `actions/checkout@v7`: v4 targets node20, which GitHub has deprecated.
+#     v7 targets node24 natively.
 jobs:
   msrv:
     name: MSRV (Rust 1.89)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.89.0"
@@ -42,10 +49,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

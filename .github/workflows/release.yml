@@ -24,6 +24,17 @@ name: release
 #
 # This workflow deliberately has no `pull_request` trigger: a fork's PR must
 # never be granted `contents: write`. It only ever runs for a tag you pushed.
+#
+# WHY RUNNERS AND ACTION MAJORS ARE PINNED — do not "helpfully" un-pin either.
+#   - `ubuntu-24.04`, not `ubuntu-latest`: the floating label starts migrating
+#     to Ubuntu 26 on 2026-10-19. A release that starts failing or, worse,
+#     silently produces different binaries because the builder image moved is
+#     the worst time to find out.
+#   - `actions/*@v7`: v4 targets node20, which GitHub has deprecated (runs are
+#     force-migrated to node24). v7 targets node24 natively. download-artifact
+#     is held at v7 rather than the newer v8 because v8 adds `skip-decompress`
+#     and `digest-mismatch`, whose defaults could change whether the archives
+#     arrive extracted — which would break the collect step below.
 
 on:
   push:
@@ -57,7 +68,7 @@ jobs:
   # Fail before burning 5 runner-minutes on a mistyped tag.
   verify-tag:
     name: Verify tag matches Cargo.toml
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       # BARE manifest version, e.g. `0.3.1`. This is what the binary's own
       # `--version` prints (`quantui-rs 0.3.1`), so the smoke test greps for
@@ -80,7 +91,7 @@ jobs:
       # both 0.3.0 and 0.3.1 before it was noticed.
       tag: ${{ steps.check.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # On a manual run the ref is a branch, which may be ahead of the tag.
           # Check out the tag when one was named, so the built binary really
@@ -119,11 +130,16 @@ jobs:
           # is the single most common "the download is broken" report for a
           # Rust CLI. musl has no runtime dependency at all.
           #
+          # That also means the builder's distro is IRRELEVANT to the artifact:
+          # a static musl binary links nothing from the runner, so pinning the
+          # runner below cannot change what ships. Pinning is about runner
+          # stability, not artifact compatibility.
+          #
           # Both archs use NATIVE runners (free for public repos), so the
-          # smoke test below runs the real binary. ubuntu-latest is x86_64;
-          # there is no ubuntu-latest-arm alias, the ARM label is spelled out.
+          # smoke test below runs the real binary. ubuntu-24.04 is x86_64; there
+          # is no ubuntu-latest-arm alias, the ARM label is spelled out.
           - name: linux-x86_64 (static)
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive: tar.gz
           - name: linux-aarch64 (static)
@@ -149,7 +165,7 @@ jobs:
             archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Must match verify-tag: on a manual run, build the TAG's source, not
           # the branch's. Otherwise a re-attach would ship binaries built from
@@ -254,7 +270,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: dist/
@@ -268,21 +284,34 @@ jobs:
   attach:
     name: Attach to GitHub Release
     needs: [verify-tag, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # The `gh` CLI resolves which repository to upload to from the git
       # remote, so it needs a real checkout. Without this it aborts with
       # "failed to run git: fatal: not a git repository" and the archives never
       # reach the Release — after five successful builds, which is the most
       # expensive place to fail. The checkout costs about a second.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: all
-          # merge-multiple:false gives each job its own directory. Flattening
-          # would be fine here (the file names embed the target and are unique)
-          # but per-job dirs keep the provenance visible if a step ever changes.
+          # merge-multiple:false gives each job its own directory, so the five
+          # per-target archives stay distinguishable until the collect step
+          # below flattens them. Flattening here would work too (the file names
+          # embed the target and are unique) but per-job dirs keep the
+          # provenance visible if a step ever changes.
+          #
+          # download-artifact v5 changed ONE layout rule: a SINGLE artifact now
+          # extracts straight into `path/` instead of into `path/<name>/`, where
+          # v4 nested it when selected by artifact-ids. We are unaffected —
+          # this job downloads ALL artifacts and the matrix always produces
+          # five, so the multi-artifact per-name-subdirectory layout above
+          # still holds. The `find` commands are recursive anyway, so even a
+          # single-artifact run (a partially failed matrix) would still be
+          # collected correctly. Pinned to v7 deliberately: v8 adds
+          # `skip-decompress` / `digest-mismatch`, whose defaults could change
+          # whether these archives arrive extracted at all.
           merge-multiple: false
 
       - name: Collect and build one checksum manifest
