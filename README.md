@@ -1,10 +1,14 @@
 <a id="readme-top"></a>
 
 <p align="center">
-  <img src="assets/icon.svg" width="96" height="96" alt="quantui-rs icon: a fine lattice of blocks narrowing through a wedge into a few large blocks — many weights collapsing onto few levels">
+  <img alt="banner-main" src="https://github.com/user-attachments/assets/f6c42b19-5fad-491b-a170-57e5ec536e00" alt="quantui-rs icon: a fine lattice of blocks narrowing through a wedge into a few large blocks — many weights collapsing onto few levels">
 </p>
 
-# ⟪ quantui-rs ⟫
+<div align="center">
+  
+# ⟪ QuantUI-rs ⟫
+  
+</div>
 
 **One static Rust binary that quantizes, converts, and casts Hugging Face `safetensors` models.** No Python, no torch, no runtime dependencies.
 
@@ -12,11 +16,13 @@ ComfyUI INT8 / FP8 / MXFP8 / NVFP4 · GGUF for the llama.cpp ecosystem · one si
 
 **The contract:** output is byte-exact against the Python/torch and `llama.cpp` references on every default path. The handful of opt-in formats that trade that guarantee for accuracy say so on every run, on the [`parity:` line](#parity).
 
-
+<div align="center">
+  
 [![Rust][rust-shield]][rust-url]
 [![License MIT][mit-shield]][license-url]
 [![Platform][platform-shield]][building-url]
 
+</div>
 
 ```sh
 # Quantize to INT8 for ComfyUI
