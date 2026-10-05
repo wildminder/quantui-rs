@@ -1,7 +1,7 @@
 <a id="readme-top"></a>
 
 <p align="center">
-  <img alt="banner-main" src="https://github.com/user-attachments/assets/f6c42b19-5fad-491b-a170-57e5ec536e00" alt="quantui-rs icon: a fine lattice of blocks narrowing through a wedge into a few large blocks — many weights collapsing onto few levels">
+  <img src="https://github.com/user-attachments/assets/f6c42b19-5fad-491b-a170-57e5ec536e00" alt="quantui-rs icon: a fine lattice of blocks narrowing through a wedge into a few large blocks — many weights collapsing onto few levels">
 </p>
 
 <div align="center">
