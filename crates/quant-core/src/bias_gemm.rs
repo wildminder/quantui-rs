@@ -41,26 +41,223 @@
 //! expression, and silently produces wrong-but-plausible numbers. This was
 //! hit once while building the plan (32768/32768 mismatches); the tests below
 //! are written so that class of mistake cannot survive.
+//!
+//! # Step 2.2 measured negative (why production stays on the f64 detour)
+//!
+//! The scalar `mul_add` swap the plan originally specified for Step 2.2 is
+//! bitwise correct but a measured NEGATIVE end-to-end (31 s -> 122 s on
+//! `bench_bias_probe`): this crate ships baseline x86-64 (no `target-cpu`
+//! in the release profile or CI), where `f32::mul_add` lowers to a software
+//! `fmaf` that is 2.2x slower than the f64 detour it would replace.
+//! Hardware FMA is therefore obtained ONLY through
+//! `#[target_feature(enable = "avx2,fma")]` + `is_x86_feature_detected!`
+//! dispatch (Step 2.4); the scalar f64 detour stays the portable fallback.
 
-// Step 2.1 deliberately adds no non-test code: the module is empty in a
-// release build until Step 2.3 lands the transpose helper.
+// Production code begins at Step 2.3. Step 2.1 was proofs-only (the module
+// was empty in release builds); from Step 2.3 on it owns the packed-Err
+// layout and (Step 2.4) the AVX2/FMA microkernel for the bias GEMM.
+
+/// Deterministic LCG pseudo-random f32 in `[-1.0, 1.0)`.
+/// No RNG crate: the proofs must run with zero new dependencies and be
+/// reproducible bit-for-bit on every platform.
+#[cfg(test)]
+fn next_f32(state: &mut u64) -> f32 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*state >> 40) as f32 / (1 << 24) as f32) - 1.0
+}
+
+use rayon::prelude::*;
+
+/// Transpose `err` from row-major `[m, n]` to `[n, m]` so the `m` values
+/// belonging to one K-element are CONTIGUOUS: in the packed microkernel,
+/// one 256-bit load replaces 8 strided 4-byte loads.
+///
+/// Bit-exactness-neutral: a pure data movement, no arithmetic. The packed
+/// layout only changes WHICH ADDRESS holds a value, never a computed bit.
+///
+/// The transpose is done ONCE per `correct_bias` call and reused across all
+/// `S = 3072` calibration rows, so its cost is amortized ~3072x. Blocked:
+/// output strips of `JR = 8` rows per rayon task (contiguous, disjoint
+/// writes), walked in `IR = 32`-row tiles of `err` (contiguous reads, 8 hot
+/// output lines per tile). A naive scalar transpose measured 85.8 ms for
+/// 4096^2; this must stay far under the microkernel's cost (plan gate:
+/// < 5% of the GEMM at S = 3072, asserted by `bench_transpose_err`).
+pub fn transpose_err(err: &[f32], m: usize, n: usize) -> Vec<f32> {
+    debug_assert_eq!(err.len(), m * n);
+    let mut out = vec![0.0f32; m * n];
+    if m == 0 || n == 0 {
+        debug_assert!(out.is_empty());
+        return out;
+    }
+    const IR: usize = 32;
+    const JR: usize = 8;
+    // Disjointness: task jb exclusively owns out rows [jb*JR, jb*JR + rows),
+    // a contiguous strip of the output — no cross-task writes, no false
+    // sharing within a strip's interior.
+    out.par_chunks_mut(m * JR)
+        .enumerate()
+        .for_each(|(jb, chunk)| {
+            let j0 = jb * JR;
+            let rows = chunk.len() / m;
+            let mut i = 0usize;
+            while i < m {
+                let i1 = (i + IR).min(m);
+                for ii in i..i1 {
+                    // Contiguous run of `rows` K-elements from err row ii.
+                    let src = &err[ii * n + j0..ii * n + j0 + rows];
+                    for (jj, v) in src.iter().enumerate() {
+                        chunk[jj * m + ii] = *v;
+                    }
+                }
+                i = i1;
+            }
+        });
+    out
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    use super::next_f32;
+    use super::transpose_err;
+
+    /// The reference: an index-by-index double loop. Slow on purpose — it
+    /// is the definition the blocked kernel must reproduce.
+    fn naive(err: &[f32], m: usize, n: usize) -> Vec<f32> {
+        assert_eq!(err.len(), m * n);
+        let mut out = vec![0.0f32; m * n];
+        for j in 0..n {
+            for i in 0..m {
+                out[j * m + i] = err[i * n + j];
+            }
+        }
+        out
+    }
+
+    fn fill(m: usize, n: usize, seed: u64) -> Vec<f32> {
+        let mut st = seed;
+        (0..m * n).map(|_| next_f32(&mut st)).collect()
+    }
+
+    const SHAPES: &[(usize, usize)] = &[
+        (1, 1),
+        (1, 5),
+        (5, 1),
+        (2, 2),
+        (7, 3),
+        (3, 7),
+        (8, 8),
+        (8, 1),
+        (1, 8),
+        (9, 16),
+        (16, 9),
+        (31, 33),
+        (33, 31),
+        (32, 32),
+        (40, 300),
+        (300, 40),
+        (128, 4),
+        (4, 128),
+        (64, 64), // multiple rayon strips, exact JR boundary
+    ];
+
+    /// A transpose must move values, never change them: multiset equality
+    /// of the bit patterns (NaN payloads and -0.0 included).
+    #[test]
+    fn transpose_is_a_permutation() {
+        for &(m, n) in SHAPES {
+            let err = fill(m, n, 0x7000_0000_0000_0001u64 ^ m as u64 ^ (n as u64) << 32);
+            let mut a: Vec<u32> = err.iter().map(|v| v.to_bits()).collect();
+            a.sort_unstable();
+            let mut b: Vec<u32> = transpose_err(&err, m, n)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            b.sort_unstable();
+            assert_eq!(a, b, "m={m} n={n}: transpose changed the value multiset");
+        }
+    }
+
+    /// Roundtrip: transpose(N x M) back must be the identity — including
+    /// the rayon strip remainder handling on both passes.
+    #[test]
+    fn transpose_roundtrips() {
+        for &(m, n) in SHAPES {
+            let err = fill(m, n, 0x5EED_0000_0000_00AAu64 ^ n as u64 ^ (m as u64) << 32);
+            let once = transpose_err(&err, m, n);
+            let back = transpose_err(&once, n, m);
+            for (i, (x, y)) in once.iter().zip(back.iter()).enumerate() {
+                debug_assert_eq!(err.len(), back.len());
+                assert_eq!(
+                    y.to_bits(),
+                    err[i].to_bits(),
+                    "m={m} n={n} idx={i}: roundtrip differs"
+                );
+                let _ = x;
+            }
+        }
+    }
+
+    /// Non-square is the NORM (m = out-dim, n = in-dim of the layer).
+    /// Bitwise agreement with the naive double loop on every element,
+    /// plus specials that must survive any code path verbatim: ±0.0,
+    /// denormals, NaN (payload bits), infinities, extremes.
+    #[test]
+    fn transpose_handles_non_square() {
+        for &(m, n) in SHAPES {
+            let mut err = fill(m, n, 0xC0FF_EE00_DEAD_0001u64 ^ m as u64 ^ n as u64);
+            // Sprinkle specials at deterministic positions.
+            let specials = [
+                0.0f32,
+                -0.0,
+                f32::MIN_POSITIVE,
+                1e-40,
+                f32::MAX,
+                f32::MIN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+            ];
+            for (k, s) in specials.iter().enumerate() {
+                if err.is_empty() {
+                    break;
+                }
+                let idx = (k * 977 + 3) % err.len();
+                err[idx] = *s;
+            }
+            let got = transpose_err(&err, m, n);
+            let want = naive(&err, m, n);
+            assert_eq!(got.len(), want.len(), "m={m} n={n}: length");
+            for (j, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "m={m} n={n} out[{j}]: got {g:e} want {w:e}"
+                );
+            }
+        }
+    }
+
+    /// Degenerate axes: a transpose of nothing is nothing, and a 0-length
+    /// axis must not panic in the blocked/rayon paths.
+    #[test]
+    fn transpose_handles_empty_axes() {
+        assert!(transpose_err(&[], 0, 0).is_empty());
+        assert!(transpose_err(&[], 0, 5).is_empty());
+        assert!(transpose_err(&[], 5, 0).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod proofs {
+    use super::next_f32;
+
     /// The K-block size the GEMM resets its accumulator at. MUST mirror
     /// `bias_correction.rs::GEMM_K_CHUNK` — if that constant ever moves, this
     /// test module must move with it (asserted by
     /// [`k_chunk_constant_mirrors_the_kernel`]).
     const K_CHUNK: usize = 128;
-
-    /// Deterministic xorshift-based pseudo-random f32 in `[-1.0, 1.0)`.
-    /// No RNG crate: the proofs must run with zero new dependencies and be
-    /// reproducible bit-for-bit on every platform.
-    fn next_f32(state: &mut u64) -> f32 {
-        *state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*state >> 40) as f32 / (1 << 24) as f32) - 1.0
-    }
 
     // ---------------------------------------------------------------------
     // The verbatim PRE-CHANGE kernels. Kept here, unmodified, as the oracle
