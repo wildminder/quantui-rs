@@ -20,6 +20,11 @@ pub mod quant_nvfp4;
 pub mod stream;
 // Enabled early: Phase 1 (safetensors IO) scaffolding created in Phase 0 per spec.
 pub mod bias_correction;
+// Bit-exactness proofs + (Phase 1 of the SIMD plan) the packed-Err transpose
+// and the 8x8 AVX2 microkernel for the bias-correction GEMM. The proofs in
+// `bias_gemm::proofs` are the gate for the whole optimization: they prove
+// `f32::mul_add` reproduces the f64-emulated FMA bitwise.
+pub mod bias_gemm;
 pub mod discover;
 // IQ-family lattice infrastructure (Unsloth plan Phase 4.3 IQ slice).
 // gguf_iq_grid is the runtime port (init/kmap/neighbors);
