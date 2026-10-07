@@ -19,8 +19,9 @@ does and how to run it, start at the [README](README.md).
 <a name="rejected"></a>
 ## ❯ Tried, measured, rejected
 
-Three techniques from the literature were implemented, measured on this crate's
-own metric, and deliberately **not** recommended. Recording them is a result,
+Four techniques — three from the literature and one from this repo's own
+optimization plan — were implemented, measured on this crate's own metric,
+and deliberately **not** recommended. Recording them is a result,
 not a failure — a reader deciding whether to try one of these deserves to know
 it was already tried here:
 
@@ -29,6 +30,7 @@ it was already tried here:
 | MXFP8 E8M0 `4/3` scale compensation | arXiv:2509.23202 | **Bit-exact no-op.** `rel_l2` ratio `1.000000` — 0.00% change |
 | MXAttention `Qmax = 7.25` | arXiv:2607.24377 | **Inert.** No output byte changes |
 | INT8 absmax clip ratio 0.9 | QuaRot, arXiv:2404.00456 | **31×–1.4e4× worse** in weight-space L2; 0 of 4 distributions improved |
+| Scalar `f32::mul_add` for the bias-GEMM f64 FMA detour | bias-GEMM SIMD plan, Step 2.2 (`docs/plans/2026-10-06`) | **4× slower end-to-end.** `bench_bias_probe` int8: 31 s → 122 s |
 
 The MXFP8 case is the sharpest: E4M3 halves exactly, so doubling the scale and
 halving every code reconstructs the identical `f32`, and this crate's scale
@@ -42,6 +44,17 @@ rounding error for *unbounded* saturation error, and INT8's 127 levels leave
 only ~1.5e-5 of rounding error to recover; the published gain is a perplexity
 result on activations, and this crate quantizes weights and does not measure
 perplexity.
+
+The `mul_add` entry is a codegen trap, not a numerics one: the swap itself is
+bitwise-identical to the f64 detour (proven adversarially in
+`crates/quant-core/src/bias_gemm.rs`), but this crate ships baseline x86-64 —
+the release profile sets no `target-cpu`, and neither does CI. Without the
+FMA target feature, `f32::mul_add` compiles to a *slower* software `fmaf` than
+the f64 emulation it replaced: 1.14 ms (f64 detour) vs 2.55 ms (software
+`fmaf`) per 4096² tile on the default target, vs 0.37 ms with FMA enabled —
+hence 31 s → 122 s end-to-end. Hardware FMA is only obtainable via
+`#[target_feature(enable = "avx2,fma")]` plus `is_x86_feature_detected!`
+dispatch inside the kernel (plan Step 2.4), never via a crate-baseline scalar.
 
 **The transferable lesson:** the one technique that worked runs a real *search*
 and lets the data pick a point; the three that failed each nudged a hardcoded

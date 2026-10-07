@@ -134,7 +134,8 @@ mod proofs {
         for &n in &shapes {
             for &sa in &scales {
                 for &sb in &scales {
-                    let mut st = 0x1234_5678_9ABC_DEF0u64 ^ (n as u64)
+                    let mut st = 0x1234_5678_9ABC_DEF0u64
+                        ^ (n as u64)
                         ^ (sa.to_bits() as u64).rotate_left(17)
                         ^ (sb.to_bits() as u64).rotate_left(33);
                     let xs: Vec<f32> = (0..n).map(|_| next_f32(&mut st) * sa).collect();

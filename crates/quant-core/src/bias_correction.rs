@@ -515,25 +515,43 @@ mod tests {
     fn parallel_correct_bias_is_bit_identical_to_sequential() {
         // Small but non-trivial dims; n not a multiple of 128 to exercise the
         // K-chunk tail, m spanning both the 32-group and ilp-tail reduction paths.
-        let (m, n) = (40usize, 300usize);
-        let mut state = 0x1234_5678_9ABC_DEF0u64;
-        let x: Vec<f32> = (0..CALIB_SAMPLES * n)
-            .map(|_| next_f32(&mut state))
-            .collect();
-        let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
-        let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
-        let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();
+        // Phase 1 Step 2.2 extended the sweep from one shape to six. The
+        // sequential oracle below runs the ORIGINAL f64-emulated FMA verbatim,
+        // so this is the standing production-vs-prechange guard: whatever the
+        // GEMM body ends up being (the f64 detour today, the packed AVX2/FMA
+        // microkernel of the later plan steps next), it must stay
+        // bit-identical to that oracle. Shapes deliberately straddle: m < 8
+        // (scalar_outer_sum), m crossing 8/32 group boundaries, m in the
+        // ilp tail; n below/at/above the 128 K-chunk and at the 4096
+        // production width.
+        const SHAPES: &[(usize, usize)] = &[
+            (40, 300),  // original case: m in 32-group, ilp tail; n % 128 != 0
+            (1, 129),   // single row, K-chunk tail (129 = 128 + 1)
+            (7, 128),   // m < 8 -> scalar_outer_sum path, exact chunk
+            (8, 128),   // m == 8 boundary
+            (9, 257),   // m one past the boundary, two chunks + tail
+            (33, 4096), // production width, 32 K-chunks, m in ilp tail
+        ];
+        for &(m, n) in SHAPES {
+            let mut state = 0x1234_5678_9ABC_DEF0u64 ^ (m as u64).rotate_left(17) ^ n as u64;
+            let x: Vec<f32> = (0..CALIB_SAMPLES * n)
+                .map(|_| next_f32(&mut state))
+                .collect();
+            let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+            let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+            let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();
 
-        let par = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, None).expect("no cancel");
-        let seq = sequential_correct_bias(&x, &w_orig, &w_dq, &bias, m, n);
+            let par = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, None).expect("no cancel");
+            let seq = sequential_correct_bias(&x, &w_orig, &w_dq, &bias, m, n);
 
-        assert_eq!(par.len(), seq.len());
-        for (i, (a, b)) in par.iter().zip(seq.iter()).enumerate() {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "bias[{i}] differs: parallel={a} sequential={b}"
-            );
+            assert_eq!(par.len(), seq.len(), "m={m} n={n}: length mismatch");
+            for (i, (a, b)) in par.iter().zip(seq.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "m={m} n={n} bias[{i}] differs: parallel={a} sequential={b}"
+                );
+            }
         }
     }
 
