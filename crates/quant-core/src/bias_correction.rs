@@ -19,7 +19,10 @@
 //!   accumulator every 128 elements of K and sums the per-chunk partials
 //!   left-to-right; within a chunk each step is a correctly-rounded FMA
 //!   `part = round_f32(f64(x_k) * f64(e_k) + f64(part))`. Bit-exact vs torch
-//!   2.13.0+cpu at S=3072 for K in {64, 128, 256}.
+//!   2.13.0+cpu at S=3072 for K in {64, 128, 256}. Since Phase 1 Step 2.5
+//!   the body is `bias_gemm::GemmBias`: the packed AVX2/FMA microkernel on
+//!   x86_64 with AVX2+FMA, the scalar f64 kernel above everywhere else —
+//!   the two are proven bit-identical.
 //! - `sum(dim=0)`: dispatches to `cascade_sum` in
 //!   `aten/src/ATen/native/cpu/SumKernel.cpp` (NOT Reduce.h). With
 //!   VF = Vectorized<f32>::size() = 8 (AVX2):
@@ -254,21 +257,28 @@ pub fn correct_bias(
     // GEMM stage: out_err[s, i] = sum_j X[s, j] * err[i, j], emulating
     // oneDNN's f32 sgemm microkernel. The kernel does NOT run one unbroken
     // FMA chain over K: it resets the f32 accumulator every 128 elements of
-    // K (GEMM_K_CHUNK) and sums the per-chunk partials left-to-right. Within
-    // a chunk each step is a correctly-rounded FMA (product exact in f64,
-    // added to the previous rounded f32 partial, rounded once back to f32).
-    // For K <= 128 this degenerates to a single chain. Validated bit-exact
-    // vs torch 2.13.0+cpu at S=3072 for K in {64, 128, 256}
-    // (target/probe_gemm_final.py).
+    // K (bias_gemm::GEMM_K_CHUNK) and sums the per-chunk partials
+    // left-to-right. Within a chunk each step is a correctly-rounded FMA
+    // (product exact in f64, added to the previous rounded f32 partial,
+    // rounded once back to f32). For K <= 128 this degenerates to a single
+    // chain. Validated bit-exact vs torch 2.13.0+cpu at S=3072 for K in
+    // {64, 128, 256} (target/probe_gemm_final.py).
+    //
+    // Phase 1 Step 2.5: the GEMM body lives in `bias_gemm::GemmBias` — on
+    // AVX2+FMA hosts it runs the packed 8-lane FMA microkernel, elsewhere
+    // the scalar f64 kernel below (gemm_block_scalar). Both are proven
+    // bit-identical to this function's former inline loop (the six-shape
+    // sweep below against the sequential f64 oracle; bias_gemm's own
+    // battery against an independent spec), so the emitted artifact does
+    // not depend on the dispatch decision.
     //
     // Parallelization (bit-safe): each output element out_err[s, i] owns its
-    // own K-accumulation chain, independent of every other element, so we may
-    // schedule the (s, i) work across threads in any order without changing a
-    // single accumulated bit. We parallelize over `s` (rows of the output /
-    // calibration rows), keeping the reference's inner loop order (i, then j)
-    // intact inside each task — this preserves the original cache behavior
-    // (the calibration row `xs` is loaded once and reused across all `i`).
-    // Same order-independence argument as the block-amax pass (Phase 11.1).
+    // own K-accumulation chain, independent of every other element, so we
+    // may schedule the (s, i) work across threads in any order without
+    // changing a single accumulated bit. We parallelize over `s` (rows of
+    // the output / calibration rows) in BLOCKS OF 8 — 384 tasks at
+    // S=3072 — keeping each task's per-element chain intact. Same
+    // order-independence argument as the block-amax pass (Phase 11.1).
     //
     // The `err` matrix (w_orig - w_dq, "the err tensor itself is an f32 torch
     // op") is materialized ONCE up front and shared read-only across tasks.
@@ -276,47 +286,30 @@ pub fn correct_bias(
     // `ro[j] - rd[j]` inline, and it removes (S-1)·m·n redundant subtractions.
     //
     // Cancellation: `try_for_each` short-circuits — once any task sees the
-    // flag set it returns Err and rayon stops scheduling further tasks, so a
-    // Ctrl-C takes effect within one task's worth of work (a few ms), not
-    // after the whole (S, M) GEMM.
-    const GEMM_K_CHUNK: usize = 128;
+    // flag set it returns Err and rayon stops scheduling further tasks, so
+    // a Ctrl-C takes effect within one 8-row block (~ms), not after the
+    // whole (S, M) GEMM.
     let s_count = CALIB_SAMPLES;
     let err: Vec<f32> = (0..w_orig.len())
         .into_par_iter()
         .map(|k| w_orig[k] - w_dq[k])
         .collect();
+    let gemm = crate::bias_gemm::GemmBias::new(&err, m, n);
     let mut out_err = vec![0.0f32; s_count * m];
+    const GEMM_ROWS_PER_BLOCK: usize = 8;
     let gemm_cancelled = out_err
-        .par_chunks_mut(m)
+        .par_chunks_mut(m * GEMM_ROWS_PER_BLOCK)
         .enumerate()
-        .try_for_each(|(s, row)| {
+        .try_for_each(|(bi, block)| {
             if let Some(flag) = cancel {
                 if flag.load(Ordering::Relaxed) {
                     return Err(());
                 }
             }
-            let xs = &x[s * n..(s + 1) * n];
-            for i in 0..m {
-                let er = &err[i * n..(i + 1) * n];
-                let mut acc = 0.0f32;
-                let mut j0 = 0usize;
-                let mut first = true;
-                while j0 < n {
-                    let j1 = (j0 + GEMM_K_CHUNK).min(n);
-                    let mut part = 0.0f32;
-                    for j in j0..j1 {
-                        part = ((xs[j] as f64) * (er[j] as f64) + (part as f64)) as f32;
-                    }
-                    acc = if first {
-                        part
-                    } else {
-                        ((acc as f64) + (part as f64)) as f32
-                    };
-                    first = false;
-                    j0 = j1;
-                }
-                row[i] = acc;
-            }
+            let s0 = bi * GEMM_ROWS_PER_BLOCK;
+            let rows = block.len() / m;
+            let x_blk = &x[s0 * n..(s0 + rows) * n];
+            gemm.gemm_block(x_blk, block);
             Ok(())
         })
         .is_err();
@@ -515,15 +508,15 @@ mod tests {
     fn parallel_correct_bias_is_bit_identical_to_sequential() {
         // Small but non-trivial dims; n not a multiple of 128 to exercise the
         // K-chunk tail, m spanning both the 32-group and ilp-tail reduction paths.
-        // Phase 1 Step 2.2 extended the sweep from one shape to six. The
-        // sequential oracle below runs the ORIGINAL f64-emulated FMA verbatim,
-        // so this is the standing production-vs-prechange guard: whatever the
-        // GEMM body ends up being (the f64 detour today, the packed AVX2/FMA
-        // microkernel of the later plan steps next), it must stay
-        // bit-identical to that oracle. Shapes deliberately straddle: m < 8
-        // (scalar_outer_sum), m crossing 8/32 group boundaries, m in the
-        // ilp tail; n below/at/above the 128 K-chunk and at the 4096
-        // production width.
+        // Phase 1 Step 2.2 extended the sweep from one shape to six; Step 2.5
+        // added (1, 4096). The sequential oracle below runs the ORIGINAL
+        // f64-emulated FMA verbatim, so this is the standing
+        // production-vs-prechange guard: whatever the GEMM body ends up being
+        // (the f64 detour before 2.5, the dispatched packed AVX2/FMA
+        // microkernel since), it must stay bit-identical to that oracle.
+        // Shapes deliberately straddle: m < 8 (scalar_outer_sum), m crossing
+        // 8/32 group boundaries, m in the ilp tail; n below/at/above the
+        // 128 K-chunk and at the 4096 production width.
         const SHAPES: &[(usize, usize)] = &[
             (40, 300),  // original case: m in 32-group, ilp tail; n % 128 != 0
             (1, 129),   // single row, K-chunk tail (129 = 128 + 1)
@@ -531,6 +524,7 @@ mod tests {
             (8, 128),   // m == 8 boundary
             (9, 257),   // m one past the boundary, two chunks + tail
             (33, 4096), // production width, 32 K-chunks, m in ilp tail
+            (1, 4096),  // single output row at production width
         ];
         for &(m, n) in SHAPES {
             let mut state = 0x1234_5678_9ABC_DEF0u64 ^ (m as u64).rotate_left(17) ^ n as u64;
@@ -575,5 +569,66 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let res = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, Some(&cancel));
         assert!(res.is_some(), "unset flag must complete");
+    }
+
+    /// Phase 1 Step 2.5: with the flag pre-set, the FIRST 8-row block must
+    /// observe it and abort before any GEMM work. The behavioral guard is
+    /// the `None` return (a run that ignores the flag completes and returns
+    /// `Some`). No wall-clock assert: at unit-test shapes a full packed GEMM
+    /// is sub-second, so a timing bound could not distinguish "cancelled"
+    /// from "ran everything" — the None-assertion is the guard that bites,
+    /// and the block-level flag check (first statement of the task closure)
+    /// is the structure that keeps Ctrl-C latency at one 8-row block.
+    #[test]
+    fn correct_bias_cancels_within_one_block() {
+        let (m, n) = (4096usize, 1024usize);
+        // Constant fill: allocation cost only. The GEMM's cost is
+        // value-independent, and err = w_orig - w_dq stays non-zero.
+        let x = vec![0.25f32; CALIB_SAMPLES * n];
+        let w_orig = vec![1.0f32; m * n];
+        let w_dq = vec![0.5f32; m * n];
+        let bias = vec![0.75f32; m];
+
+        let cancel = AtomicBool::new(true);
+        let res = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, Some(&cancel));
+        assert!(
+            res.is_none(),
+            "pre-set flag: the first 8-row block must abort before any GEMM"
+        );
+    }
+
+    /// Phase 1 Step 2.5: the module header claims thread-count independence
+    /// ("validated ... thread counts 1/3/12"); make it a tested claim. The
+    /// 8-row block split must not change a single accumulated bit: every
+    /// output element owns its own K-chain.
+    #[test]
+    fn correct_bias_is_deterministic_across_thread_counts() {
+        let (m, n) = (33usize, 257usize);
+        let mut state = 0x5EED_1234u64;
+        let x: Vec<f32> = (0..CALIB_SAMPLES * n)
+            .map(|_| next_f32(&mut state))
+            .collect();
+        let w_orig: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+        let w_dq: Vec<f32> = (0..m * n).map(|_| next_f32(&mut state)).collect();
+        let bias: Vec<f32> = (0..m).map(|_| next_f32(&mut state)).collect();
+
+        let reference = correct_bias(&x, &w_orig, &w_dq, &bias, m, n, None).expect("no cancel");
+        for &threads in &[1usize, 3, 12] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool build");
+            let got = pool
+                .install(|| correct_bias(&x, &w_orig, &w_dq, &bias, m, n, None))
+                .expect("no cancel");
+            assert_eq!(got.len(), reference.len(), "threads={threads}: length");
+            for (i, (a, b)) in got.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "threads={threads}: bias[{i}] differs"
+                );
+            }
+        }
     }
 }

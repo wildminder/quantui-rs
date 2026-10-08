@@ -754,17 +754,23 @@ mod proofs {
     // Structural guard: the mirrored constant.
     // ---------------------------------------------------------------------
 
-    /// `K_CHUNK` here must equal `GEMM_K_CHUNK` in the production kernel. The
-    /// proofs are about THE reference order; if the two constants drift the
+    /// `K_CHUNK` here must equal the K-block constant in every kernel. The
+    /// proofs are about THE reference order; if the constants drift the
     /// proofs silently stop testing the real code path. Read the source and
     /// compare literally — a doc test would not see runtime drift.
+    ///
+    /// Since Step 2.5, bias_correction.rs delegates its GEMM to this module
+    /// (see `correct_bias_goes_through_the_dispatcher`), so its pin is the
+    /// sequential f64 ORACLE's local `K_CHUNK`; the production constants are
+    /// the ones below.
     #[test]
     fn k_chunk_constant_mirrors_the_kernel() {
         let src = include_str!("bias_correction.rs");
         assert!(
-            src.contains("const GEMM_K_CHUNK: usize = 128;"),
-            "bias_correction.rs no longer declares GEMM_K_CHUNK = 128; \
-             update K_CHUNK in this module in the same commit"
+            src.contains("const K_CHUNK: usize = 128;"),
+            "bias_correction.rs no longer declares its sequential oracle's \
+             K_CHUNK = 128; the oracle, this module, and the proofs must \
+             move together"
         );
         let src2 = include_str!("convrot.rs");
         assert!(
@@ -781,18 +787,39 @@ mod proofs {
         assert_eq!(K_CHUNK, 128);
     }
 
+    /// Step 2.5 wiring pin: `correct_bias` must run its GEMM through
+    /// `bias_gemm::GemmBias` (packed microkernel or the proven-identical
+    /// scalar fallback) — not through a private re-inline. A re-inline is
+    /// not automatically wrong, but it must be a CONSCIOUS change: this pin
+    /// fails and forces moving the bit-identity battery in the same commit.
+    #[test]
+    fn correct_bias_goes_through_the_dispatcher() {
+        let src = include_str!("bias_correction.rs");
+        assert!(
+            src.contains("GemmBias::new("),
+            "correct_bias no longer builds bias_gemm::GemmBias; if the GEMM \
+             moved, the k_chunk/f64-line pins and the microkernel battery \
+             must move with it in the same commit"
+        );
+    }
+
     /// The f64-emulation line and the partial-add line must stay VERBATIM in
     /// every file that carries a copy of the kernel. A copy that drifts is a
     /// silent parity break: this module's oracle, the Step 2.4 fallback, the
-    /// microkernel tail, and both production kernels must round identically.
-    /// The pins are per-file because convrot names its operands differently.
+    /// microkernel tail, the sequential oracle in bias_correction, and both
+    /// production kernels must round identically. The pins are per-file
+    /// because the copies name their operands differently. Since Step 2.5,
+    /// bias_correction.rs's copy is its sequential ORACLE (the production
+    /// GEMM lives in this module).
     #[test]
     fn f64_emulation_line_is_verbatim_everywhere() {
         let pins: &[(&str, &[&str])] = &[
             (
                 "bias_correction.rs",
                 &[
-                    "part = ((xs[j] as f64) * (er[j] as f64) + (part as f64)) as f32;",
+                    // sequential_correct_bias oracle (the standing f64
+                    // reference; operand named `e` there):
+                    "part = ((xs[j] as f64) * (e as f64) + (part as f64)) as f32;",
                     "((acc as f64) + (part as f64)) as f32",
                 ],
             ),
