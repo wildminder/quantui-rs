@@ -917,7 +917,12 @@ mod proofs {
 #[cfg(test)]
 mod microkernel_tests {
     use super::next_f32;
-    use super::{transpose_err, GemmBias};
+    use super::GemmBias;
+    // Only referenced inside the x86_64 blocks below (the direct
+    // microkernel comparisons); a bare import is unused — and a
+    // `-D warnings` failure — on every other target's lib-test build.
+    #[cfg(target_arch = "x86_64")]
+    use super::transpose_err;
 
     /// INDEPENDENT spec implementation written from the reference
     /// description — out[q][i] = K-chunk-128 dot of x row q and err row i,
