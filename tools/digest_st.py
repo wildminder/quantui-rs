@@ -58,7 +58,7 @@ def main() -> None:
             dt, shape, h = d[name]
             print(f"{name}\t{dt}\t{shape}\t{h}")
     if len(all_out) == 2:
-        (pa, pb), (da, db) = all_out.items()
+        (pa, da), (pb, db) = list(all_out.items())
         keys = set(da) | set(db)
         diffs = [k for k in keys if da.get(k) != db.get(k)]
         only_a = [k for k in da if k not in db]
