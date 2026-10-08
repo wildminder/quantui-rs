@@ -316,17 +316,14 @@ mod x86 {
 }
 
 /// Cached AVX2+FMA detection: one CPUID decision for the whole process.
+/// Exists only on x86_64: with the `GemmBias` x86-only state cfg-gated there
+/// is no caller left on other targets, so no stub is needed there.
 #[cfg(target_arch = "x86_64")]
 fn avx2_fma_detected() -> bool {
     static DETECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DETECT.get_or_init(|| {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     })
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn avx2_fma_detected() -> bool {
-    false
 }
 
 /// Runtime-dispatch engine for the bias-correction GEMM.
@@ -360,6 +357,11 @@ pub struct GemmBias<'a> {
     /// scalar fallback.
     err: &'a [f32],
     /// Packed [n, m] — present only when the microkernel will run.
+    /// x86_64-only: the AVX2 microkernel is this field's only reader, so on
+    /// other targets the field (and the transpose that fills it) must not
+    /// exist — a field no compiled reader can reach is `dead_code` under
+    /// `-D warnings`, which is how the macOS (aarch64) CI job failed.
+    #[cfg(target_arch = "x86_64")]
     err_t: Option<Vec<f32>>,
     m: usize,
     n: usize,
@@ -369,12 +371,21 @@ impl<'a> GemmBias<'a> {
     /// `err` is the caller's (w_orig - w_dq) buffer, [m, n] row-major.
     pub fn new(err: &'a [f32], m: usize, n: usize) -> Self {
         debug_assert_eq!(err.len(), m * n);
+        // x86_64-only state; see the field doc. On every other target the
+        // engine is just the scalar fallback and `new` stores nothing extra.
+        #[cfg(target_arch = "x86_64")]
         let err_t = if avx2_fma_detected() {
             Some(transpose_err(err, m, n))
         } else {
             None
         };
-        Self { err, err_t, m, n }
+        Self {
+            err,
+            #[cfg(target_arch = "x86_64")]
+            err_t,
+            m,
+            n,
+        }
     }
 
     /// Compute one block of calibration rows: `x_blk` is [s_blk, n]
