@@ -25,7 +25,7 @@ use rlx_gguf::{quantize, GgmlType, GgufWriter, MetaValue};
 
 use crate::discover::{classify_input, resolve_single_file, resolve_union, InputKind};
 use crate::dtype::DType;
-use crate::gguf_names::{hf_to_gguf_name, load_arch_info};
+use crate::gguf_names::{gemma_norm_plus_one, hf_to_gguf_name, load_arch_info};
 use crate::gguf_registry::{self, GgufScheme};
 use crate::{gguf_quants, llama_policy, st_io::reader::SafetensorsReader};
 
@@ -307,7 +307,7 @@ pub fn convert_hf_to_gguf(
         // Count over the GGUF-side names, in processing order.
         let gguf_names: Vec<String> = names
             .iter()
-            .map(|(n, _)| hf_to_gguf_name(n).unwrap_or_else(|| n.clone()))
+            .map(|(n, _)| hf_to_gguf_name(n, &arch).unwrap_or_else(|| n.clone()))
             .collect();
         let refs: Vec<&str> = gguf_names.iter().map(|s| s.as_str()).collect();
         Some(llama_policy::count_state(&refs, false))
@@ -377,6 +377,7 @@ pub fn convert_hf_to_gguf(
         // ── Phase A ──
         let resolved = resolve_one_tensor(
             cfg,
+            &arch,
             entry,
             engine,
             &mut policy_state,
@@ -930,6 +931,7 @@ struct ResolvedTensor {
 #[allow(clippy::too_many_arguments)]
 fn resolve_one_tensor(
     cfg: &GgufConvertConfig,
+    arch: &str,
     entry: &gguf_registry::RegistryEntry,
     engine: llama_policy::LlamaPolicy,
     policy_state: &mut Option<llama_policy::PolicyState>,
@@ -942,7 +944,7 @@ fn resolve_one_tensor(
     let raw = reader.tensor_bytes(name)?;
     let ndim = info.shape.len();
 
-    let gguf_name = hf_to_gguf_name(name).unwrap_or_else(|| name.to_string());
+    let gguf_name = hf_to_gguf_name(name, arch).unwrap_or_else(|| name.to_string());
     let mut warnings: Vec<String> = Vec::new();
     let mut row_demoted = false;
 
@@ -1055,10 +1057,24 @@ fn resolve_one_tensor(
     let ggml = scheme_to_ggml(scheme);
 
     // Decode to f32 (GGUF encoders consume f32).
-    let floats = decode_f32(info.dtype, raw).ok_or_else(|| GgufError::BadDtype {
+    let mut floats = decode_f32(info.dtype, raw).ok_or_else(|| GgufError::BadDtype {
         name: name.to_string(),
         dtype: info.dtype,
     })?;
+
+    // Gemma-family norm pre-bake: store `1 + w` for every `*norm.weight`
+    // (the HF runtime multiplies by `(1 + w)` inside RMSNorm; llama.cpp
+    // folds the offset into the stored weight — see gguf_names.rs
+    // `gemma_norm_plus_one`). The unsloth gemma3 reference holds the exact
+    // f32 sum, which this decode-to-f32-then-add reproduces bit-for-bit.
+    // Name-based on the HF side, exactly like the reference converter — no
+    // shape gate. Runs before ANY encoder consumes `floats`; 1-D norms are
+    // F32-only by the shared convention, but nothing here relies on that.
+    if gemma_norm_plus_one(arch, name) {
+        for v in floats.iter_mut() {
+            *v += 1.0;
+        }
+    }
 
     // Phase 4.4 entry semantics (llama-quant.cpp:1222-1251, :803-822):
     // - no imatrix configured → legacy behaviour: everything goes

@@ -148,8 +148,14 @@ impl VerifyReport {
 /// Build the ours→reference name map: map OUR HF-ish names through
 /// [`hf_to_gguf_name`] (identities pass through), so a converted
 /// wrapped-prefix checkpoint lines up with the reference's llama.cpp names.
-fn our_name_to_gguf(name: &str) -> String {
-    hf_to_gguf_name(name).unwrap_or_else(|| name.to_string())
+///
+/// `arch` comes from OUR file's `general.architecture` metadata — the
+/// `post_attention_layernorm` arm maps differently for gemma2/gemma3 than
+/// for the llama family, and the re-map must agree with however the file
+/// was converted. Empty when the metadata is absent (arch-blind, the
+/// pre-gemma-split behavior).
+fn our_name_to_gguf(name: &str, arch: &str) -> String {
+    hf_to_gguf_name(name, arch).unwrap_or_else(|| name.to_string())
 }
 
 /// Spec-conformance scan of our file (productized diag_vibevoice_q8.py):
@@ -267,6 +273,12 @@ pub fn verify_against_with_quality(
     let mut report = VerifyReport::default();
     report.spec_violations = scan_spec_violations(&fo);
 
+    // OUR file's declared architecture, for the arch-aware name re-map.
+    let our_arch = match fo.metadata.get("general.architecture") {
+        Some(rlx_gguf::MetaValue::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+
     // Reference name set.
     let mut ref_names: BTreeMap<&str, &rlx_gguf::GgufTensor> = BTreeMap::new();
     for (n, t) in &fr.tensors {
@@ -275,11 +287,11 @@ pub fn verify_against_with_quality(
 
     // Walk OUR tensors in mapped-name order (deterministic output).
     let mut our_entries: Vec<(&String, &rlx_gguf::GgufTensor)> = fo.tensors.iter().collect();
-    our_entries.sort_by_key(|(n, _)| our_name_to_gguf(n));
+    our_entries.sort_by_key(|(n, _)| our_name_to_gguf(n, &our_arch));
 
     let mut matched_ref: Vec<String> = Vec::new();
     for (name, t) in our_entries {
-        let gguf_name = our_name_to_gguf(name);
+        let gguf_name = our_name_to_gguf(name, &our_arch);
         let Some(rt) = ref_names.get(gguf_name.as_str()) else {
             report.ours_only.push(gguf_name);
             continue;
