@@ -51,3 +51,11 @@ harness = false
 [[bench]]
 name = "quality_error"
 harness = false
+
+# Bias-GEMM plan Step 2.6: kernel-level criterion timing for the three GEMM
+# routes (f64-detour oracle, the recorded scalar mul_add negative, the packed
+# AVX2/FMA route) plus the Err transpose cost. Measurement only — NOT a
+# pass/fail gate (benches do not run in `cargo test`).
+[[bench]]
+name = "bias_gemm"
+harness = false
