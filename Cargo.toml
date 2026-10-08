@@ -3,14 +3,17 @@ resolver = "2"
 members = ["crates/quant-core", "crates/quant-cli"]
 
 [workspace.package]
-# 0.3.1 — a plain HuggingFace folder holding one `model.safetensors` is
-# accepted by `quantize` / `cast` / `info` again. The folder was classified as
-# a single-file input but never resolved to the file inside it, so Windows
-# rejected the directory itself ("Access is denied", os error 5). `gguf` also
-# derives the model dir from that resolution now, so a folder input
-# auto-detects its arch instead of writing an empty one. Every quantizer is
-# untouched and emitted bytes are unchanged for file and sharded inputs.
-version = "0.3.1"
+# 0.4.0 — the bias-correction GEMM runs through a packed AVX2/FMA
+# microkernel with runtime feature detection (16× the old scalar path on
+# one core); emitted safetensors bytes are unchanged and all five parity
+# digests are identical. GGUF conversion fixes the gemma2/3 family:
+# the four arch-dependent layer-norm names map correctly now, and every
+# gemma `*norm.weight` is stored as `1 + w` (the llama.cpp convention)
+# — previous gemma GGUFs were loader-breaking. Real-model validated:
+# yue2 int8/int8_convrot byte-identical to the pre-change baseline;
+# functiongemma Q8_0/BF16/UD-Q8_K_XL byte-identical to the unsloth
+# references (236/236 tensors each).
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
