@@ -101,7 +101,7 @@ fn dot_scalar_mul_add(xs: &[f32], er: &[f32]) -> f32 {
     acc
 }
 
-fn run_gemm<F>(x: &Vec<f32>, err: &Vec<f32>, dot: F) -> Vec<f32>
+fn run_gemm<F>(x: &[f32], err: &[f32], dot: F) -> Vec<f32>
 where
     F: Fn(&[f32], &[f32]) -> f32,
 {
