@@ -118,8 +118,9 @@ pub fn transpose_err(err: &[f32], m: usize, n: usize) -> Vec<f32> {
 }
 
 /// The K-block size the GEMM resets its accumulator at — MUST mirror
-/// `bias_correction.rs::GEMM_K_CHUNK` and `convrot.rs::GEMM_K_CHUNK`
-/// (asserted by `proofs::k_chunk_constant_mirrors_the_kernel`).
+/// `convrot.rs::GEMM_K_CHUNK` and the sequential oracle's `K_CHUNK` in
+/// `bias_correction.rs` (asserted by
+/// `proofs::k_chunk_constant_mirrors_the_kernel`).
 const GEMM_K_CHUNK: usize = 128;
 
 /// The verbatim production kernel: a K-chunk-128 f64-emulated FMA chain,
@@ -537,9 +538,10 @@ mod transpose_tests {
 mod proofs {
     use super::next_f32;
 
-    /// The K-block size the GEMM resets its accumulator at. MUST mirror
-    /// `bias_correction.rs::GEMM_K_CHUNK` — if that constant ever moves, this
-    /// test module must move with it (asserted by
+    /// The K-block size the GEMM resets its accumulator at. MUST mirror the
+    /// production `GEMM_K_CHUNK` above and the sequential oracle's `K_CHUNK`
+    /// in `bias_correction.rs` — if either ever moves, this test module
+    /// must move with it (asserted by
     /// [`k_chunk_constant_mirrors_the_kernel`]).
     const K_CHUNK: usize = 128;
 
@@ -765,23 +767,34 @@ mod proofs {
     /// the ones below.
     #[test]
     fn k_chunk_constant_mirrors_the_kernel() {
+        // The needles are assembled via concat! so no VERBATIM copy of a
+        // pinned declaration lives in this file's own assertion lines: with
+        // plain literals, the bias_gemm.rs self-check matched its own needle
+        // and could NEVER fail — drill-verified (plan §6.5): this pin
+        // passed while the production const was mutated to 64.
+        let gemm_needle = concat!("const GEMM_K", "_CHUNK: usize = 1", "28;");
+        let oracle_needle = concat!("const K", "_CHUNK: usize = 1", "28;");
         let src = include_str!("bias_correction.rs");
         assert!(
-            src.contains("const K_CHUNK: usize = 128;"),
+            src.contains(oracle_needle),
             "bias_correction.rs no longer declares its sequential oracle's \
              K_CHUNK = 128; the oracle, this module, and the proofs must \
              move together"
         );
         let src2 = include_str!("convrot.rs");
         assert!(
-            src2.contains("const GEMM_K_CHUNK: usize = 128;"),
+            src2.contains(gemm_needle),
             "convrot.rs no longer declares GEMM_K_CHUNK = 128; the ConvRot \
              GEMM and the proofs must move together"
         );
+        // Exactly ONE declaration may exist in this file — the production
+        // const. A second (shadowing) declaration, or a moved value, must
+        // be a conscious change that re-pins this count.
         let src3 = include_str!("bias_gemm.rs");
-        assert!(
-            src3.contains("const GEMM_K_CHUNK: usize = 128;"),
-            "bias_gemm.rs no longer declares GEMM_K_CHUNK = 128; the \
+        assert_eq!(
+            src3.matches(gemm_needle).count(),
+            1,
+            "bias_gemm.rs must declare GEMM_K_CHUNK = 128 exactly once; the \
              microkernel, the fallback, and the proofs must move together"
         );
         assert_eq!(K_CHUNK, 128);
@@ -807,45 +820,49 @@ mod proofs {
     /// every file that carries a copy of the kernel. A copy that drifts is a
     /// silent parity break: this module's oracle, the Step 2.4 fallback, the
     /// microkernel tail, the sequential oracle in bias_correction, and both
-    /// production kernels must round identically. The pins are per-file
-    /// because the copies name their operands differently. Since Step 2.5,
+    /// production kernels must round identically. The copies name their
+    /// operands differently, so the pins are per-file. Since Step 2.5,
     /// bias_correction.rs's copy is its sequential ORACLE (the production
     /// GEMM lives in this module).
+    ///
+    /// bias_gemm.rs carries its own copies, so a contains() self-check could
+    /// never fail — ANY copy, including this test's own needle literal,
+    /// satisfied it (drill-verified, plan §6.5). The self-entry therefore
+    /// pins the COPY COUNT: the file must hold exactly the recorded number
+    /// of deliberate copies, and any edit to any copy must consciously
+    /// re-pin the number here.
     #[test]
     fn f64_emulation_line_is_verbatim_everywhere() {
+        // Assembled via concat! so no needle exists VERBATIM in this file's
+        // own text — a plain literal would satisfy the self-counts below.
+        let e_line = concat!(
+            "part = ((xs[j] as f64) * (e as f64) + ",
+            "(part as f64)) as f32;"
+        );
+        let er_line = concat!(
+            "part = ((xs[j] as f64) * (er[j] as f64) + ",
+            "(part as f64)) as f32;"
+        );
+        let ab_line = concat!(
+            "part = ((a[j] as f64) * (b[j] as f64) + ",
+            "(part as f64)) as f32;"
+        );
+        let acc_line = concat!("((acc as f64) + (part as f", "64)) as f32");
         let pins: &[(&str, &[&str])] = &[
             (
                 "bias_correction.rs",
                 &[
                     // sequential_correct_bias oracle (the standing f64
                     // reference; operand named `e` there):
-                    "part = ((xs[j] as f64) * (e as f64) + (part as f64)) as f32;",
-                    "((acc as f64) + (part as f64)) as f32",
+                    e_line, acc_line,
                 ],
             ),
-            (
-                "convrot.rs",
-                &[
-                    "part = ((a[j] as f64) * (b[j] as f64) + (part as f64)) as f32;",
-                    "((acc as f64) + (part as f64)) as f32",
-                ],
-            ),
-            (
-                "bias_gemm.rs",
-                &[
-                    // scalar_dot_kchunk128 (fallback oracle):
-                    "part = ((xs[j] as f64) * (er[j] as f64) + (part as f64)) as f32;",
-                    // microkernel i-tail (packed-layout variant):
-                    "part = ((xs[j] as f64) * (e as f64) + (part as f64)) as f32;",
-                    "((acc as f64) + (part as f64)) as f32",
-                ],
-            ),
+            ("convrot.rs", &[ab_line, acc_line]),
         ];
         for (file, lines) in pins {
             let src = match *file {
                 "bias_correction.rs" => include_str!("bias_correction.rs"),
-                "convrot.rs" => include_str!("convrot.rs"),
-                _ => include_str!("bias_gemm.rs"),
+                _ => include_str!("convrot.rs"),
             };
             for line in *lines {
                 assert!(
@@ -856,6 +873,33 @@ mod proofs {
                 );
             }
         }
+        // Self-pin — deliberate copies in bias_gemm.rs, by count. Today:
+        //   er_line  x2 — scalar_dot_kchunk128, the proofs' pre-change oracle
+        //   e_line   x1 — the microkernel i-tail
+        //   acc_line x8 — module doc, scalar_dot, the microkernel i-tail,
+        //                 the proofs' oracle, the partial-add proof doc and
+        //                 its two inline want-lines, and spec_gemm
+        let src3 = include_str!("bias_gemm.rs");
+        assert_eq!(
+            src3.matches(er_line).count(),
+            2,
+            "the `er[j]` f64-emulation line must stay verbatim in both \
+             copies in bias_gemm.rs — mirror the edit in every deliberate \
+             copy or revert it"
+        );
+        assert_eq!(
+            src3.matches(e_line).count(),
+            1,
+            "the `e` f64-emulation line must stay verbatim in the \
+             microkernel i-tail in bias_gemm.rs"
+        );
+        assert_eq!(
+            src3.matches(acc_line).count(),
+            8,
+            "the partial-add f64 emulation must stay verbatim in all eight \
+             deliberate copies in bias_gemm.rs — mirror the edit in every \
+             deliberate copy or revert it"
+        );
     }
 }
 
